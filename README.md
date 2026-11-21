@@ -10,6 +10,7 @@
 
 <p>
   <a href="https://github.com/Tenfoto/PrismFX/releases/latest"><img src="https://img.shields.io/github/v/release/Tenfoto/PrismFX?style=for-the-badge&color=2D81FF&label=Release" alt="Latest Release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Tenfoto/PrismFX?style=for-the-badge&color=F59E0B" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/Platform-Windows%2011%20(24H2)-0078D6?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 11" />
   <img src="https://img.shields.io/badge/Python-3.12+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12+" />
   <img src="https://img.shields.io/badge/OpenGL-3.3%20Core-5586A4?style=for-the-badge&logo=opengl&logoColor=white" alt="OpenGL 3.3 Core" />
@@ -374,7 +375,8 @@ PrismFX/
 
 ---
 
-## 📄 Third-Party Component & Font Notes
+## 📄 License & Third-Party Notes
 
+- **PrismFX Studio:** Licensed under the [**MIT License**](LICENSE) — Copyright © 2026 Tenfoto.
 - **PySide6 (Qt 6.12):** LGPLv3 / Qt Commercial.
 - **Thai Display Typography (`FC Minimal`):** Resolved dynamically from the user's locally installed Windows Fonts directory (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`) and **not** redistributed inside this repository; falls back gracefully to system Windows fonts if unavailable.
