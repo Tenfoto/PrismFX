@@ -62,6 +62,10 @@ recovery_journal.json
 prismfx_profile*/
 snapshots/
 
+# --- Local-only GitHub Social Preview Assets ---
+docs/media/social_preview.png
+tools/make_social_preview.py
+
 # --- Secrets, Private Keys & Local Credentials ---
 .env
 .env.*

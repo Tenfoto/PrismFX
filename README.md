@@ -21,6 +21,7 @@
 
 <p>
   <a href="#-live-gpu-demos">Live Demos</a> •
+  <a href="#-how-prismfx-compares">Comparison</a> •
   <a href="#-studio-interface-gallery">Studio Gallery</a> •
   <a href="#-feature-highlights">Features</a> •
   <a href="#-measured-benchmarks">Benchmarks</a> •
@@ -68,6 +69,18 @@
 | **Atomic Crash Recovery** | Every temporary OS mutation (opacity, pin, roll-up, cloaking, hidden icons) is journaled in `recovery_journal.json` and auto-restored. |
 | **Bilingual Studio UI (EN / TH)** | Frameless dark architectural studio with instant `TH / EN` switching and proper Thai grapheme-cluster rendering. |
 | **Razor-Lean Footprint** | Only **1** external dependency (`PySide6`) — zero `pywin32`, zero `psutil`, zero Electron/Node bloat. |
+
+---
+
+## ⚖️ How PrismFX Compares
+
+| Feature | **PrismFX Studio** | WindowFX | Windhawk Mods | Deskwarp |
+| :--- | :---: | :---: | :---: | :---: |
+| **Free & Open-Source (MIT)** | ✅ **Yes** | ❌ Paid | ✅ Yes | ✅ Yes |
+| **Zero DLL Injection** | ✅ **Out-of-Process** | ❌ DLL / Hook Injection | ❌ DLL Injection | ✅ Out-of-Process |
+| **42+ GPU Shaders + Wobbly Physics** | ✅ **42+ GLSL + 165 Hz Wobbly** | ✅ Built-in DX10 + Wobbly | ⚠️ Mod-dependent | ⚠️ Wobbly focus only |
+| **Anti-Cheat / Gaming Safe** | ✅ **Auto-Pause & Exclusions** | ⚠️ May conflict | ⚠️ Needs exclusions | ✅ Yes |
+| **Crash-Safe Atomic OS Recovery** | ✅ **`recovery_journal.json`** | — | — | — |
 
 ---
 
@@ -169,14 +182,21 @@ Captured directly on the target Windows 11 24H2 machine via the built-in `--perf
 
 ## ⚡ Quick Start
 
+### System Requirements
+- **OS:** **Windows 11 (64-bit, 24H2 recommended)** with an OpenGL 3.3+ capable GPU.
+- **Windows 10?** PrismFX Studio is designed and verified exclusively for **Windows 11**. Windows 10 is **untested and not officially supported** due to differences in DWM composition and shell/taskbar internals.
+
 ### Option A — Download Pre-Built Windows Release *(Recommended, No Python Required)*
 
-1. Download **`PrismFX-v1.0.1-Windows-x64.zip`** from [**GitHub Releases**](https://github.com/Tenfoto/PrismFX/releases/latest).
+1. Download the latest **Windows x64 zip** from [**GitHub Releases**](https://github.com/Tenfoto/PrismFX/releases/latest).
 2. Extract the archive and double-click **`PrismFX\PrismFX.exe`**.
+
+> [!NOTE]
+> **Windows SmartScreen / Antivirus Notice:** Since this is an unsigned open-source release packaged with PyInstaller, Windows SmartScreen or Defender may show a warning on first launch (*More info → Run anyway*). All binaries are built transparently from public source via [GitHub Actions CI](.github/workflows/release.yml) with verifiable `SHA256SUMS.txt` checksums — or you can run directly from source below.
 
 ### Option B — Run from Source
 
-- **Requirements:** **Windows 11** (64-bit) with OpenGL 3.3+ GPU · **Python 3.12+**
+- **Requirements:** **Windows 11 (64-bit)** + **Python 3.12+**
 
 ```powershell
 # 1. Clone the repository
@@ -369,6 +389,7 @@ PrismFX/
 
 ## ⚠️ Known Windows 11 Platform Limitations & Privileges
 
+- **Windows 10 Compatibility:** Targeted and verified strictly for **Windows 11 (24H2)**; Windows 10 is untested and unsupported.
 - **Elevated (Administrator) Target Windows:** Under Windows UIPI (User Interface Privilege Isolation), a standard-privilege PrismFX instance cannot animate elevated (Admin) windows; enable **Elevated Auto-Start** or **Relaunch as Administrator** inside PrismFX Studio to animate Task Manager, Admin PowerShell, and Registry Editor seamlessly.
 - **DRM / Hardware-Protected Video Surfaces:** Windows protected media paths (e.g., HDCP Netflix playback) return blank frames from `PrintWindow` by OS security design.
 - **Anti-Cheat / Exclusive Fullscreen Games:** Automatically paused via `SHQueryUserNotificationState` and excluded by the built-in App Catalog to preserve zero-latency gaming and anti-cheat compatibility.
