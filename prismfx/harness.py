@@ -206,6 +206,32 @@ def run_selftest() -> dict:
             f"no_wh_mouse_ll={no_ll_hook} no_idle_loc={no_idle_loc} raw_abi_48B={raw_abi_ok} open_readiness={readiness_ok}",
         )
 
+        # 7d. Windows Startup XML, Elevation ABI & IPC message registration
+        import xml.etree.ElementTree as ET
+        from .core import startup as win_startup
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        cmd, args_s, cwd_s, full_cmd = win_startup.build_autostart_command(repo_root)
+        xml_txt = win_startup.build_task_scheduler_xml(cmd, args_s, cwd_s, "TESTPC\\DemoUser", elevated=True)
+        root_xml = ET.fromstring(xml_txt)
+        xml_ok = (
+            "HighestAvailable" in xml_txt
+            and "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in xml_txt
+            and "<Priority>5</Priority>" in xml_txt
+            and "--autostart" in full_cmd
+            and root_xml.tag.endswith("Task")
+        )
+        abi_ok = (
+            ctypes.sizeof(w32.SHELLEXECUTEINFOW) == 112
+            and ctypes.sizeof(w32.PROPERTYKEY) == 20
+            and ctypes.sizeof(w32.PROPVARIANT_LPWSTR) == 24
+            and w32.register_ipc_message(str(td)) > 0
+        )
+        check(
+            "startup_xml_and_privilege_abi",
+            xml_ok and abi_ok,
+            f"xml_valid={xml_ok} sei_112B={ctypes.sizeof(w32.SHELLEXECUTEINFOW)} propkey_20B={ctypes.sizeof(w32.PROPERTYKEY)}",
+        )
+
     # 8. OpenGL 3.3 Core GPU compilation & FBO render across ALL 42 built-in shaders!
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fmt = make_gl_format()
@@ -287,10 +313,12 @@ def run_uitest(profile_dir: pathlib.Path) -> dict:
         ok = hit is not None and (hit is widget or widget.isAncestorOf(hit))
         check(f"hittest_{label}", ok, f"hit={type(hit).__name__ if hit else None}")
 
-    # Hit-test titlebar controls & all 5 sidebar navigation buttons
+    # Hit-test titlebar controls & all 5 sidebar navigation buttons + sidebar startup controls
     verify_hit(win.master_toggle, "master_toggle")
     verify_hit(win.btn_lang, "lang_switch")
     verify_hit(win.btn_quick_ctrl, "quick_ctrl")
+    verify_hit(win.chk_side_autostart, "side_autostart")
+    verify_hit(win.btn_side_admin, "side_admin")
     for k, btn in win._nav_buttons.items():
         verify_hit(btn, f"nav_{k}")
 
@@ -299,6 +327,12 @@ def run_uitest(profile_dir: pathlib.Path) -> dict:
         win._nav_buttons[k].click()
         QtCore.QCoreApplication.processEvents()
         check(f"navigate_{k}", win._active_page == k and win._stack.currentIndex() == win._page_map[k])
+
+    # Hit-test Startup & Privilege controls on Page 05 (Apps & Safety)
+    verify_hit(win.chk_autostart, "page_autostart")
+    verify_hit(win.chk_autostart_min, "page_autostart_min")
+    verify_hit(win.chk_autostart_admin, "page_autostart_admin")
+    verify_hit(win.btn_elevate_admin, "page_elevate_admin")
 
     # Verify trigger & category switches on Animations Lab
     win._select_page("animations")

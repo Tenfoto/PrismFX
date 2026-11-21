@@ -144,7 +144,24 @@ HT_RESIZE_BORDERS = frozenset({
     HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
 })
 WM_CLOSE = 0x0010
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
 VK_LBUTTON = 0x01
+
+MSGFLT_ALLOW = 1
+IPC_CMD_ACTIVATE = 1
+IPC_CMD_QUIT = 2
+
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+ERROR_CANCELLED = 1223
+WAIT_OBJECT_0 = 0x00000000
+STILL_ACTIVE = 259
+
+CTRL_C_EVENT = 0
+CTRL_BREAK_EVENT = 1
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
 
 HWND_MESSAGE = -3
 RID_INPUT = 0x10000003
@@ -333,6 +350,56 @@ class RAWINPUT_MOUSE(ctypes.Structure):
     ]
 
 
+class SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIconOrMonitor", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class PROPERTYKEY(ctypes.Structure):
+    _fields_ = [
+        ("fmtid", GUID),
+        ("pid", wintypes.DWORD),
+    ]
+
+
+class PROPVARIANT_LPWSTR(ctypes.Structure):
+    _fields_ = [
+        ("vt", wintypes.WORD),
+        ("wReserved1", wintypes.WORD),
+        ("wReserved2", wintypes.WORD),
+        ("wReserved3", wintypes.WORD),
+        ("pwszVal", ctypes.c_void_p),
+        ("_pad", ctypes.c_void_p),
+    ]
+
+
+HANDLER_ROUTINE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+
 # ---------------------------------------------------------------------------
 # Prototypes
 # ---------------------------------------------------------------------------
@@ -487,12 +554,39 @@ kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+kernel32.SetConsoleCtrlHandler.argtypes = [HANDLER_ROUTINE, wintypes.BOOL]
+kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wintypes.UINT
+try:
+    user32.ChangeWindowMessageFilterEx.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.DWORD, ctypes.c_void_p,
+    ]
+    user32.ChangeWindowMessageFilterEx.restype = wintypes.BOOL
+except Exception:
+    pass
 
 shell32.SHQueryUserNotificationState.argtypes = [ctypes.POINTER(ctypes.c_int)]
 shell32.SHQueryUserNotificationState.restype = ctypes.c_long
+shell32.IsUserAnAdmin.argtypes = []
+shell32.IsUserAnAdmin.restype = wintypes.BOOL
+shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+shell32.ShellExecuteExW.restype = wintypes.BOOL
 try:
     shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
     shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+except Exception:
+    pass
+try:
+    shell32.SHGetPropertyStoreForWindow.argtypes = [
+        wintypes.HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
+    ]
+    shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long
 except Exception:
     pass
 
@@ -549,6 +643,180 @@ def create_single_instance_mutex(profile_id: str) -> tuple[int, bool]:
 def close_handle(handle: int) -> None:
     if handle:
         kernel32.CloseHandle(handle)
+
+
+def is_user_admin() -> bool:
+    """Return True if the current process is running with elevated Administrator privileges."""
+    try:
+        return bool(shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def register_ipc_message(profile_id: str) -> int:
+    """Register a profile-scoped Win32 IPC window message (ACTIVATE / QUIT)."""
+    name = f"PrismFX_IPC_{fnv1a_32(profile_id.lower())}"
+    return int(user32.RegisterWindowMessageW(name) or 0)
+
+
+def allow_window_message_uipi(hwnd: int, msg: int) -> bool:
+    """Allow lower-integrity processes (e.g. standard Explorer launch) to send msg to an elevated PrismFX."""
+    if not hwnd or not msg:
+        return False
+    try:
+        return bool(user32.ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None))
+    except Exception:
+        return False
+
+
+def find_instance_windows(title_exact: str, exclude_pid: int = 0) -> list[int]:
+    """Find all PrismFX Studio top-level windows (even when hidden to tray), skipping exclude_pid."""
+    found: list[int] = []
+
+    def _cb(hwnd, _lp):
+        if exclude_pid:
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == exclude_pid:
+                return True
+        if get_window_text(hwnd) == title_exact:
+            found.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(ENUMWINDOWSPROC(_cb), 0)
+    return found
+
+
+def find_instance_window(title_exact: str, exclude_pid: int = 0) -> int:
+    """Find an existing PrismFX Studio window (even when hidden to tray), skipping exclude_pid."""
+    wins = find_instance_windows(title_exact, exclude_pid=exclude_pid)
+    return wins[0] if wins else 0
+
+
+_CONSOLE_CTRL_REFS: list[HANDLER_ROUTINE] = []
+
+
+def register_console_ctrl_handler(on_close_fn) -> bool:
+    """Install a Win32 console control handler so closing CMD / Ctrl+C / Logoff ALWAYS restores OS state!"""
+    @HANDLER_ROUTINE
+    def _handler(ctrl_type: int) -> bool:
+        if ctrl_type in (CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT):
+            try:
+                on_close_fn(int(ctrl_type))
+            except Exception:
+                pass
+            return True
+        return False
+
+    try:
+        if kernel32.SetConsoleCtrlHandler(_handler, True):
+            _CONSOLE_CTRL_REFS.append(_handler)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def shell_execute_elevated(
+    file_path: str,
+    parameters: str = "",
+    cwd: str = "",
+    show_cmd: int = SW_SHOWNORMAL,
+    wait_timeout_ms: int = 0,
+    hwnd: int = 0,
+) -> tuple[bool, int, str]:
+    """Launch an elevated process via official Windows UAC (`runas`).
+
+    Returns `(ok, exit_code_or_winerr, status)` where status is `"ok"`, `"cancelled"`, or `"error"`.
+    """
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS
+    sei.hwnd = hwnd or 0
+    sei.lpVerb = "runas"
+    sei.lpFile = file_path
+    sei.lpParameters = parameters or None
+    sei.lpDirectory = cwd or None
+    sei.nShow = show_cmd
+
+    ctypes.set_last_error(0)
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        err = ctypes.get_last_error()
+        if err == ERROR_CANCELLED:
+            return (False, err, "cancelled")
+        return (False, err, "error")
+
+    hproc = int(sei.hProcess or 0)
+    if not hproc:
+        return (True, 0, "ok")
+    try:
+        if wait_timeout_ms > 0:
+            wres = kernel32.WaitForSingleObject(hproc, wait_timeout_ms)
+            if wres == WAIT_OBJECT_0:
+                code = wintypes.DWORD(0)
+                kernel32.GetExitCodeProcess(hproc, ctypes.byref(code))
+                return (code.value == 0, int(code.value), "ok" if code.value == 0 else "error")
+            return (False, -1, "timeout")
+        return (True, 0, "ok")
+    finally:
+        kernel32.CloseHandle(hproc)
+
+
+_IID_IPROPERTYSTORE = GUID(
+    0x886D8EEB, 0x8CF2, 0x4446, (ctypes.c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99)
+)
+_FMTID_APPUSERMODEL = GUID(
+    0x9F4C2855, 0x9F79, 0x4B39, (ctypes.c_ubyte * 8)(0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3)
+)
+
+
+def set_window_app_user_model_properties(
+    hwnd: int,
+    app_id: str,
+    relaunch_cmd: str = "",
+    display_name: str = "",
+    icon_resource: str = "",
+) -> bool:
+    """Bind taskbar identity & pin-to-taskbar relaunch command directly to PrismFX.exe via IPropertyStore."""
+    if not hwnd:
+        return False
+    try:
+        store_ptr = ctypes.c_void_p()
+        hr = shell32.SHGetPropertyStoreForWindow(
+            hwnd, ctypes.byref(_IID_IPROPERTYSTORE), ctypes.byref(store_ptr)
+        )
+        if hr != 0 or not store_ptr.value:
+            return False
+        vtable_ptr = ctypes.cast(store_ptr.value, ctypes.POINTER(ctypes.c_void_p)).contents.value
+        vtable = ctypes.cast(vtable_ptr, ctypes.POINTER(ctypes.c_void_p))
+
+        _Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+        _SetValue = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT_LPWSTR)
+        )(vtable[6])
+        _Commit = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vtable[7])
+
+        try:
+            def _set_str(pid: int, text: str) -> None:
+                if not text:
+                    return
+                key = PROPERTYKEY(_FMTID_APPUSERMODEL, pid)
+                buf = ctypes.create_unicode_buffer(text)
+                pv = PROPVARIANT_LPWSTR()
+                pv.vt = 31  # VT_LPWSTR
+                pv.pwszVal = ctypes.cast(buf, ctypes.c_void_p).value
+                _SetValue(store_ptr.value, ctypes.byref(key), ctypes.byref(pv))
+
+            _set_str(5, app_id)         # System.AppUserModel.ID
+            _set_str(2, relaunch_cmd)   # System.AppUserModel.RelaunchCommand
+            _set_str(3, icon_resource)  # System.AppUserModel.RelaunchIconResource
+            _set_str(4, display_name)   # System.AppUserModel.RelaunchDisplayNameResource
+            _Commit(store_ptr.value)
+            return True
+        finally:
+            _Release(store_ptr.value)
+    except Exception:
+        return False
 
 
 def get_window_text(hwnd: int) -> str:

@@ -12,9 +12,66 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent
 DIST = ROOT / "dist"
+
+
+def _find_csc() -> pathlib.Path | None:
+    for p in (
+        pathlib.Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+        pathlib.Path(r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"),
+    ):
+        if p.is_file():
+            return p
+    found = shutil.which("csc")
+    return pathlib.Path(found) if found else None
+
+
+def build_native_launcher(out_exe: pathlib.Path) -> bool:
+    """Compile the tiny ~12 KB windowless GUI PrismFX.exe launcher (zero CMD console!)."""
+    csc = _find_csc()
+    launcher_cs = ROOT / "tools" / "PrismFXLauncher.cs"
+    manifest = ROOT / "tools" / "PrismFX.manifest"
+    icon = ROOT / "assets" / "prismfx.ico"
+    if not csc or not launcher_cs.is_file():
+        print("[WARN] csc.exe or tools/PrismFXLauncher.cs not found; skipping native PrismFX.exe build.")
+        return False
+
+    py_exe = pathlib.Path(sys.executable)
+    pyw = py_exe.with_name("pythonw.exe")
+    pyw_str = str(pyw if pyw.is_file() else py_exe).replace('"', '""')
+
+    tmp_cfg: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cs", encoding="utf-8", delete=False) as tf:
+            tf.write(
+                "namespace PrismFXLauncher {\n"
+                f'    internal static class BuildConfig {{ public const string PythonW = @"{pyw_str}"; }}\n'
+                "}\n"
+            )
+            tmp_cfg = pathlib.Path(tf.name)
+
+        out_exe.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            str(csc),
+            "/nologo",
+            "/target:winexe",
+            "/platform:anycpu",
+            "/optimize+",
+            f"/out:{out_exe}",
+        ]
+        if icon.is_file():
+            cmd.append(f"/win32icon:{icon}")
+        if manifest.is_file():
+            cmd.append(f"/win32manifest:{manifest}")
+        cmd.extend([str(launcher_cs), str(tmp_cfg)])
+        subprocess.run(cmd, check=True)
+        return out_exe.is_file()
+    finally:
+        if tmp_cfg is not None:
+            tmp_cfg.unlink(missing_ok=True)
 
 DPI_MANIFEST = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -63,14 +120,17 @@ def build_portable() -> pathlib.Path:
     shutil.copytree(ROOT / "prismfx", out / "prismfx", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copytree(ROOT / "assets", out / "assets")
     shutil.copy2(ROOT / "main.py", out / "main.py")
-    shutil.copy2(ROOT / "run.bat", out / "PrismFX.bat")
-    (out / "PrismFX.manifest").write_text(DPI_MANIFEST, encoding="utf-8")
-    (out / "PrismFX_Silent.vbs").write_text(
-        'Set WshShell = CreateObject("WScript.Shell")\n'
-        'WshShell.CurrentDirectory = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)\n'
-        'WshShell.Run "pythonw main.py", 0, False\n',
-        encoding="utf-8",
-    )
+
+    # Build standalone windowless PrismFX.exe (zero cmd.exe console, embedded icon & DPI manifest!)
+    exe_out = out / "PrismFX.exe"
+    if build_native_launcher(exe_out):
+        # Also refresh workspace root PrismFX.exe for convenient one-click launch
+        shutil.copy2(exe_out, ROOT / "PrismFX.exe")
+        print(f"[OK] Compiled windowless native launcher: {exe_out} ({exe_out.stat().st_size:,} bytes)")
+    else:
+        (out / "PrismFX.manifest").write_text(DPI_MANIFEST, encoding="utf-8")
+        shutil.copy2(ROOT / "run.bat", out / "PrismFX.bat")
+
     print(f"[OK] Built portable bundle at: {out}")
     return out
 

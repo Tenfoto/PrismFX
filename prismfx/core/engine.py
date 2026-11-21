@@ -339,6 +339,7 @@ class PrismEngine:
         self._open_stager_thread: Optional[threading.Thread] = None
         self._open_wake = threading.Event()
         self._stop_event = threading.Event()
+        self._stop_lock = threading.Lock()
         self._win_event_hooks: list[int] = []
         self._win_event_cb_ref = None
         self._raw_wndproc_ref = None
@@ -416,12 +417,16 @@ class PrismEngine:
         )
 
     def _can_prehide_restore(self) -> bool:
+        if not self._running or self._stop_event.is_set():
+            return False
         if self.backend.is_demo or not self.config.enabled or self._cached_paused_reason:
             return False
         tc = self.config.triggers.get("restore")
         return bool(tc and tc.enabled and tc.effect_id != "none")
 
     def _can_prehide_open(self) -> bool:
+        if not self._running or self._stop_event.is_set():
+            return False
         if self.backend.is_demo or not self.config.enabled or self._cached_paused_reason:
             return False
         tc = self.config.triggers.get("open")
@@ -442,6 +447,8 @@ class PrismEngine:
         orig_alpha = info.opacity if info.opacity >= 20 else 255
         if info.opacity == 0:
             return False  # Already hidden by another owner; do not touch!
+        if not self._running or self._stop_event.is_set():
+            return False
         self.journal.record_alpha(hwnd, orig_alpha)
         if self.backend.set_window_hidden_alpha(hwnd, True):
             with self._hidden_lock:
@@ -607,32 +614,45 @@ class PrismEngine:
             self._raw_input_thread.start()
 
     def stop(self) -> None:
-        if not self._running:
-            return
-        self._running = False
-        self._stop_event.set()
-        self._open_wake.set()
-        if self._hook_tid:
-            try:
-                w32.user32.PostThreadMessageW(self._hook_tid, w32.WM_QUIT, 0, 0)
-            except Exception:
-                pass
-        if self._raw_input_tid:
-            try:
-                w32.user32.PostThreadMessageW(self._raw_input_tid, w32.WM_QUIT, 0, 0)
-            except Exception:
-                pass
-        self._momentum = None
-        self.restore_all_os_state()
-        self._update_spotlight_state(force_off=True)
-        if self._poll_thread and self._poll_thread.is_alive():
-            self._poll_thread.join(timeout=1.0)
-        if self._open_stager_thread and self._open_stager_thread.is_alive():
-            self._open_stager_thread.join(timeout=1.0)
-        if self._hook_thread and self._hook_thread.is_alive():
-            self._hook_thread.join(timeout=1.0)
-        if self._raw_input_thread and self._raw_input_thread.is_alive():
-            self._raw_input_thread.join(timeout=1.0)
+        with self._stop_lock:
+            if not self._running:
+                return
+            self._running = False
+            self._stop_event.set()
+            self._open_wake.set()
+            if self._hook_tid:
+                try:
+                    w32.user32.PostThreadMessageW(self._hook_tid, w32.WM_QUIT, 0, 0)
+                except Exception:
+                    pass
+            if self._raw_input_tid:
+                try:
+                    w32.user32.PostThreadMessageW(self._raw_input_tid, w32.WM_QUIT, 0, 0)
+                except Exception:
+                    pass
+            self._momentum = None
+            # Pass 1: immediate synchronous restore (critical under CTRL_CLOSE / WM_ENDSESSION deadlines)
+            self.restore_all_os_state()
+            self._update_spotlight_state(force_off=True)
+            cur = threading.current_thread()
+            # Re-post WM_QUIT while joining in case hook/raw threads were still creating their Win32 message queue
+            deadline = time.perf_counter() + 0.8
+            for th in (self._poll_thread, self._open_stager_thread, self._hook_thread, self._raw_input_thread):
+                while th and th is not cur and th.is_alive() and time.perf_counter() < deadline:
+                    if self._hook_tid:
+                        try:
+                            w32.user32.PostThreadMessageW(self._hook_tid, w32.WM_QUIT, 0, 0)
+                        except Exception:
+                            pass
+                    if self._raw_input_tid:
+                        try:
+                            w32.user32.PostThreadMessageW(self._raw_input_tid, w32.WM_QUIT, 0, 0)
+                        except Exception:
+                            pass
+                    th.join(timeout=0.08)
+            # Pass 2: final sweep in case a worker mutated a window right as stop_event fired
+            if self.journal.has_pending_recovery() or self._prehidden_minimized or self._hidden_for_anim:
+                self.restore_all_os_state()
 
     def restore_all_os_state(self) -> int:
         """Emergency & shutdown restoration via Crash Recovery Journal."""
@@ -1715,8 +1735,13 @@ class PrismEngine:
         elif do_bg_scan and self._can_prehide_restore():
             # Pre-hide any eligible already-minimized windows (e.g. minimized before PrismFX launched!)
             for iconic_hwnd in w32.list_iconic_top_windows(own_pid=self.own_pid):
+                if self._stop_event.is_set():
+                    return
                 if iconic_hwnd not in self._own_hwnds:
                     self._prehide_minimized_hwnd(iconic_hwnd)
+
+        if self._stop_event.is_set():
+            return
 
         fg = self.backend.get_foreground_hwnd()
         fg_info = self.backend.get_window_info(fg) if fg else None
@@ -1877,7 +1902,7 @@ class PrismEngine:
         @w32.WINEVENTPROC
         def _on_win_event(h_hook, event, hwnd, id_object, id_child, _tid, _ms):
             try:
-                if id_object != w32.OBJID_WINDOW or id_child != w32.CHILDID_SELF or not hwnd:
+                if self._stop_event.is_set() or id_object != w32.OBJID_WINDOW or id_child != w32.CHILDID_SELF or not hwnd:
                     return
                 ihwnd = int(hwnd)
                 if ihwnd in self._own_hwnds:
@@ -1961,6 +1986,8 @@ class PrismEngine:
         @w32.WNDPROC
         def _raw_wndproc(hwnd, msg, wparam, lparam):
             try:
+                if self._stop_event.is_set():
+                    return w32.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
                 if msg == w32.WM_INPUT:
                     if self.config.enabled and not self._cached_paused_reason:
                         raw_sz.value = full_sz

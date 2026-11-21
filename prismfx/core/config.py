@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import pathlib
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -92,6 +93,9 @@ class PrismConfig:
     active_preset: str = "Prism Studio Default"
     global_speed_scale: float = 1.0
     target_fps: int = 165
+    start_with_windows: bool = False
+    start_with_windows_admin: bool = False
+    autostart_minimized: bool = True
     start_minimized_to_tray: bool = False
     window_geometry: list[int] = field(default_factory=lambda: [140, 80, 1280, 800])
     triggers: dict[str, TriggerConfig] = field(
@@ -139,6 +143,9 @@ class PrismConfig:
         cfg.active_preset = str(raw.get("active_preset", cfg.active_preset))
         cfg.global_speed_scale = max(0.35, min(2.5, float(raw.get("global_speed_scale", cfg.global_speed_scale))))
         cfg.target_fps = max(30, min(360, int(raw.get("target_fps", cfg.target_fps))))
+        cfg.start_with_windows = bool(raw.get("start_with_windows", cfg.start_with_windows))
+        cfg.start_with_windows_admin = bool(raw.get("start_with_windows_admin", cfg.start_with_windows_admin))
+        cfg.autostart_minimized = bool(raw.get("autostart_minimized", cfg.autostart_minimized))
         cfg.start_minimized_to_tray = bool(raw.get("start_minimized_to_tray", cfg.start_minimized_to_tray))
         geom = raw.get("window_geometry")
         if isinstance(geom, list) and len(geom) == 4:
@@ -307,11 +314,23 @@ class ConfigStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.config_path.with_suffix(".json.part")
         payload = json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
-        with open(tmp, "wb") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.config_path)
+        for attempt in range(5):
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.config_path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    with open(self.config_path, "wb") as f:
+                        f.write(payload)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    tmp.unlink(missing_ok=True)
+                    return
+                time.sleep(0.008 * (attempt + 1))
 
     def apply_preset(self, cfg: PrismConfig, preset_name: str) -> PrismConfig:
         updated = copy.deepcopy(cfg)

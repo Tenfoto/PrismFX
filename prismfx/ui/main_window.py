@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ctypes import wintypes
 import pathlib
 import queue
 from typing import Optional
@@ -9,6 +10,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import __app_name__, __version__
+from ..core import startup as win_startup
 from ..core import win32_api as w32
 from ..core.config import BUILTIN_PRESETS, PrismConfig
 from ..core.effects import CATEGORIES, EASING_CURVES, TRIGGER_TYPES, EffectSpec
@@ -41,11 +43,25 @@ class MainWindow(QtWidgets.QMainWindow):
         enable_overlays: bool = True,
         enable_tray: bool = True,
         icon_path: Optional[pathlib.Path] = None,
+        ipc_msg: int = 0,
+        repo_root: Optional[pathlib.Path] = None,
+        profile_arg: str = "",
     ) -> None:
         super().__init__()
         self.engine = engine
         self.cfg: PrismConfig = engine.config
         self._lang = self.cfg.language
+        self._ipc_msg = int(ipc_msg or 0)
+        self._repo_root = (repo_root or pathlib.Path(__file__).resolve().parents[2]).resolve()
+        self._profile_arg = profile_arg
+        self._startup_status = win_startup.query_startup_status(
+            self._repo_root, dry_run=self.engine.backend.is_demo
+        )
+        self._is_admin = self._startup_status.is_admin
+        if not self.engine.backend.is_demo:
+            self.cfg.start_with_windows = self._startup_status.enabled
+            self.cfg.start_with_windows_admin = (self._startup_status.mode == "elevated_task")
+        self._native_bound = False
         self._drag_pos: Optional[QtCore.QPoint] = None
         self._active_page = "home"
         self._active_trigger = "open"
@@ -58,6 +74,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tile_windows: dict[int, FloatingTileWindow] = {}
         self._current_fps = 0.0
         self._current_frame_ms = 0.0
+        self._act_tray_autostart: Optional[QtGui.QAction] = None
+        self._act_tray_admin: Optional[QtGui.QAction] = None
 
         self.setWindowTitle(f"{__app_name__} Studio v{__version__}")
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
@@ -93,6 +111,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._select_page("home")
         self._refresh_animations_grid()
         self._sync_trigger_controls()
+        self._sync_startup_ui()
         self._refresh_apps_table()
 
     # ------------------------------------------------------------------
@@ -125,12 +144,66 @@ class MainWindow(QtWidgets.QMainWindow):
         p.end()
         return QtGui.QIcon(pm)
 
+    def ensure_native_handle(self) -> int:
+        """Realize native Win32 HWND even when starting hidden in tray (for IPC, UIPI & taskbar pinning)."""
+        hwnd = int(self.winId())
+        if hwnd:
+            self.engine.register_own_hwnd(hwnd)
+            if not self._native_bound:
+                self._native_bound = True
+                if self._ipc_msg:
+                    w32.allow_window_message_uipi(hwnd, self._ipc_msg)
+                exe, _args, is_native = win_startup.resolve_launcher(self._repo_root)
+                ico = self._repo_root / "assets" / "prismfx.ico"
+                relaunch = f'"{exe}"' if is_native else ""
+                icon_res = f"{ico},0" if ico.exists() else ""
+                w32.set_window_app_user_model_properties(
+                    hwnd,
+                    app_id="PrismFX.Studio",
+                    relaunch_cmd=relaunch,
+                    display_name="PrismFX Studio",
+                    icon_resource=icon_res,
+                )
+        return hwnd
+
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
-        hwnd = int(self.winId())
-        self.engine.register_own_hwnd(hwnd)
-        w32.set_immersive_dark_mode(hwnd, True)
-        w32.set_window_corner_square(hwnd)
+        hwnd = self.ensure_native_handle()
+        if hwnd:
+            w32.set_immersive_dark_mode(hwnd, True)
+            w32.set_window_corner_square(hwnd)
+
+    def nativeEvent(self, eventType, message):  # type: ignore[override]
+        try:
+            if eventType == b"windows_generic_MSG" and message is not None:
+                addr = int(message)
+                if addr:
+                    msg = wintypes.MSG.from_address(addr)
+                    if self._ipc_msg and msg.message == self._ipc_msg:
+                        if msg.wParam == w32.IPC_CMD_ACTIVATE:
+                            QtCore.QTimer.singleShot(0, self._restore_from_tray)
+                            return (True, 1)
+                        if msg.wParam == w32.IPC_CMD_QUIT:
+                            QtCore.QTimer.singleShot(0, self.full_shutdown)
+                            return (True, 1)
+                    elif msg.message in (w32.WM_QUERYENDSESSION, w32.WM_ENDSESSION):
+                        # Synchronously restore all hidden/pre-hidden windows before Windows logs off or shuts down
+                        self.engine.stop()
+        except Exception:
+            pass
+        return super().nativeEvent(eventType, message)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._persist_geometry()
+        if self._tray and self._tray.isVisible() and not self.engine.backend.is_demo:
+            event.ignore()
+            self.hide()
+            self.home_stage.pause_clock()
+            self.lab_stage.pause_clock()
+            self.wobble_stage.pause_clock()
+        else:
+            self.full_shutdown()
+            event.accept()
 
     def changeEvent(self, event: QtCore.QEvent) -> None:
         if event.type() == QtCore.QEvent.WindowStateChange and self.isMinimized():
@@ -329,6 +402,51 @@ class MainWindow(QtWidgets.QMainWindow):
             lay.addWidget(btn)
 
         lay.addStretch(1)
+
+        # Sidebar Quick Startup & Privileges Card (visible on every page!)
+        start_card = PanelCard(recessed=False)
+        stl = QtWidgets.QVBoxLayout(start_card)
+        stl.setContentsMargins(10, 9, 10, 9)
+        stl.setSpacing(6)
+
+        st_hdr = QtWidgets.QHBoxLayout()
+        st_hdr.setSpacing(4)
+        lbl_st_hdr = QtWidgets.QLabel("STARTUP")
+        lbl_st_hdr.setFont(ATLAS.font_for("mono", 7.6, bold=True))
+        lbl_st_hdr.setStyleSheet(f"color: {TOKENS['accent_hi']}; border: none; background: transparent;")
+        self.lbl_side_priv = QtWidgets.QLabel("● ADMIN" if self._is_admin else "◐ STANDARD")
+        self.lbl_side_priv.setFont(ATLAS.font_for("mono", 7.3, bold=True))
+        self.lbl_side_priv.setStyleSheet(
+            f"color: {TOKENS['ok'] if self._is_admin else TOKENS['warn']}; border: none; background: transparent;"
+        )
+        st_hdr.addWidget(lbl_st_hdr)
+        st_hdr.addStretch(1)
+        st_hdr.addWidget(self.lbl_side_priv)
+        stl.addLayout(st_hdr)
+
+        self.chk_side_autostart = QtWidgets.QCheckBox(self._tr_btn("เปิดพร้อม Windows", "Start with Windows"))
+        self.chk_side_autostart.setObjectName("chk_side_autostart")
+        self.chk_side_autostart.setFont(ATLAS.font_for("body", 8.8, text=self.chk_side_autostart.text()))
+        self.chk_side_autostart.setChecked(self.cfg.start_with_windows)
+        self.chk_side_autostart.toggled.connect(self._on_side_autostart_toggled)
+        stl.addWidget(self.chk_side_autostart)
+
+        self.btn_side_admin = QtWidgets.QPushButton(
+            self._tr_btn("✓ สิทธิ์ผู้ดูแลพร้อมใช้", "✓ Admin Mode Active")
+            if self._is_admin
+            else self._tr_btn("ยกระดับสิทธิ์ Admin", "Run as Admin")
+        )
+        self.btn_side_admin.setObjectName("btn_side_admin")
+        self.btn_side_admin.setFixedHeight(32)
+        self.btn_side_admin.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_side_admin.setFont(ATLAS.font_for("body", 9.0, text=self.btn_side_admin.text(), bold=True))
+        self.btn_side_admin.clicked.connect(self._on_side_admin_clicked)
+        stl.addWidget(self.btn_side_admin)
+
+        wrap_st = QtWidgets.QHBoxLayout()
+        wrap_st.setContentsMargins(10, 0, 10, 8)
+        wrap_st.addWidget(start_card)
+        lay.addLayout(wrap_st)
 
         # Sidebar Engine Architecture Card
         card = PanelCard(recessed=False)
@@ -1050,9 +1168,69 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(
             SectionHeader(
                 "APP CATALOG, EXCLUSIONS & CRASH RECOVERY",
-                self._tr("ตรวจสอบหน้าต่างที่เปิดอยู่, ยกเว้นเกม/แอปอัจฉริยะ และระบบกู้คืนฉุกเฉิน", "Live App Catalog, Smart Game Exclusions & Crash-Safe Recovery"),
+                self._tr("ตรวจสอบหน้าต่างที่เปิดอยู่, สิทธิ์ระบบ/เปิดพร้อมเครื่อง และระบบกู้คืนฉุกเฉิน", "Live App Catalog, Windows Startup & Privileges, Smart Exclusions"),
             )
         )
+
+        # Windows Startup & Administrator Privileges Card (WindowFX-style boot & UIPI elevation)
+        boot_card = PanelCard()
+        bl = QtWidgets.QVBoxLayout(boot_card)
+        bl.setContentsMargins(14, 10, 14, 10)
+        bl.setSpacing(8)
+
+        bh = QtWidgets.QHBoxLayout()
+        bh.setSpacing(10)
+        lbl_boot_hdr = QtWidgets.QLabel("WINDOWS STARTUP & PRIVILEGES")
+        lbl_boot_hdr.setFont(ATLAS.font_for("mono", 8.3, bold=True))
+        lbl_boot_hdr.setStyleSheet(f"color: {TOKENS['accent_hi']}; background: transparent; border: none;")
+
+        self.lbl_priv_badge = QtWidgets.QLabel()
+        self.lbl_priv_badge.setFont(ATLAS.font_for("mono", 7.8, bold=True))
+
+        self.lbl_startup_status = QtWidgets.QLabel()
+        self.lbl_startup_status.setFont(ATLAS.font_for("body", 8.8, text="เปิดอัตโนมัติ"))
+        self.lbl_startup_status.setStyleSheet(f"color: {TOKENS['ink_secondary']}; background: transparent; border: none;")
+
+        self.btn_elevate_admin = QtWidgets.QPushButton()
+        self.btn_elevate_admin.setObjectName("btn_elevate_admin")
+        self.btn_elevate_admin.setFixedHeight(34)
+        self.btn_elevate_admin.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_elevate_admin.clicked.connect(self._on_relaunch_as_admin)
+
+        bh.addWidget(lbl_boot_hdr)
+        bh.addWidget(self.lbl_priv_badge)
+        bh.addWidget(self.lbl_startup_status, 1)
+        bh.addWidget(self.btn_elevate_admin)
+        bl.addLayout(bh)
+
+        br = QtWidgets.QHBoxLayout()
+        br.setSpacing(16)
+        self.chk_autostart = QtWidgets.QCheckBox(
+            self._tr_btn("เปิดโปรแกรมทันทีหลังเปิดเครื่อง (Start with Windows)", "Start Automatically with Windows")
+        )
+        self.chk_autostart.setObjectName("chk_autostart")
+        self.chk_autostart.setChecked(self.cfg.start_with_windows)
+        self.chk_autostart.toggled.connect(self._on_autostart_toggled)
+
+        self.chk_autostart_min = QtWidgets.QCheckBox(
+            self._tr_btn("เริ่มแบบย่อลง System Tray ทันที", "Start Minimized to Tray on Boot")
+        )
+        self.chk_autostart_min.setObjectName("chk_autostart_min")
+        self.chk_autostart_min.setChecked(self.cfg.autostart_minimized)
+        self.chk_autostart_min.toggled.connect(self._on_autostart_min_toggled)
+
+        self.chk_autostart_admin = QtWidgets.QCheckBox(
+            self._tr_btn("ใช้สิทธิ์ผู้ดูแลตอนเปิดเครื่อง (ไม่เด้ง UAC — คุมหน้าต่าง Admin ได้)", "Elevated Boot Task (Zero-UAC Admin Startup)")
+        )
+        self.chk_autostart_admin.setObjectName("chk_autostart_admin")
+        self.chk_autostart_admin.setChecked(self.cfg.start_with_windows_admin)
+        self.chk_autostart_admin.toggled.connect(self._on_autostart_admin_toggled)
+
+        br.addWidget(self.chk_autostart)
+        br.addWidget(self.chk_autostart_min)
+        br.addWidget(self.chk_autostart_admin, 1)
+        bl.addLayout(br)
+        lay.addWidget(boot_card)
 
         # Top Safety Switches Card
         safe_card = PanelCard()
@@ -1430,6 +1608,163 @@ class MainWindow(QtWidgets.QMainWindow):
         restored = self.engine.restore_all_os_state()
         self.tile_journal.set_value("RESTORED", f"{restored} items reset cleanly")
 
+    # ------------------------------------------------------------------
+    # Windows Startup & Administrator Privileges
+    # ------------------------------------------------------------------
+    def _sync_startup_ui(self, status_note: str = "") -> None:
+        st = self._startup_status
+        self._is_admin = st.is_admin
+
+        # Sync checkboxes without feedback loops
+        for cb, val in (
+            (self.chk_autostart, self.cfg.start_with_windows),
+            (self.chk_side_autostart, self.cfg.start_with_windows),
+            (self.chk_autostart_min, self.cfg.autostart_minimized),
+            (self.chk_autostart_admin, self.cfg.start_with_windows_admin),
+        ):
+            cb.blockSignals(True)
+            cb.setChecked(bool(val))
+            cb.blockSignals(False)
+
+        if self._act_tray_autostart is not None:
+            self._act_tray_autostart.blockSignals(True)
+            self._act_tray_autostart.setChecked(bool(self.cfg.start_with_windows))
+            self._act_tray_autostart.blockSignals(False)
+
+        # Privilege badges
+        if self._is_admin:
+            self.lbl_side_priv.setText("● ADMIN")
+            self.lbl_side_priv.setStyleSheet(f"color: {TOKENS['ok']}; border: none; background: transparent;")
+            self.lbl_priv_badge.setText("● ADMIN / ELEVATED")
+            self.lbl_priv_badge.setStyleSheet(
+                f"color: {TOKENS['ok']}; background: #0E2219; border: 1px solid {TOKENS['ok']}; padding: 1px 6px;"
+            )
+            side_txt = self._tr_btn("✓ สิทธิ์ผู้ดูแลพร้อมใช้", "✓ Admin Mode Active")
+            self.btn_side_admin.setText(side_txt)
+            self.btn_side_admin.setFont(ATLAS.font_for("body", 8.6, text=side_txt, bold=True))
+            self.btn_side_admin.setProperty("accent", "false")
+            self.btn_side_admin.setStyleSheet(
+                f"QPushButton {{ background: #0E2219; border: 1px solid {TOKENS['ok']}; color: {TOKENS['ok']}; padding: 2px 6px; }}"
+                f"QPushButton:hover {{ background: #133024; }}"
+            )
+            adm_txt = self._tr_btn("✓ กำลังทำงานด้วยสิทธิ์ผู้ดูแลระบบ", "✓ Running as Administrator")
+            self.btn_elevate_admin.setText(adm_txt)
+            self.btn_elevate_admin.setEnabled(False)
+            self.btn_elevate_admin.setProperty("accent", "false")
+            self.btn_elevate_admin.setStyleSheet(
+                f"QPushButton {{ background: #0E2219; border: 1px solid {TOKENS['ok']}; color: {TOKENS['ok']}; padding: 3px 10px; }}"
+            )
+        else:
+            self.lbl_side_priv.setText("◐ STANDARD")
+            self.lbl_side_priv.setStyleSheet(f"color: {TOKENS['warn']}; border: none; background: transparent;")
+            self.lbl_priv_badge.setText("◐ STANDARD USER")
+            self.lbl_priv_badge.setStyleSheet(
+                f"color: {TOKENS['warn']}; background: #261E0F; border: 1px solid {TOKENS['warn']}; padding: 1px 6px;"
+            )
+            side_txt = self._tr_btn("ยกระดับสิทธิ์ Admin", "Run as Admin")
+            self.btn_side_admin.setText(side_txt)
+            self.btn_side_admin.setFont(ATLAS.font_for("body", 9.0, text=side_txt, bold=True))
+            self.btn_side_admin.setStyleSheet(
+                f"QPushButton {{ background: {TOKENS['accent']}; border: 1px solid {TOKENS['accent_hi']}; "
+                f"color: #FFFFFF; padding: 3px 8px; font-weight: 600; }}"
+                f"QPushButton:hover {{ background: #3B8BFF; }}"
+            )
+
+            adm_txt = self._tr_btn("ยกระดับสิทธิ์ผู้ดูแลระบบ (Run as Admin)", "Restart as Administrator")
+            self.btn_elevate_admin.setText(adm_txt)
+            self.btn_elevate_admin.setFont(ATLAS.font_for("body", 9.2, text=adm_txt, bold=True))
+            self.btn_elevate_admin.setEnabled(True)
+            self.btn_elevate_admin.setStyleSheet(
+                f"QPushButton {{ background: {TOKENS['accent']}; border: 1px solid {TOKENS['accent_hi']}; "
+                f"color: #FFFFFF; padding: 4px 12px; font-weight: 600; }}"
+                f"QPushButton:hover {{ background: #3B8BFF; }}"
+            )
+
+        # Startup mode detail label
+        if status_note:
+            self.lbl_startup_status.setText(status_note)
+        elif self.cfg.start_with_windows:
+            if self.cfg.start_with_windows_admin:
+                self.lbl_startup_status.setText(
+                    self._tr("สถานะ: เปิดอัตโนมัติพร้อมสิทธิ์ Admin (Task Scheduler — ไม่เด้ง UAC)", "Active: Elevated Logon Task (Zero-UAC Admin Boot)")
+                )
+            else:
+                self.lbl_startup_status.setText(
+                    self._tr("สถานะ: เปิดอัตโนมัติพร้อม Windows (HKCU Run)", "Active: Standard Windows Startup (HKCU Run)")
+                )
+        else:
+            self.lbl_startup_status.setText(
+                self._tr("สถานะ: ปิดการเปิดอัตโนมัติหลังเปิดเครื่อง", "Disabled: Manual launch only")
+            )
+
+    def _apply_startup_change(self, enable: bool, elevated_task: bool) -> None:
+        dry_run = self.engine.backend.is_demo
+        hwnd = int(self.winId()) if self.isVisible() else 0
+        ok, code, _msg = win_startup.apply_startup_settings(
+            self._repo_root,
+            enable=enable,
+            elevated_task=elevated_task,
+            hwnd=hwnd,
+            dry_run=dry_run,
+        )
+        note = ""
+        if ok:
+            self.cfg.start_with_windows = bool(enable)
+            self.cfg.start_with_windows_admin = bool(enable and elevated_task)
+            self.engine.update_config(self.cfg)
+            self._startup_status = win_startup.query_startup_status(self._repo_root, dry_run=dry_run)
+        else:
+            # Refresh real OS state so toggles stay 100% honest if user cancelled UAC
+            self._startup_status = win_startup.query_startup_status(self._repo_root, dry_run=dry_run)
+            if not dry_run:
+                self.cfg.start_with_windows = self._startup_status.enabled
+                self.cfg.start_with_windows_admin = (self._startup_status.mode == "elevated_task")
+            if code == "cancelled":
+                note = self._tr("ยกเลิกการขอสิทธิ์ผู้ดูแลระบบ (UAC) — คงค่าเดิมไว้", "UAC cancelled — previous startup setting kept")
+            else:
+                note = self._tr("ไม่สามารถอัปเดตการเปิดอัตโนมัติได้ กรุณาลองอีกครั้ง", "Could not update Windows startup entry")
+        self._sync_startup_ui(status_note=note)
+
+    def _on_side_autostart_toggled(self, checked: bool) -> None:
+        self._apply_startup_change(enable=checked, elevated_task=self.cfg.start_with_windows_admin)
+
+    def _on_autostart_toggled(self, checked: bool) -> None:
+        self._apply_startup_change(enable=checked, elevated_task=self.cfg.start_with_windows_admin)
+
+    def _on_autostart_min_toggled(self, checked: bool) -> None:
+        self.cfg.autostart_minimized = bool(checked)
+        self.engine.update_config(self.cfg)
+
+    def _on_autostart_admin_toggled(self, checked: bool) -> None:
+        # Turning ON elevated boot automatically enables startup in one click
+        enable = True if checked else self.cfg.start_with_windows
+        self._apply_startup_change(enable=enable, elevated_task=checked)
+
+    def _on_side_admin_clicked(self) -> None:
+        if self._is_admin:
+            self._select_page("apps")
+        else:
+            self._on_relaunch_as_admin()
+
+    def _on_relaunch_as_admin(self) -> None:
+        if self._is_admin:
+            return
+        extra = ["--profile", self._profile_arg] if self._profile_arg else []
+        hwnd = int(self.winId()) if self.isVisible() else 0
+        ok, status = win_startup.relaunch_as_admin(
+            self._repo_root,
+            extra_args=extra,
+            hwnd=hwnd,
+            dry_run=self.engine.backend.is_demo,
+        )
+        if not ok:
+            note = (
+                self._tr("ยกเลิกการยกระดับสิทธิ์ (UAC) — ยังทำงานต่อในโหมดปกติ", "UAC cancelled — continuing in Standard mode")
+                if status == "cancelled"
+                else self._tr("ไม่สามารถเปิดโหมดผู้ดูแลระบบได้", "Failed to relaunch as Administrator")
+            )
+            self._sync_startup_ui(status_note=note)
+
     def _restore_all_tiles(self) -> None:
         for hwnd, tw in list(self._tile_windows.items()):
             self.engine.restore_from_tile(hwnd)
@@ -1456,6 +1791,18 @@ class MainWindow(QtWidgets.QMainWindow):
             txt = f"{n}  {self._tr(th, en)}"
             self._nav_buttons[k].setText(self._qt_esc(txt))
             self._nav_buttons[k].setFont(ATLAS.font_for("body", 10.5, text=txt, bold=True))
+        # Update Startup & Privilege labels
+        self.chk_side_autostart.setText(self._tr_btn("เปิดพร้อม Windows", "Start with Windows"))
+        self.chk_autostart.setText(
+            self._tr_btn("เปิดโปรแกรมทันทีหลังเปิดเครื่อง (Start with Windows)", "Start Automatically with Windows")
+        )
+        self.chk_autostart_min.setText(
+            self._tr_btn("เริ่มแบบย่อลง System Tray ทันที", "Start Minimized to Tray on Boot")
+        )
+        self.chk_autostart_admin.setText(
+            self._tr_btn("ใช้สิทธิ์ผู้ดูแลตอนเปิดเครื่อง (ไม่เด้ง UAC — คุมหน้าต่าง Admin ได้)", "Elevated Boot Task (Zero-UAC Admin Startup)")
+        )
+        self._sync_startup_ui()
 
     # ------------------------------------------------------------------
     # Lock-free Telemetry & Overlay Bridges
@@ -1478,7 +1825,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_st_engine.setText(f"◐ PAUSED ({frame.paused_reason.upper()})")
             self.lbl_st_engine.setStyleSheet(f"color: {TOKENS['warn']}; background: transparent;")
         else:
-            self.lbl_st_engine.setText("● ENGINE: ACTIVE (ZERO-INJECTION)")
+            mode_tag = "ADMIN // ZERO-INJECTION" if self._is_admin else "ZERO-INJECTION"
+            self.lbl_st_engine.setText(f"● ENGINE: ACTIVE ({mode_tag})")
             self.lbl_st_engine.setStyleSheet(f"color: {TOKENS['ok']}; background: transparent;")
 
         self.tile_played.set_value(f"{frame.total_animations_played}")
@@ -1526,6 +1874,14 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction("Quick Window Controls", self._open_quick_controls)
         menu.addAction("Toggle Desktop Icons", lambda: self.engine.toggle_desktop_icons())
         menu.addSeparator()
+        act_auto = menu.addAction("Start with Windows")
+        act_auto.setCheckable(True)
+        act_auto.setChecked(bool(self.cfg.start_with_windows))
+        act_auto.toggled.connect(self._on_autostart_toggled)
+        self._act_tray_autostart = act_auto
+        if not self._is_admin:
+            self._act_tray_admin = menu.addAction("Restart as Administrator", self._on_relaunch_as_admin)
+        menu.addSeparator()
         menu.addAction("Emergency Restore All Windows", self._on_emergency_restore)
         menu.addAction("Quit PrismFX", self.full_shutdown)
         tray.setContextMenu(menu)
@@ -1537,6 +1893,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.showNormal()
         self.activateWindow()
         self.raise_()
+        self._select_page(self._active_page)
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():

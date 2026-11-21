@@ -74,11 +74,29 @@ class RecoveryJournal:
         }
         tmp = self.path.with_suffix(".json.part")
         data = json.dumps(payload, indent=2).encode("utf-8")
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path)
+        for attempt in range(6):
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+                return
+            except PermissionError:
+                if attempt == 5:
+                    try:
+                        # Last-resort direct overwrite if AV/indexer locked atomic replace
+                        with open(self.path, "wb") as f:
+                            f.write(data)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return
+                time.sleep(0.008 * (attempt + 1))
+            except OSError:
+                return
 
     def has_pending_recovery(self) -> bool:
         with self._lock:
@@ -180,8 +198,8 @@ class RecoveryJournal:
             self._windows.clear()
             self._desktop_icons_hidden_by_app = False
             self._original_min_animate = None
-            self._flush_locked()
 
+        # Always revert live OS mutations FIRST so disk/AV locks can NEVER prevent restoring user windows!
         restored = 0
         for m in items:
             try:
@@ -211,4 +229,7 @@ class RecoveryJournal:
                 restored += 1
             except Exception:
                 pass
+
+        with self._lock:
+            self._flush_locked()
         return restored
