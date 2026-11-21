@@ -59,7 +59,7 @@
 
 ## ✨ Why PrismFX Studio?
 
-| Capability | PrismFX Studio v1.0.0 |
+| Capability | PrismFX Studio |
 | :--- | :--- |
 | **Zero DLL Injection** | Runs strictly out-of-process via Win32 `SetWinEventHook` + Raw Input — 100% safe alongside games & anti-cheat. |
 | **Zero-Swapchain Anti-Flicker** | Renders via offscreen OpenGL 3.3 FBO → `UpdateLayeredWindow`, avoiding MPO / NVIDIA Overlay (`Alt+Z`) hooks. |
