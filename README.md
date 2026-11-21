@@ -9,6 +9,7 @@
 *42+ native OpenGL 3.3 Core GLSL shaders · Compiz-style wobbly spring physics · Zero DLL injection · Crash-safe OS recovery*
 
 <p>
+  <a href="https://github.com/Tenfoto/PrismFX/releases/latest"><img src="https://img.shields.io/github/v/release/Tenfoto/PrismFX?style=for-the-badge&color=2D81FF&label=Release" alt="Latest Release" /></a>
   <img src="https://img.shields.io/badge/Platform-Windows%2011%20(24H2)-0078D6?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 11" />
   <img src="https://img.shields.io/badge/Python-3.12+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12+" />
   <img src="https://img.shields.io/badge/OpenGL-3.3%20Core-5586A4?style=for-the-badge&logo=opengl&logoColor=white" alt="OpenGL 3.3 Core" />
@@ -167,11 +168,14 @@ Captured directly on the target Windows 11 24H2 machine via the built-in `--perf
 
 ## ⚡ Quick Start
 
-### Prerequisites
-- **Windows 11** (64-bit) with OpenGL 3.3+ capable GPU
-- **Python 3.12+**
+### Option A — Download Pre-Built Windows Release *(Recommended, No Python Required)*
 
-### Installation & Run
+1. Download **`PrismFX-v1.0.0-Windows-x64.zip`** from [**GitHub Releases**](https://github.com/Tenfoto/PrismFX/releases/latest).
+2. Extract the archive and double-click **`PrismFX\PrismFX.exe`**.
+
+### Option B — Run from Source
+
+- **Requirements:** **Windows 11** (64-bit) with OpenGL 3.3+ GPU · **Python 3.12+**
 
 ```powershell
 # 1. Clone the repository

@@ -1,0 +1,172 @@
+name: Build & Publish Windows Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build & publish (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Windows x64 EXE & Portable Bundles
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Building release for tag: $tag"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies (PySide6 + PyInstaller)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 pyinstaller
+
+      - name: Verify headless core physics, catalog & recovery journal
+        shell: pwsh
+        run: |
+          @'
+          from prismfx.core.physics import DampedSpring, WobblyMesh, eval_easing
+          from prismfx.core.effects import EffectRegistry
+          from prismfx.core.catalog import classify_app
+          sp = DampedSpring(0.0, 1.0, omega=18.0, zeta=1.0)
+          for _ in range(165):
+              sp.step(1.0 / 165.0)
+          assert abs(sp.value - 1.0) < 1e-3, sp.value
+          reg = EffectRegistry()
+          assert reg.shader_effect_count() == 42, reg.shader_effect_count()
+          assert classify_app("VALORANT-Win64-Shipping.exe", "UnrealWindow").recommended_exclude
+          print("Core sanity checks passed: 42 shaders registered, spring physics converged.")
+          '@ | python -
+
+      - name: Build Portable Bundle (dist/PrismFX-Portable)
+        shell: pwsh
+        run: |
+          python build_dist.py
+          Copy-Item "README.md" "dist\PrismFX-Portable\README.md" -Force
+
+      - name: Build Standalone Trimmed Windows EXE (dist/PrismFX)
+        shell: pwsh
+        run: |
+          python build_dist.py --exe
+          Copy-Item "README.md" "dist\PrismFX\README.md" -Force
+          if (-not (Test-Path "dist\PrismFX\PrismFX.exe")) {
+            throw "Expected dist\PrismFX\PrismFX.exe was not generated!"
+          }
+          $exeSizeMB = [math]::Round((Get-Item "dist\PrismFX\PrismFX.exe").Length / 1MB, 2)
+          Write-Host "Built dist\PrismFX\PrismFX.exe ($exeSizeMB MB)"
+
+      - name: Package Release Archives & SHA256SUMS
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          New-Item -ItemType Directory -Path "release_artifacts" -Force | Out-Null
+
+          $exeZip = "release_artifacts\PrismFX-$tag-Windows-x64.zip"
+          $portZip = "release_artifacts\PrismFX-$tag-Portable.zip"
+
+          Compress-Archive -Path "dist\PrismFX" -DestinationPath $exeZip -CompressionLevel Optimal -Force
+          Compress-Archive -Path "dist\PrismFX-Portable" -DestinationPath $portZip -CompressionLevel Optimal -Force
+
+          $zips = Get-ChildItem "release_artifacts\*.zip" | Sort-Object Name
+          $checksumLines = foreach ($z in $zips) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $z.FullName).Hash.ToLowerInvariant()
+            "$hash  $($z.Name)"
+          }
+          Set-Content -Path "release_artifacts\SHA256SUMS.txt" -Value $checksumLines -Encoding ascii
+
+          Get-ChildItem "release_artifacts" | Format-Table Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}} -AutoSize
+          Get-Content "release_artifacts\SHA256SUMS.txt"
+
+      - name: Prepare Release Notes
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $template = @'
+          ## PrismFX Studio __TAG__
+
+          **Next-Gen 165 Hz GPU-Accelerated Windows 11 Desktop Motion & Window FX Studio**
+
+          42+ native OpenGL 3.3 Core GLSL shaders, Compiz-style 4x4 spring-mass wobbly windows, focus spotlight controls, zero DLL injection, and crash-safe atomic OS recovery.
+
+          ---
+
+          ### Which Download Should I Pick?
+
+          | Package | Best For | Requirements |
+          | :--- | :--- | :--- |
+          | **`PrismFX-__TAG__-Windows-x64.zip`** *(Recommended)* | Most Windows 11 users — unzip and run `PrismFX.exe` immediately | Windows 11 (64-bit) + OpenGL 3.3 GPU (no Python needed) |
+          | **`PrismFX-__TAG__-Portable.zip`** | Lightweight portable package (~350 KB) with `PrismFX.bat` & silent launcher | Windows 11 + Python 3.12+ + `pip install PySide6` |
+          | **`SHA256SUMS.txt`** | Integrity verification checksums | Any SHA-256 verifier (`Get-FileHash`) |
+
+          ---
+
+          ### Highlights in __TAG__
+
+          - **42 Original Bi-Directional GPU Shaders + Custom `.glsl` Plugin API:** Spatial & Fluid (10), Elemental & Energy (10), Cyber & Glitch (8), 3D Architectural (8), Clean & Directional (6), plus Smart Random Pool.
+          - **Zero-Swapchain Offscreen GPU Rendering:** Renders via OpenGL 3.3 Core FBO → `UpdateLayeredWindow`, immune to NVIDIA Overlay (`Alt+Z`) / ShadowPlay / MPO flicker.
+          - **Compiz-Style 165 Hz Wobbly Windows & Momentum Physics:** Closed-form `DampedSpring`, 4x4 `WobblyMesh`, elastic edge bounce, drag translucency, Window Flicks, Smart Edge Snap & Smooth Maximize Morph.
+          - **Focus & Desktop Controls:** Z-ordered Focus Spotlight (Window Halo / Cursor / Dimmer), Inactive Window Fade, Auto-Minimize Idle Timer, Floating Window Mini-Tiles, Titlebar Middle-Click Roll-Up, and Quick Control Bar (`Ctrl+Alt+W`).
+          - **Zero DLL Injection & Crash Safety:** Strictly out-of-process Win32 hooks, automatic pause for fullscreen games / anti-cheat, and atomic `recovery_journal.json` restoration (or emergency `PrismFX.exe --restore`).
+          - **Bilingual Studio UI (EN / TH):** Frameless dark architectural studio with instant `TH / EN` switching.
+
+          ---
+
+          ### Quick Usage (Standalone EXE)
+
+          1. Download and extract **`PrismFX-__TAG__-Windows-x64.zip`**.
+          2. Run **`PrismFX\PrismFX.exe`**.
+          3. *(Optional)* Run `PrismFX.exe --demo` to explore safely with zero OS window side effects, or `PrismFX.exe --restore` to reset any active window states.
+
+          > **Note on Windows SmartScreen:** Because this open-source binary is unsigned and built directly by GitHub Actions from public source, Windows Defender SmartScreen may show a prompt on first launch — click **More info → Run anyway**, or verify the file against `SHA256SUMS.txt`.
+          '@
+          $notes = $template.Replace('__TAG__', $tag)
+          Set-Content -Path "release_notes.md" -Value $notes -Encoding utf8
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $assets = @(Get-ChildItem "release_artifacts" -File | Sort-Object Name | ForEach-Object { $_.FullName })
+          $ErrorActionPreference = "Continue"
+          gh release view $tag *> $null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = "Stop"
+
+          if ($exists) {
+            Write-Host "Release $tag already exists - updating assets and notes..."
+            gh release upload $tag @assets --clobber
+            gh release edit $tag --title "PrismFX Studio $tag" --notes-file release_notes.md --latest
+          } else {
+            Write-Host "Creating GitHub Release $tag..."
+            gh release create $tag @assets --title "PrismFX Studio $tag" --notes-file release_notes.md --latest
+          }
