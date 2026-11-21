@@ -4,11 +4,126 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import pathlib
+import shutil
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Optional
+
+from .effects import EASING_CURVES, sanitize_hex_color
+
+_VALID_EASINGS = frozenset(item[0] for item in EASING_CURVES)
+_VALID_SNAP_ZONES = frozenset({
+    "left_50", "right_50", "left_66", "right_33", "left_33", "right_66",
+    "left_75", "right_25", "left_25", "right_75", "center_50", "center_66",
+    "center_33", "top_50", "bottom_50", "tl_corner", "tr_corner",
+    "bl_corner", "br_corner", "maximize", "minimize", "none",
+})
+_VALID_MIDDLE_CLICK = frozenset({"none", "rollup", "minimize", "pin", "tile"})
+_VALID_SPOTLIGHT_MODES = frozenset({"flat", "halo", "cursor"})
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+
+
+def _is_windows_reserved_name(name: str) -> bool:
+    stem = name.strip().rstrip(". ").split(".", 1)[0].strip().upper()
+    return stem in _WINDOWS_RESERVED_NAMES
+
+
+def _sanitize_preset_name(name: object) -> str:
+    raw = str(name or "").strip()
+    raw_reserved = _is_windows_reserved_name(raw)
+    safe = "".join(c for c in raw if c.isalnum() or c in (" ", "-", "_")).strip()
+    safe = safe.rstrip(". ")[:80].rstrip(". ")
+    if not safe:
+        return "Custom Preset"
+    if raw_reserved or _is_windows_reserved_name(safe):
+        safe = f"preset_{safe}"[:80].rstrip(". ")
+    if not safe or _is_windows_reserved_name(safe):
+        return "Custom Preset"
+    return safe
+
+
+def _parse_bool(val: Any, default: bool) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val)
+    return default
+
+
+def _parse_float(val: Any, default: float, lo: float, hi: float) -> float:
+    if isinstance(val, bool) or val is None:
+        return default
+    if not isinstance(val, (int, float, str)):
+        return default
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return max(lo, min(hi, num))
+
+
+def _parse_int(val: Any, default: int, lo: int, hi: int) -> int:
+    if isinstance(val, bool) or val is None:
+        return default
+    if isinstance(val, int):
+        return max(lo, min(hi, val))
+    if isinstance(val, (float, str)):
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(num):
+            return default
+        return max(lo, min(hi, int(round(num))))
+    return default
+
+
+def _parse_str(
+    val: Any,
+    default: str,
+    allowed: Optional[frozenset[str] | tuple[str, ...]] = None,
+    max_len: int = 128,
+) -> str:
+    if not isinstance(val, str):
+        return default
+    s = val.strip()
+    if not s or "\x00" in s:
+        return default
+    if len(s) > max_len:
+        s = s[:max_len]
+    if allowed is not None and s not in allowed:
+        return default
+    return s
+
+
+def _parse_str_list(
+    val: Any,
+    default: list[str],
+    allow_empty: bool = True,
+    max_items: int = 512,
+) -> list[str]:
+    if not isinstance(val, list):
+        return list(default)
+    cleaned: list[str] = []
+    for item in val:
+        if isinstance(item, str):
+            s = item.strip()
+            if s and "\x00" not in s:
+                cleaned.append(s)
+                if len(cleaned) >= max_items:
+                    break
+    if not cleaned and not allow_empty:
+        return list(default)
+    return cleaned
 
 
 @dataclass
@@ -138,49 +253,138 @@ class PrismConfig:
         cfg = cls()
         if not isinstance(raw, dict):
             return cfg
-        cfg.enabled = bool(raw.get("enabled", cfg.enabled))
-        cfg.language = str(raw.get("language", cfg.language)) if raw.get("language") in ("th", "en") else "th"
-        cfg.active_preset = str(raw.get("active_preset", cfg.active_preset))
-        cfg.global_speed_scale = max(0.35, min(2.5, float(raw.get("global_speed_scale", cfg.global_speed_scale))))
-        cfg.target_fps = max(30, min(360, int(raw.get("target_fps", cfg.target_fps))))
-        cfg.start_with_windows = bool(raw.get("start_with_windows", cfg.start_with_windows))
-        cfg.start_with_windows_admin = bool(raw.get("start_with_windows_admin", cfg.start_with_windows_admin))
-        cfg.autostart_minimized = bool(raw.get("autostart_minimized", cfg.autostart_minimized))
-        cfg.start_minimized_to_tray = bool(raw.get("start_minimized_to_tray", cfg.start_minimized_to_tray))
+        cfg.enabled = _parse_bool(raw.get("enabled"), cfg.enabled)
+        cfg.language = _parse_str(raw.get("language"), cfg.language, allowed=("th", "en"))
+        cfg.active_preset = _parse_str(raw.get("active_preset"), cfg.active_preset, max_len=128)
+        cfg.global_speed_scale = _parse_float(raw.get("global_speed_scale"), cfg.global_speed_scale, 0.35, 2.5)
+        cfg.target_fps = _parse_int(raw.get("target_fps"), cfg.target_fps, 30, 360)
+        cfg.start_with_windows = _parse_bool(raw.get("start_with_windows"), cfg.start_with_windows)
+        cfg.start_with_windows_admin = _parse_bool(raw.get("start_with_windows_admin"), cfg.start_with_windows_admin)
+        cfg.autostart_minimized = _parse_bool(raw.get("autostart_minimized"), cfg.autostart_minimized)
+        cfg.start_minimized_to_tray = _parse_bool(raw.get("start_minimized_to_tray"), cfg.start_minimized_to_tray)
+
         geom = raw.get("window_geometry")
         if isinstance(geom, list) and len(geom) == 4:
-            cfg.window_geometry = [int(v) for v in geom]
+            def_geom = cfg.window_geometry
+            cfg.window_geometry = [
+                _parse_int(geom[0], def_geom[0], -32768, 32768),
+                _parse_int(geom[1], def_geom[1], -32768, 32768),
+                _parse_int(geom[2], def_geom[2], 320, 16384),
+                _parse_int(geom[3], def_geom[3], 240, 16384),
+            ]
 
-        raw_triggers = raw.get("triggers", {})
+        raw_triggers = raw.get("triggers")
         if isinstance(raw_triggers, dict):
             for k, default_tc in cfg.triggers.items():
-                if isinstance(raw_triggers.get(k), dict):
-                    td = raw_triggers[k]
+                td = raw_triggers.get(k)
+                if isinstance(td, dict):
                     cfg.triggers[k] = TriggerConfig(
-                        enabled=bool(td.get("enabled", default_tc.enabled)),
-                        effect_id=str(td.get("effect_id", default_tc.effect_id)),
-                        duration_ms=max(80, min(1400, int(td.get("duration_ms", default_tc.duration_ms)))),
-                        easing=str(td.get("easing", default_tc.easing)),
-                        intensity=max(0.2, min(2.0, float(td.get("intensity", default_tc.intensity)))),
-                        accent_hex=str(td.get("accent_hex", default_tc.accent_hex)),
+                        enabled=_parse_bool(td.get("enabled"), default_tc.enabled),
+                        effect_id=_parse_str(td.get("effect_id"), default_tc.effect_id, max_len=128),
+                        duration_ms=_parse_int(td.get("duration_ms"), default_tc.duration_ms, 80, 1400),
+                        easing=_parse_str(td.get("easing"), default_tc.easing, allowed=_VALID_EASINGS),
+                        intensity=_parse_float(td.get("intensity"), default_tc.intensity, 0.2, 2.0),
+                        accent_hex=sanitize_hex_color(td.get("accent_hex"), default_tc.accent_hex),
                     )
 
-        rp = raw.get("random_pool")
-        if isinstance(rp, list) and rp:
-            cfg.random_pool = [str(x) for x in rp]
+        cfg.random_pool = _parse_str_list(raw.get("random_pool"), cfg.random_pool, allow_empty=False)
 
-        for sub_name, sub_cls in (
-            ("physics", PhysicsConfig),
-            ("focus", FocusConfig),
-            ("safety", SafetyConfig),
-        ):
-            sub_raw = raw.get(sub_name)
-            if isinstance(sub_raw, dict):
-                base = asdict(getattr(cfg, sub_name))
-                for k, v in sub_raw.items():
-                    if k in base:
-                        base[k] = v
-                setattr(cfg, sub_name, sub_cls(**base))
+        raw_physics = raw.get("physics")
+        if isinstance(raw_physics, dict):
+            dp = cfg.physics
+            cfg.physics = PhysicsConfig(
+                wobbly_enabled=_parse_bool(raw_physics.get("wobbly_enabled"), dp.wobbly_enabled),
+                wobbly_stiffness=_parse_float(raw_physics.get("wobbly_stiffness"), dp.wobbly_stiffness, 5.0, 80.0),
+                wobbly_damping=_parse_float(raw_physics.get("wobbly_damping"), dp.wobbly_damping, 0.1, 2.0),
+                wobbly_amplitude=_parse_float(raw_physics.get("wobbly_amplitude"), dp.wobbly_amplitude, 0.0, 3.0),
+                momentum_enabled=_parse_bool(raw_physics.get("momentum_enabled"), dp.momentum_enabled),
+                momentum_friction=_parse_float(raw_physics.get("momentum_friction"), dp.momentum_friction, 0.5, 30.0),
+                momentum_bounce=_parse_bool(raw_physics.get("momentum_bounce"), dp.momentum_bounce),
+                momentum_strict_clamp=_parse_bool(raw_physics.get("momentum_strict_clamp"), dp.momentum_strict_clamp),
+                drag_transparency_enabled=_parse_bool(
+                    raw_physics.get("drag_transparency_enabled"), dp.drag_transparency_enabled
+                ),
+                drag_opacity_pct=_parse_int(raw_physics.get("drag_opacity_pct"), dp.drag_opacity_pct, 20, 100),
+                flicks_enabled=_parse_bool(raw_physics.get("flicks_enabled"), dp.flicks_enabled),
+                flick_threshold=_parse_float(raw_physics.get("flick_threshold"), dp.flick_threshold, 200.0, 10000.0),
+                edge_snap_enabled=_parse_bool(raw_physics.get("edge_snap_enabled"), dp.edge_snap_enabled),
+                smooth_maximize_enabled=_parse_bool(
+                    raw_physics.get("smooth_maximize_enabled"), dp.smooth_maximize_enabled
+                ),
+                smooth_maximize_ms=_parse_int(raw_physics.get("smooth_maximize_ms"), dp.smooth_maximize_ms, 60, 1000),
+                snap_left_zone=_parse_str(
+                    raw_physics.get("snap_left_zone"), dp.snap_left_zone, allowed=_VALID_SNAP_ZONES
+                ),
+                snap_right_zone=_parse_str(
+                    raw_physics.get("snap_right_zone"), dp.snap_right_zone, allowed=_VALID_SNAP_ZONES
+                ),
+                snap_top_zone=_parse_str(
+                    raw_physics.get("snap_top_zone"), dp.snap_top_zone, allowed=_VALID_SNAP_ZONES
+                ),
+                snap_bottom_zone=_parse_str(
+                    raw_physics.get("snap_bottom_zone"), dp.snap_bottom_zone, allowed=_VALID_SNAP_ZONES
+                ),
+                middle_click_titlebar=_parse_str(
+                    raw_physics.get("middle_click_titlebar"), dp.middle_click_titlebar, allowed=_VALID_MIDDLE_CLICK
+                ),
+                double_click_desktop_icons=_parse_bool(
+                    raw_physics.get("double_click_desktop_icons"), dp.double_click_desktop_icons
+                ),
+            )
+
+        raw_focus = raw.get("focus")
+        if isinstance(raw_focus, dict):
+            df = cfg.focus
+            cfg.focus = FocusConfig(
+                spotlight_enabled=_parse_bool(raw_focus.get("spotlight_enabled"), df.spotlight_enabled),
+                spotlight_mode=_parse_str(
+                    raw_focus.get("spotlight_mode"), df.spotlight_mode, allowed=_VALID_SPOTLIGHT_MODES
+                ),
+                spotlight_opacity_pct=_parse_int(
+                    raw_focus.get("spotlight_opacity_pct"), df.spotlight_opacity_pct, 5, 95
+                ),
+                spotlight_color_hex=sanitize_hex_color(
+                    raw_focus.get("spotlight_color_hex"), df.spotlight_color_hex
+                ),
+                spotlight_exclude_snapped=_parse_bool(
+                    raw_focus.get("spotlight_exclude_snapped"), df.spotlight_exclude_snapped
+                ),
+                inactive_fade_enabled=_parse_bool(
+                    raw_focus.get("inactive_fade_enabled"), df.inactive_fade_enabled
+                ),
+                inactive_opacity_pct=_parse_int(
+                    raw_focus.get("inactive_opacity_pct"), df.inactive_opacity_pct, 25, 100
+                ),
+                auto_minimize_enabled=_parse_bool(
+                    raw_focus.get("auto_minimize_enabled"), df.auto_minimize_enabled
+                ),
+                auto_minimize_minutes=_parse_int(
+                    raw_focus.get("auto_minimize_minutes"), df.auto_minimize_minutes, 1, 240
+                ),
+                desktop_icons_autohide=_parse_bool(
+                    raw_focus.get("desktop_icons_autohide"), df.desktop_icons_autohide
+                ),
+                tiles_topmost=_parse_bool(raw_focus.get("tiles_topmost"), df.tiles_topmost),
+                tile_size_px=_parse_int(raw_focus.get("tile_size_px"), df.tile_size_px, 96, 512),
+            )
+
+        raw_safety = raw.get("safety")
+        if isinstance(raw_safety, dict):
+            ds = cfg.safety
+            cfg.safety = SafetyConfig(
+                pause_on_fullscreen_game=_parse_bool(
+                    raw_safety.get("pause_on_fullscreen_game"), ds.pause_on_fullscreen_game
+                ),
+                pause_on_battery=_parse_bool(raw_safety.get("pause_on_battery"), ds.pause_on_battery),
+                auto_exclude_games=_parse_bool(raw_safety.get("auto_exclude_games"), ds.auto_exclude_games),
+                suppress_native_min_anim=_parse_bool(
+                    raw_safety.get("suppress_native_min_anim"), ds.suppress_native_min_anim
+                ),
+                excluded_exes=_parse_str_list(
+                    raw_safety.get("excluded_exes"), ds.excluded_exes, allow_empty=True
+                ),
+            )
+
         return cfg
 
 
@@ -295,25 +499,47 @@ class ConfigStore:
         self.config_path = data_dir / "config.json"
         self.presets_dir = data_dir / "presets"
         self.shaders_dir = data_dir / "shaders"
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.presets_dir.mkdir(parents=True, exist_ok=True)
-        self.shaders_dir.mkdir(parents=True, exist_ok=True)
+        self.last_load_recovered_corrupt: bool = False
+        for d in (self.data_dir, self.presets_dir, self.shaders_dir):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
 
     def load(self) -> PrismConfig:
-        if not self.config_path.exists():
+        self.last_load_recovered_corrupt = False
+        try:
+            exists = self.config_path.exists()
+        except OSError:
+            return PrismConfig()
+        if not exists:
             cfg = PrismConfig()
             self.save(cfg)
             return cfg
         try:
-            raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+            raw_text = self.config_path.read_text(encoding="utf-8-sig")
+            raw = json.loads(raw_text)
+            if not isinstance(raw, dict):
+                raise ValueError("Root config JSON must be an object")
             return PrismConfig.from_dict(raw)
-        except Exception:
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            self.last_load_recovered_corrupt = True
+            try:
+                bak_path = self.config_path.with_name(f"{self.config_path.name}.corrupt.bak")
+                shutil.copyfile(self.config_path, bak_path)
+            except OSError:
+                pass
+            return PrismConfig()
+        except OSError:
             return PrismConfig()
 
-    def save(self, cfg: PrismConfig) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+    def save(self, cfg: PrismConfig) -> bool:
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
+        except (OSError, TypeError, ValueError):
+            return False
         tmp = self.config_path.with_suffix(".json.part")
-        payload = json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
         for attempt in range(5):
             try:
                 with open(tmp, "wb") as f:
@@ -321,19 +547,32 @@ class ConfigStore:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, self.config_path)
-                return
-            except PermissionError:
+                return True
+            except OSError:
                 if attempt == 4:
-                    with open(self.config_path, "wb") as f:
-                        f.write(payload)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    tmp.unlink(missing_ok=True)
-                    return
+                    try:
+                        with open(self.config_path, "wb") as f:
+                            f.write(payload)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        return True
+                    except OSError:
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        return False
                 time.sleep(0.008 * (attempt + 1))
+        return False
 
     def apply_preset(self, cfg: PrismConfig, preset_name: str) -> PrismConfig:
         updated = copy.deepcopy(cfg)
+        if not isinstance(preset_name, str) or not preset_name.strip():
+            return updated
         if preset_name in BUILTIN_PRESETS:
             p = BUILTIN_PRESETS[preset_name]
             updated.active_preset = preset_name
@@ -343,36 +582,80 @@ class ConfigStore:
                     updated.triggers[k].effect_id = tv["effect_id"]
                     updated.triggers[k].duration_ms = tv["duration_ms"]
                     updated.triggers[k].easing = tv["easing"]
-                    updated.triggers[k].accent_hex = tv["accent_hex"]
+                    updated.triggers[k].accent_hex = sanitize_hex_color(
+                        tv["accent_hex"], updated.triggers[k].accent_hex
+                    )
             updated.physics.wobbly_enabled = bool(p["wobbly"])
             updated.physics.momentum_enabled = bool(p["momentum"])
             return updated
 
-        user_file = self.presets_dir / f"{preset_name}.prismpreset.json"
-        if user_file.exists():
-            raw = json.loads(user_file.read_text(encoding="utf-8"))
+        clean_name = preset_name.strip()
+        if (
+            "\x00" in clean_name
+            or "/" in clean_name
+            or "\\" in clean_name
+            or ":" in clean_name
+            or ".." in clean_name
+            or _is_windows_reserved_name(clean_name)
+        ):
+            return updated
+
+        try:
+            presets_root = self.presets_dir.resolve()
+            candidate = self.presets_dir / f"{clean_name}.prismpreset.json"
+            if candidate.is_symlink():
+                link_target = str(candidate.readlink())
+                if link_target.replace("/", "\\").startswith(("\\\\", "\\?")):
+                    return updated
+            user_file = candidate.resolve()
+            if (
+                not user_file.is_relative_to(presets_root)
+                or not user_file.is_file()
+                or user_file.stat().st_size > 512 * 1024
+            ):
+                return updated
+            raw = json.loads(user_file.read_text(encoding="utf-8-sig"))
+            if not isinstance(raw, dict):
+                return updated
             loaded = PrismConfig.from_dict(raw)
-            loaded.active_preset = preset_name
+            loaded.active_preset = clean_name
             loaded.window_geometry = updated.window_geometry
             loaded.language = updated.language
             return loaded
-        return updated
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+            return updated
 
-    def save_user_preset(self, name: str, cfg: PrismConfig) -> pathlib.Path:
-        safe = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_")).strip() or "Custom Preset"
-        out = self.presets_dir / f"{safe}.prismpreset.json"
-        tmp = out.with_suffix(".part")
-        data = json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, out)
-        return out
+    def save_user_preset(self, name: str, cfg: PrismConfig) -> Optional[pathlib.Path]:
+        safe = _sanitize_preset_name(name)
+        tmp: Optional[pathlib.Path] = None
+        try:
+            self.presets_dir.mkdir(parents=True, exist_ok=True)
+            presets_root = self.presets_dir.resolve()
+            out = (self.presets_dir / f"{safe}.prismpreset.json").resolve()
+            if not out.is_relative_to(presets_root):
+                return None
+            tmp = out.with_suffix(".part")
+            data = json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, out)
+            return out
+        except (OSError, TypeError, ValueError):
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return None
 
     def list_presets(self) -> list[tuple[str, bool]]:
         """Return list of (preset_name, is_builtin)."""
         items: list[tuple[str, bool]] = [(name, True) for name in BUILTIN_PRESETS]
-        for f in sorted(self.presets_dir.glob("*.prismpreset.json")):
-            items.append((f.name.replace(".prismpreset.json", ""), False))
+        try:
+            for f in sorted(self.presets_dir.glob("*.prismpreset.json")):
+                items.append((f.name.replace(".prismpreset.json", ""), False))
+        except OSError:
+            pass
         return items

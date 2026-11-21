@@ -5,6 +5,7 @@ from __future__ import annotations
 from ctypes import wintypes
 import pathlib
 import queue
+import threading
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -37,6 +38,8 @@ SPOTLIGHT_SWATCHES = ["#06080E", "#0A0D18", "#120B18", "#071412", "#140D08"]
 class MainWindow(QtWidgets.QMainWindow):
     """Frameless architectural desktop studio controlling PrismEngine & GPU overlays."""
 
+    startupStatusReady = QtCore.Signal(object)
+
     def __init__(
         self,
         engine: PrismEngine,
@@ -46,21 +49,26 @@ class MainWindow(QtWidgets.QMainWindow):
         ipc_msg: int = 0,
         repo_root: Optional[pathlib.Path] = None,
         profile_arg: str = "",
+        ipc_quit_msg: int = 0,
     ) -> None:
         super().__init__()
         self.engine = engine
         self.cfg: PrismConfig = engine.config
         self._lang = self.cfg.language
         self._ipc_msg = int(ipc_msg or 0)
+        self._ipc_quit_msg = int(ipc_quit_msg or 0)
         self._repo_root = (repo_root or pathlib.Path(__file__).resolve().parents[2]).resolve()
         self._profile_arg = profile_arg
-        self._startup_status = win_startup.query_startup_status(
-            self._repo_root, dry_run=self.engine.backend.is_demo
-        )
+        self._shutdown_started = False
+        self._startup_user_modified = False
+        self._is_admin = False
+        # Fast non-blocking initial startup snapshot (avoids 4s sync schtasks /Query in __init__)
+        self._startup_status = self._make_fast_initial_startup_status()
         self._is_admin = self._startup_status.is_admin
         if not self.engine.backend.is_demo:
             self.cfg.start_with_windows = self._startup_status.enabled
             self.cfg.start_with_windows_admin = (self._startup_status.mode == "elevated_task")
+        self.startupStatusReady.connect(self._apply_startup_status, QtCore.Qt.QueuedConnection)
         self._native_bound = False
         self._drag_pos: Optional[QtCore.QPoint] = None
         self._active_page = "home"
@@ -80,7 +88,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"{__app_name__} Studio v{__version__}")
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
         self.setMinimumSize(1120, 720)
-        self._app_icon = self._load_icon(icon_path)
+        self._icon_path: Optional[pathlib.Path] = pathlib.Path(icon_path) if icon_path else None
+        self._app_icon = self._load_icon(self._icon_path)
         self.setWindowIcon(self._app_icon)
 
         # Restore persisted bounds safely
@@ -113,6 +122,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_trigger_controls()
         self._sync_startup_ui()
         self._refresh_apps_table()
+        self._start_async_startup_query()
 
     # ------------------------------------------------------------------
     # Localization helper
@@ -144,6 +154,102 @@ class MainWindow(QtWidgets.QMainWindow):
         p.end()
         return QtGui.QIcon(pm)
 
+    def _is_process_elevated(self) -> bool:
+        """Return True when the current process runs elevated (fail-closed for UIPI guard)."""
+        fn = getattr(w32, "is_process_elevated", None) or getattr(w32, "is_user_admin", None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return True
+        return bool(self._is_admin)
+
+    def _make_fast_initial_startup_status(self) -> win_startup.StartupStatus:
+        """Build an instant, non-blocking StartupStatus without spawning schtasks.exe."""
+        is_admin = self._is_process_elevated()
+        try:
+            exe, _args, _native = win_startup.resolve_launcher(self._repo_root)
+            launcher_path = str(exe)
+        except Exception:
+            launcher_path = ""
+
+        elev_allowed = False
+        elev_reason = ""
+        can_elev = getattr(win_startup, "can_enable_elevated_task", None)
+        if callable(can_elev):
+            try:
+                elev_allowed, elev_reason = can_elev(self._repo_root)
+            except Exception:
+                elev_allowed, elev_reason = False, ""
+
+        enabled = False
+        mode = "none"
+        cmd_line = ""
+        approved_disabled = False
+        if not self.engine.backend.is_demo:
+            read_reg = getattr(win_startup, "_read_registry_run", None)
+            if callable(read_reg):
+                try:
+                    reg_cmd, approved_disabled = read_reg()
+                    if reg_cmd:
+                        enabled = not approved_disabled
+                        mode = "registry"
+                        cmd_line = reg_cmd
+                except Exception:
+                    pass
+
+        base_kwargs = dict(
+            enabled=enabled,
+            mode=mode,
+            is_admin=is_admin,
+            launcher_path=launcher_path,
+            command_line=cmd_line,
+            approved_disabled=approved_disabled,
+        )
+        try:
+            return win_startup.StartupStatus(
+                **base_kwargs,
+                elevated_task_allowed=elev_allowed,
+                elevated_task_block_reason=elev_reason,
+            )
+        except TypeError:
+            return win_startup.StartupStatus(**base_kwargs)
+
+    def _start_async_startup_query(self) -> None:
+        """Query full Task Scheduler + Registry startup state on a daemon thread."""
+        repo_root = self._repo_root
+        dry_run = self.engine.backend.is_demo
+
+        def _worker() -> None:
+            try:
+                st = win_startup.query_startup_status(repo_root, dry_run=dry_run)
+            except Exception:
+                return
+            if self._shutdown_started or self._startup_user_modified:
+                return
+            try:
+                self.startupStatusReady.emit(st)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_worker, name="PrismFX-StartupQuery", daemon=True).start()
+
+    @QtCore.Slot(object)
+    def _apply_startup_status(self, st: object) -> None:
+        """Apply asynchronously queried StartupStatus safely on the Qt GUI thread."""
+        if (
+            self._shutdown_started
+            or self._startup_user_modified
+            or not isinstance(st, win_startup.StartupStatus)
+        ):
+            return
+        self._startup_status = st
+        self._is_admin = st.is_admin
+        if not self.engine.backend.is_demo:
+            self.cfg.start_with_windows = st.enabled
+            self.cfg.start_with_windows_admin = (st.mode == "elevated_task")
+        self._sync_startup_ui()
+
     def ensure_native_handle(self) -> int:
         """Realize native Win32 HWND even when starting hidden in tray (for IPC, UIPI & taskbar pinning)."""
         hwnd = int(self.winId())
@@ -152,9 +258,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._native_bound:
                 self._native_bound = True
                 if self._ipc_msg:
+                    # UIPI hardening: whitelist ONLY the Activate message, NEVER self._ipc_quit_msg
                     w32.allow_window_message_uipi(hwnd, self._ipc_msg)
                 exe, _args, is_native = win_startup.resolve_launcher(self._repo_root)
-                ico = self._repo_root / "assets" / "prismfx.ico"
+                ico = (
+                    self._icon_path
+                    if (self._icon_path is not None and self._icon_path.exists())
+                    else (self._repo_root / "assets" / "prismfx.ico")
+                )
                 relaunch = f'"{exe}"' if is_native else ""
                 icon_res = f"{ico},0" if ico.exists() else ""
                 w32.set_window_app_user_model_properties(
@@ -179,13 +290,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 addr = int(message)
                 if addr:
                     msg = wintypes.MSG.from_address(addr)
-                    if self._ipc_msg and msg.message == self._ipc_msg:
+                    if (
+                        self._ipc_quit_msg
+                        and self._ipc_quit_msg != self._ipc_msg
+                        and msg.message == self._ipc_quit_msg
+                    ):
+                        if msg.wParam == w32.IPC_CMD_QUIT:
+                            QtCore.QTimer.singleShot(0, self.full_shutdown)
+                            return (True, 1)
+                    elif self._ipc_msg and msg.message == self._ipc_msg:
                         if msg.wParam == w32.IPC_CMD_ACTIVATE:
                             QtCore.QTimer.singleShot(0, self._restore_from_tray)
                             return (True, 1)
                         if msg.wParam == w32.IPC_CMD_QUIT:
-                            QtCore.QTimer.singleShot(0, self.full_shutdown)
-                            return (True, 1)
+                            # Reject IPC_CMD_QUIT over the UIPI-whitelisted Activate channel when elevated
+                            if not self._is_process_elevated():
+                                QtCore.QTimer.singleShot(0, self.full_shutdown)
+                                return (True, 1)
+                            return (True, 0)
                     elif msg.message in (w32.WM_QUERYENDSESSION, w32.WM_ENDSESSION):
                         # Synchronously restore all hidden/pre-hidden windows before Windows logs off or shuts down
                         self.engine.stop()
@@ -1614,6 +1736,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sync_startup_ui(self, status_note: str = "") -> None:
         st = self._startup_status
         self._is_admin = st.is_admin
+        elev_allowed = bool(getattr(st, "elevated_task_allowed", False))
+        elev_reason = str(getattr(st, "elevated_task_block_reason", "") or "")
 
         # Sync checkboxes without feedback loops
         for cb, val in (
@@ -1625,6 +1749,33 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
             cb.blockSignals(False)
+
+        # PFX-C01 (Board Decision #3): disallow enabling Zero-UAC Elevated Boot Task in user-writable/Portable dirs
+        if not elev_allowed and st.mode != "elevated_task":
+            self.chk_autostart_admin.setEnabled(False)
+            tip = self._tr(
+                "โหมด Zero-UAC Admin ต้องติดตั้งแบบ Standalone EXE ในโฟลเดอร์ที่ป้องกันสิทธิ์ (เช่น Program Files) — โหมด Portable ใช้ได้เฉพาะ Standard Auto-Start",
+                "Zero-UAC Admin Boot requires a Standalone EXE installed in an Admin-protected folder (e.g. Program Files). Portable mode supports Standard Auto-Start only.",
+            )
+            if elev_reason:
+                tip = f"{tip}\n({elev_reason})"
+            self.chk_autostart_admin.setToolTip(tip)
+        else:
+            self.chk_autostart_admin.setEnabled(True)
+            if not elev_allowed and st.mode == "elevated_task":
+                self.chk_autostart_admin.setToolTip(
+                    self._tr(
+                        "พบ Elevated Task เดิมในโหมด Portable — สามารถยกเลิกเพื่อสลับไปใช้ Standard Auto-Start ที่ปลอดภัยได้",
+                        "Existing elevated task detected in Portable mode — uncheck to migrate to safe Standard Auto-Start.",
+                    )
+                )
+            else:
+                self.chk_autostart_admin.setToolTip(
+                    self._tr(
+                        "เปิดโปรแกรมอัตโนมัติพร้อมสิทธิ์ผู้ดูแลผ่าน Task Scheduler (ไม่เด้ง UAC)",
+                        "Start automatically with Administrator privileges via Task Scheduler (Zero-UAC).",
+                    )
+                )
 
         if self._act_tray_autostart is not None:
             self._act_tray_autostart.blockSignals(True)
@@ -1698,6 +1849,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def _apply_startup_change(self, enable: bool, elevated_task: bool) -> None:
+        self._startup_user_modified = True
         dry_run = self.engine.backend.is_demo
         hwnd = int(self.winId()) if self.isVisible() else 0
         ok, code, _msg = win_startup.apply_startup_settings(
@@ -1721,15 +1873,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.cfg.start_with_windows_admin = (self._startup_status.mode == "elevated_task")
             if code == "cancelled":
                 note = self._tr("ยกเลิกการขอสิทธิ์ผู้ดูแลระบบ (UAC) — คงค่าเดิมไว้", "UAC cancelled — previous startup setting kept")
+            elif code == "blocked_insecure_path":
+                note = self._tr(
+                    "โหมด Zero-UAC Admin ต้องติดตั้งในโฟลเดอร์ที่ป้องกันสิทธิ์ (เช่น Program Files) — โหมด Portable ใช้ได้เฉพาะ Standard Auto-Start",
+                    "Zero-UAC Admin Boot requires an Admin-protected folder (e.g. Program Files) — Portable uses Standard Auto-Start only",
+                )
             else:
                 note = self._tr("ไม่สามารถอัปเดตการเปิดอัตโนมัติได้ กรุณาลองอีกครั้ง", "Could not update Windows startup entry")
         self._sync_startup_ui(status_note=note)
 
     def _on_side_autostart_toggled(self, checked: bool) -> None:
-        self._apply_startup_change(enable=checked, elevated_task=self.cfg.start_with_windows_admin)
+        elev = bool(checked and self.cfg.start_with_windows_admin and getattr(self._startup_status, "elevated_task_allowed", False))
+        self._apply_startup_change(enable=checked, elevated_task=elev)
 
     def _on_autostart_toggled(self, checked: bool) -> None:
-        self._apply_startup_change(enable=checked, elevated_task=self.cfg.start_with_windows_admin)
+        elev = bool(checked and self.cfg.start_with_windows_admin and getattr(self._startup_status, "elevated_task_allowed", False))
+        self._apply_startup_change(enable=checked, elevated_task=elev)
 
     def _on_autostart_min_toggled(self, checked: bool) -> None:
         self.cfg.autostart_minimized = bool(checked)
@@ -1928,6 +2087,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.engine.store.save(self.cfg)
 
     def full_shutdown(self) -> None:
+        self._shutdown_started = True
         self._persist_geometry()
         self._ui_timer.stop()
         self.home_stage.cleanup_gl()

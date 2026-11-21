@@ -1,0 +1,4 @@
+# Pinned build and packaging dependencies for PrismFX Studio releases.
+# Keep versions synchronized with THIRD_PARTY_NOTICES.txt (LGPLv3 Corresponding Source).
+PySide6==6.12.0
+pyinstaller==6.13.0

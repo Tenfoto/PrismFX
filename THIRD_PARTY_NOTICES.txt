@@ -1,0 +1,109 @@
+================================================================================
+PRISMFX STUDIO — THIRD-PARTY SOFTWARE NOTICES AND LICENSE INFORMATION
+================================================================================
+
+This document accompanies both source and binary distributions of PrismFX Studio
+and provides required copyright notices, license references, Corresponding
+Source pointers, and dynamic relinking details in accordance with the MIT
+License and GNU Lesser General Public License version 3 (LGPLv3 §4(a)-(d)).
+
+
+--------------------------------------------------------------------------------
+1. PRISMFX STUDIO
+--------------------------------------------------------------------------------
+Copyright (c) 2026 Tenfoto
+License: MIT License
+
+The PrismFX Studio application source code and assets created by the project
+authors are licensed under the MIT License. See the accompanying `LICENSE` file
+for the complete license text.
+
+Nothing in the PrismFX Studio license restricts modifying the LGPL-covered
+libraries bundled with the standalone distribution, nor reverse engineering for
+debugging such modifications.
+
+
+--------------------------------------------------------------------------------
+2. PYSIDE6 / SHIBOKEN6 / QT 6 FRAMEWORK (LGPLv3)
+--------------------------------------------------------------------------------
+Pinned Version (see `requirements-build.txt`):
+  - PySide6:    6.12.0 (PySide6-Essentials 6.12.0, PySide6-Addons 6.12.0)
+  - Shiboken6:  6.12.0
+  - Qt 6:       6.12.0
+
+Copyright (C) The Qt Company Ltd. and other contributors.
+License: GNU Lesser General Public License version 3 (LGPL-3.0-only)
+
+PrismFX Studio uses PySide6, Shiboken6, and the Qt 6 C++ libraries under the
+terms of the GNU Lesser General Public License version 3 (LGPLv3). Full verbatim
+copies of both licenses accompany this distribution as required by LGPLv3 §4(b):
+  - GNU LGPL Version 3: LICENSES/LGPL-3.0.txt
+  - GNU GPL Version 3:  LICENSES/GPL-3.0.txt
+
+Corresponding Source (LGPLv3 §4(d) / GPLv3 §6):
+PrismFX Studio bundles unmodified upstream binary wheels of PySide6 / Shiboken6
+and Qt 6 matching the exact version pinned in `requirements-build.txt` (6.12.0).
+The complete Corresponding Source code is publicly available from the official
+Qt Project repositories and archives:
+  - Qt 6 Official Releases:
+      https://download.qt.io/official_releases/qt/
+  - PySide6 / Shiboken6 (Qt for Python) Source Repository:
+      https://code.qt.io/cgit/pyside/pyside-setup.git/
+
+Dynamic Relinking Notice (LGPLv3 §4(d)(1) — Standalone PyInstaller `onedir` Mode):
+The standalone Windows distribution (`PrismFX-*-Windows-x64.zip`) is built in
+PyInstaller `onedir` (directory) mode rather than `--onefile` static packing.
+All Qt 6 and PySide6/Shiboken6 shared libraries (`Qt6Core.dll`, `Qt6Gui.dll`,
+`Qt6Widgets.dll`, `Qt6OpenGL.dll`, `Qt6OpenGLWidgets.dll`, `shiboken6*.dll`,
+`PySide6/*.pyd`, and Qt platform plugins) are preserved as separate dynamically
+loaded shared libraries under `_internal/PySide6/` and `_internal/shiboken6/`.
+
+Users may replace these shared library files in `_internal/PySide6/` and
+`_internal/shiboken6/` with their own interface-compatible modified builds of
+Qt 6, PySide6, or Shiboken6 compiled from the Corresponding Source above, and
+run `PrismFX.exe` directly against the modified libraries without recompiling
+PrismFX Studio. (Unused Qt modules such as QtWebEngine, QtPdf, QtMultimedia,
+QtQuick3D, QtShaderTools, QtDesigner, QtSql, QtTest, QtQml, and
+QtVirtualKeyboard are intentionally omitted from the standalone distribution.)
+
+
+--------------------------------------------------------------------------------
+3. PYTHON RUNTIME (CPYTHON)
+--------------------------------------------------------------------------------
+Component: CPython 3.12 Runtime (bundled in Standalone Windows release)
+Copyright (c) 2001-2026 Python Software Foundation. All Rights Reserved.
+License: Python Software Foundation License Version 2 (PSF-2.0)
+Website & Source: https://www.python.org/downloads/source/
+
+The standalone Windows distribution includes the standard CPython runtime DLLs
+and standard library extensions (which incorporate permissively licensed
+third-party libraries such as OpenSSL under Apache-2.0, zlib, libffi, SQLite,
+and Expat as shipped in official CPython Windows releases).
+
+
+--------------------------------------------------------------------------------
+4. PYINSTALLER (PACKAGING BOOTLOADER)
+--------------------------------------------------------------------------------
+Pinned Version (see `requirements-build.txt`):
+  - PyInstaller: 6.13.0
+
+Copyright (c) PyInstaller Development Team.
+License: GNU General Public License Version 2 (or later) with the PyInstaller
+         Bootloader Exception.
+Source:  https://github.com/pyinstaller/pyinstaller
+
+The PyInstaller Bootloader Exception explicitly permits distributing
+executables built with the unmodified PyInstaller bootloader together with
+applications under any license (including MIT), without placing the application
+itself under the GPL.
+
+
+--------------------------------------------------------------------------------
+5. TYPOGRAPHY / FONTS NOTICE
+--------------------------------------------------------------------------------
+PrismFX Studio does NOT bundle or redistribute the `FC Minimal` font or any
+third-party proprietary font files in this repository or in any release
+archive. If `FC Minimal` is already installed by the user on Windows, PrismFX
+Studio may render UI text using it at runtime; otherwise, PrismFX Studio
+automatically falls back to standard Windows system fonts (`Leelawadee UI`,
+`Segoe UI`, `Cascadia Mono`, `Consolas`).

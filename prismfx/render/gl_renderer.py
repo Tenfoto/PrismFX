@@ -34,7 +34,7 @@ GL_COLOR_BUFFER_BIT = 0x4000
 
 _gl_read_pixels_fn = None
 try:
-    _opengl32 = ctypes.WinDLL("opengl32")
+    _opengl32 = ctypes.WinDLL("opengl32", winmode=0x00000800)
     _opengl32.glReadPixels.argtypes = [
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,

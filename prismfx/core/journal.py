@@ -37,30 +37,58 @@ class RecoveryJournal:
         self._windows: dict[int, WindowMutation] = {}
         self._desktop_icons_hidden_by_app: bool = False
         self._original_min_animate: Optional[bool] = None
+        self.last_restore_failed_count: int = 0
         self._load_existing()
 
-    def _load_existing(self) -> None:
-        if not self.path.exists():
-            return
+    def _try_load_file(self, candidate: pathlib.Path) -> bool:
+        if not candidate.is_file():
+            return False
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self._desktop_icons_hidden_by_app = bool(raw.get("desktop_icons_hidden_by_app", False))
-            self._original_min_animate = raw.get("original_min_animate", None)
-            for item in raw.get("windows", []):
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return False
+            loaded_windows: dict[int, WindowMutation] = {}
+            win_list = raw.get("windows", [])
+            if not isinstance(win_list, list):
+                return False
+            for item in win_list:
+                if not isinstance(item, dict) or "hwnd" not in item:
+                    continue
                 m = WindowMutation(
                     hwnd=int(item["hwnd"]),
                     cloaked=bool(item.get("cloaked", False)),
-                    original_alpha=item.get("original_alpha"),
+                    original_alpha=(
+                        int(item["original_alpha"])
+                        if item.get("original_alpha") is not None
+                        else None
+                    ),
                     pinned_by_app=bool(item.get("pinned_by_app", False)),
-                    original_height=item.get("original_height"),
+                    original_height=(
+                        int(item["original_height"])
+                        if item.get("original_height") is not None
+                        else None
+                    ),
                     rolled_up=bool(item.get("rolled_up", False)),
                     timestamp=float(item.get("timestamp", 0.0)),
                 )
-                self._windows[m.hwnd] = m
+                loaded_windows[m.hwnd] = m
+            orig_min = raw.get("original_min_animate", None)
+            self._windows = loaded_windows
+            self._desktop_icons_hidden_by_app = bool(raw.get("desktop_icons_hidden_by_app", False))
+            self._original_min_animate = None if orig_min is None else bool(orig_min)
+            return True
         except Exception:
-            self._windows.clear()
-            self._desktop_icons_hidden_by_app = False
-            self._original_min_animate = None
+            return False
+
+    def _load_existing(self) -> None:
+        part_path = self.path.with_suffix(".json.part")
+        if self._try_load_file(self.path):
+            return
+        if self._try_load_file(part_path):
+            return
+        self._windows.clear()
+        self._desktop_icons_hidden_by_app = False
+        self._original_min_animate = None
 
     def _flush_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,15 +112,7 @@ class RecoveryJournal:
                 return
             except PermissionError:
                 if attempt == 5:
-                    try:
-                        # Last-resort direct overwrite if AV/indexer locked atomic replace
-                        with open(self.path, "wb") as f:
-                            f.write(data)
-                            f.flush()
-                            os.fsync(f.fileno())
-                        tmp.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                    # Never fall back to non-atomic direct overwrite; preserve valid .part for recovery
                     return
                 time.sleep(0.008 * (attempt + 1))
             except OSError:
@@ -183,53 +203,130 @@ class RecoveryJournal:
 
     def restore_all(
         self,
-        uncloak_fn: Callable[[int], None],
-        restore_alpha_fn: Callable[[int, int], None],
-        unpin_fn: Callable[[int], None],
-        unroll_fn: Callable[[int, int], None],
-        show_desktop_icons_fn: Callable[[], None],
-        restore_min_animate_fn: Optional[Callable[[bool], None]] = None,
+        uncloak_fn: Callable[[int], object],
+        restore_alpha_fn: Callable[[int, int], object],
+        unpin_fn: Callable[[int], object],
+        unroll_fn: Callable[[int, int], object],
+        show_desktop_icons_fn: Callable[[], object],
+        restore_min_animate_fn: Optional[Callable[[bool], object]] = None,
     ) -> int:
-        """Revert every recorded mutation safely and clear the journal."""
+        """Revert every recorded mutation safely, preserving any failed entries on disk."""
         with self._lock:
-            items = list(self._windows.values())
+            items = [
+                WindowMutation(
+                    hwnd=m.hwnd,
+                    cloaked=m.cloaked,
+                    original_alpha=m.original_alpha,
+                    pinned_by_app=m.pinned_by_app,
+                    original_height=m.original_height,
+                    rolled_up=m.rolled_up,
+                    timestamp=m.timestamp,
+                )
+                for m in self._windows.values()
+            ]
             restore_icons = self._desktop_icons_hidden_by_app
             orig_min_anim = self._original_min_animate
-            self._windows.clear()
-            self._desktop_icons_hidden_by_app = False
-            self._original_min_animate = None
+
+        def _succeeded(res: object) -> bool:
+            # Explicit False signals Win32/UIPI failure; True or None (legacy void callbacks) counts as ok.
+            return res is not False
 
         # Always revert live OS mutations FIRST so disk/AV locks can NEVER prevent restoring user windows!
         restored = 0
+        failed = 0
+        win_results: dict[int, tuple[bool, bool, bool, bool]] = {}
+
         for m in items:
-            try:
-                if m.cloaked:
-                    uncloak_fn(m.hwnd)
-                    restored += 1
-                if m.original_alpha is not None:
-                    restore_alpha_fn(m.hwnd, m.original_alpha)
-                    restored += 1
-                if m.pinned_by_app:
-                    unpin_fn(m.hwnd)
-                    restored += 1
-                if m.rolled_up and m.original_height is not None:
-                    unroll_fn(m.hwnd, m.original_height)
-                    restored += 1
-            except Exception:
-                pass
+            ok_cloak = False
+            ok_alpha = False
+            ok_pin = False
+            ok_roll = False
+
+            if m.cloaked:
+                try:
+                    if _succeeded(uncloak_fn(m.hwnd)):
+                        ok_cloak = True
+                        restored += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+
+            if m.original_alpha is not None:
+                try:
+                    if _succeeded(restore_alpha_fn(m.hwnd, m.original_alpha)):
+                        ok_alpha = True
+                        restored += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+
+            if m.pinned_by_app:
+                try:
+                    if _succeeded(unpin_fn(m.hwnd)):
+                        ok_pin = True
+                        restored += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+
+            if m.rolled_up and m.original_height is not None:
+                try:
+                    if _succeeded(unroll_fn(m.hwnd, m.original_height)):
+                        ok_roll = True
+                        restored += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+
+            win_results[m.hwnd] = (ok_cloak, ok_alpha, ok_pin, ok_roll)
+
+        ok_icons = False
         if restore_icons:
             try:
-                show_desktop_icons_fn()
-                restored += 1
+                if _succeeded(show_desktop_icons_fn()):
+                    ok_icons = True
+                    restored += 1
+                else:
+                    failed += 1
             except Exception:
-                pass
+                failed += 1
+
+        ok_min_anim = False
         if orig_min_anim is not None and restore_min_animate_fn is not None:
             try:
-                restore_min_animate_fn(orig_min_anim)
-                restored += 1
+                if _succeeded(restore_min_animate_fn(orig_min_anim)):
+                    ok_min_anim = True
+                    restored += 1
+                else:
+                    failed += 1
             except Exception:
-                pass
+                failed += 1
 
         with self._lock:
+            for hwnd, (ok_cloak, ok_alpha, ok_pin, ok_roll) in win_results.items():
+                cur = self._windows.get(hwnd)
+                if cur is None:
+                    continue
+                if ok_cloak:
+                    cur.cloaked = False
+                if ok_alpha:
+                    cur.original_alpha = None
+                if ok_pin:
+                    cur.pinned_by_app = False
+                if ok_roll:
+                    cur.rolled_up = False
+                    cur.original_height = None
+                self._cleanup_entry_locked(hwnd, cur)
+
+            if restore_icons and ok_icons:
+                self._desktop_icons_hidden_by_app = False
+            if orig_min_anim is not None and ok_min_anim:
+                self._original_min_animate = None
+
+            self.last_restore_failed_count = failed
             self._flush_locked()
         return restored

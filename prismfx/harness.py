@@ -232,6 +232,244 @@ def run_selftest() -> dict:
             f"xml_valid={xml_ok} sei_112B={ctypes.sizeof(w32.SHELLEXECUTEINFOW)} propkey_20B={ctypes.sizeof(w32.PROPERTYKEY)}",
         )
 
+        # 7e. Sprint 0 Negative Security & Crash-Safety Tests (100% isolated in TemporaryDirectory)
+        import math
+        import re
+        import subprocess
+        from .core.effects import MAX_CUSTOM_SHADER_BYTES, sanitize_hex_color
+        from .render.shaders import load_custom_fragment_shader
+
+        # (1) sprint0_frozen_autostart: frozen EXE resolution, System32 schtasks, quoting, %TEMP% LPE block
+        frozen_dir = tdir / "frozen_app"
+        frozen_dir.mkdir(parents=True, exist_ok=True)
+        fake_exe = frozen_dir / "PrismFX.exe"
+        fake_exe.write_bytes(b"MZ")
+        orig_has_frozen = hasattr(sys, "frozen")
+        orig_frozen = getattr(sys, "frozen", False)
+        orig_executable = sys.executable
+        orig_subproc_run = subprocess.run
+        orig_shell_exec = w32.shell_execute_elevated
+        os_exec_calls: list[str] = []
+        try:
+            setattr(sys, "frozen", True)
+            sys.executable = str(fake_exe)
+            r_exe, r_args, r_native = win_startup.resolve_launcher(frozen_dir)
+            frozen_launcher_ok = (
+                r_exe == fake_exe.resolve()
+                and r_args == []
+                and r_native is True
+                and all("main.py" not in a.lower() for a in r_args)
+            )
+            schtasks_abs_ok = win_startup.SCHTASKS_EXE.lower().endswith("\\system32\\schtasks.exe")
+            quoted_bs = win_startup._quote_arg("C:\\a b\\")
+            quote_ok = quoted_bs == '"C:\\a b\\\\"'
+            can_elev, block_reason = win_startup.can_enable_elevated_task(frozen_dir)
+
+            def _forbid_subproc(*a, **kw):
+                os_exec_calls.append("subprocess.run")
+                raise AssertionError("subprocess.run must not be called for blocked_insecure_path")
+
+            def _forbid_shell_exec(*a, **kw):
+                os_exec_calls.append("shell_execute_elevated")
+                raise AssertionError("shell_execute_elevated must not be called for blocked_insecure_path")
+
+            subprocess.run = _forbid_subproc  # type: ignore[assignment]
+            w32.shell_execute_elevated = _forbid_shell_exec  # type: ignore[assignment]
+            app_ok, app_code, _app_msg = win_startup.apply_startup_settings(
+                frozen_dir, enable=True, elevated_task=True, dry_run=False
+            )
+            blocked_ok = (
+                not can_elev
+                and bool(block_reason)
+                and app_ok is False
+                and app_code == "blocked_insecure_path"
+                and not os_exec_calls
+            )
+        finally:
+            subprocess.run = orig_subproc_run  # type: ignore[assignment]
+            w32.shell_execute_elevated = orig_shell_exec  # type: ignore[assignment]
+            sys.executable = orig_executable
+            if orig_has_frozen:
+                setattr(sys, "frozen", orig_frozen)
+            elif hasattr(sys, "frozen"):
+                delattr(sys, "frozen")
+        check(
+            "sprint0_frozen_autostart",
+            frozen_launcher_ok and schtasks_abs_ok and quote_ok and blocked_ok,
+            f"launcher={frozen_launcher_ok} schtasks={schtasks_abs_ok} quote={quoted_bs!r} blocked={blocked_ok}",
+        )
+
+        # (2) sprint0_shader_traversal_unc: block traversal, UNC SMB leak, >128KB file, non-.glsl
+        nested_parent = tdir / "lvl1" / "lvl2"
+        shader_bad_dir = nested_parent / "shaders"
+        shader_bad_dir.mkdir(parents=True, exist_ok=True)
+        (tdir / "README.md").write_text("secret outside dir", encoding="utf-8")
+        (shader_bad_dir / "trav.prismfx.json").write_text(
+            json.dumps({"id": "trav", "fragment": "..\\..\\README.md"}), encoding="utf-8"
+        )
+        (shader_bad_dir / "unc.prismfx.json").write_text(
+            json.dumps({"id": "unc_leak", "fragment": "\\\\127.0.0.1\\nonexistent_share\\evil.glsl"}),
+            encoding="utf-8",
+        )
+        oversized_glsl = shader_bad_dir / "oversized.glsl"
+        oversized_glsl.write_bytes(b"// " + b"A" * (MAX_CUSTOM_SHADER_BYTES + 1024))
+        (shader_bad_dir / "oversized.prismfx.json").write_text(
+            json.dumps({"id": "oversized", "fragment": "oversized.glsl"}), encoding="utf-8"
+        )
+        bad_ext = shader_bad_dir / "bad_ext.txt"
+        bad_ext.write_text("void main() {}", encoding="utf-8")
+        (shader_bad_dir / "bad_ext.prismfx.json").write_text(
+            json.dumps({"id": "bad_ext", "fragment": "bad_ext.txt"}), encoding="utf-8"
+        )
+        reg_bad = EffectRegistry()
+        bad_loaded = reg_bad.scan_custom_dir(shader_bad_dir)
+        unc_direct_ok = (
+            load_custom_fragment_shader("\\\\127.0.0.1\\nonexistent_share\\evil.glsl") is None
+            and load_custom_fragment_shader("//127.0.0.1/nonexistent_share/evil.glsl") is None
+            and load_custom_fragment_shader("\\/127.0.0.1\\nonexistent_share\\evil.glsl") is None
+            and load_custom_fragment_shader("/\\127.0.0.1\\nonexistent_share\\evil.glsl") is None
+        )
+        oversized_direct_ok = load_custom_fragment_shader(str(oversized_glsl)) is None
+        ext_direct_ok = load_custom_fragment_shader(str(bad_ext)) is None
+        check(
+            "sprint0_shader_traversal_unc",
+            bad_loaded == 0 and unc_direct_ok and oversized_direct_ok and ext_direct_ok,
+            f"bad_loaded={bad_loaded} unc_blocked={unc_direct_ok} oversized_blocked={oversized_direct_ok} ext_blocked={ext_direct_ok}",
+        )
+
+        # (3) sprint0_qss_injection: accent_hex strictly filtered to ^#[0-9A-Fa-f]{6}$
+        qss_dir = tdir / "qss_shaders"
+        qss_dir.mkdir(parents=True, exist_ok=True)
+        evil_hex = "#2D81FF; border: 8px solid #FF00FF; background: url(//attacker/x.png)"
+        (qss_dir / "safe.glsl").write_text("void main() { fragColor = vec4(1.0); }", encoding="utf-8")
+        (qss_dir / "qss.prismfx.json").write_text(
+            json.dumps({"id": "qss_test", "fragment": "safe.glsl", "accent_hex": evil_hex}),
+            encoding="utf-8",
+        )
+        san_hex = sanitize_hex_color(evil_hex)
+        reg_qss = EffectRegistry()
+        qss_loaded = reg_qss.scan_custom_dir(qss_dir)
+        qss_spec = reg_qss.get("custom_qss_test")
+        hex_re = re.compile(r"^#[0-9A-Fa-f]{6}$")
+        qss_ok = (
+            qss_loaded == 1
+            and bool(hex_re.fullmatch(san_hex))
+            and bool(hex_re.fullmatch(qss_spec.accent_hex))
+            and ";" not in qss_spec.accent_hex
+            and "url(" not in qss_spec.accent_hex.lower()
+        )
+        check(
+            "sprint0_qss_injection",
+            qss_ok,
+            f"san={san_hex!r} spec_accent={qss_spec.accent_hex!r}",
+        )
+
+        # (4) sprint0_config_resilience: per-field safe fallback, corrupt .bak, preset traversal & reserved names
+        bad_raw = {
+            "language": "en",
+            "excluded_exes": None,
+            "global_speed_scale": "not_a_float",
+            "target_fps": float("nan"),
+            "safety": {"excluded_exes": None},
+        }
+        parsed_cfg = PrismConfig.from_dict(bad_raw)
+        default_cfg = PrismConfig()
+        iter_ex = [x.lower() for x in parsed_cfg.safety.excluded_exes]
+        from_dict_ok = (
+            parsed_cfg.language == "en"
+            and isinstance(parsed_cfg.safety.excluded_exes, list)
+            and len(iter_ex) == len(parsed_cfg.safety.excluded_exes)
+            and math.isfinite(parsed_cfg.global_speed_scale)
+            and parsed_cfg.global_speed_scale == default_cfg.global_speed_scale
+            and parsed_cfg.target_fps == default_cfg.target_fps
+        )
+        cfg_iso_dir = tdir / "cfg_resilience"
+        cfg_store = ConfigStore(cfg_iso_dir)
+        cfg_store.config_path.write_text("{corrupt json!!!", encoding="utf-8")
+        recovered_cfg = cfg_store.load()
+        corrupt_bak_ok = (
+            cfg_store.last_load_recovered_corrupt
+            and (cfg_iso_dir / "config.json.corrupt.bak").is_file()
+            and isinstance(recovered_cfg, PrismConfig)
+        )
+        # Escape preset outside presets_dir must NOT be loaded via traversal
+        (tdir / "escape.prismpreset.json").write_text(
+            json.dumps({"enabled": False, "active_preset": "ESCAPED"}), encoding="utf-8"
+        )
+        trav_res = cfg_store.apply_preset(default_cfg, "../../escape")
+        preset_trav_blocked = (
+            trav_res.active_preset == default_cfg.active_preset
+            and trav_res.enabled == default_cfg.enabled
+            and trav_res.to_dict() == default_cfg.to_dict()
+        )
+        saved_con = cfg_store.save_user_preset("CON", default_cfg)
+        con_safe_ok = (
+            not (cfg_store.presets_dir / "CON.json").exists()
+            and not (cfg_store.presets_dir / "CON.prismpreset.json").exists()
+            and saved_con is not None
+            and saved_con.is_file()
+            and saved_con.name.lower() not in ("con.json", "con.prismpreset.json")
+        )
+        check(
+            "sprint0_config_resilience",
+            from_dict_ok and corrupt_bak_ok and preset_trav_blocked and con_safe_ok,
+            f"from_dict={from_dict_ok} bak={corrupt_bak_ok} trav_blocked={preset_trav_blocked} con_safe={con_safe_ok}",
+        )
+
+        # (5) sprint0_journal_failed_restore: failed callbacks must preserve pending entries in memory & on disk
+        jfail_path = tdir / "journal_fail" / "recovery_journal.json"
+        jf = RecoveryJournal(jfail_path)
+        jf.record_alpha(2001, 255)
+        jf.record_pin(2002, True)
+        jf.record_rollup(2003, True, 540)
+        jf.record_desktop_icons_hidden(True)
+        pending_before = jf.pending_count()
+        restored_fail = jf.restore_all(
+            uncloak_fn=lambda _h: False,
+            restore_alpha_fn=lambda _h, _a: False,
+            unpin_fn=lambda _h: False,
+            unroll_fn=lambda _h, _oh: False,
+            show_desktop_icons_fn=lambda: False,
+            restore_min_animate_fn=lambda _orig: False,
+        )
+        jf_reloaded = RecoveryJournal(jfail_path)
+        preserved_ok = (
+            pending_before == 4
+            and restored_fail == 0
+            and jf.pending_count() == pending_before
+            and jf.last_restore_failed_count == pending_before
+            and jfail_path.is_file()
+            and jf_reloaded.pending_count() == pending_before
+        )
+        restored_ok = jf_reloaded.restore_all(
+            uncloak_fn=lambda _h: True,
+            restore_alpha_fn=lambda _h, _a: True,
+            unpin_fn=lambda _h: True,
+            unroll_fn=lambda _h, _oh: True,
+            show_desktop_icons_fn=lambda: True,
+            restore_min_animate_fn=lambda _orig: True,
+        )
+        cleared_ok = (
+            restored_ok == pending_before
+            and jf_reloaded.pending_count() == 0
+            and jf_reloaded.last_restore_failed_count == 0
+            and RecoveryJournal(jfail_path).pending_count() == 0
+        )
+        check(
+            "sprint0_journal_failed_restore",
+            preserved_ok and cleared_ok,
+            f"before={pending_before} fail_kept={preserved_ok} retry_cleared={cleared_ok}",
+        )
+
+        # (6) sprint0_uipi_ipc_split: separate QUIT message ID (>0 and distinct from Activate IPC message)
+        ipc_activate = w32.register_ipc_message(str(tdir))
+        ipc_quit = w32.register_ipc_quit_message(str(tdir))
+        check(
+            "sprint0_uipi_ipc_split",
+            ipc_activate > 0 and ipc_quit > 0 and ipc_quit != ipc_activate,
+            f"activate={ipc_activate} quit={ipc_quit}",
+        )
+
     # 8. OpenGL 3.3 Core GPU compilation & FBO render across ALL 42 built-in shaders!
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fmt = make_gl_format()

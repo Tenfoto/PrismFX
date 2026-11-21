@@ -6,9 +6,41 @@ Zero UI imports — pure data & plugin discovery for both headless core and GPU 
 from __future__ import annotations
 
 import json
+import math
 import pathlib
+import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+MAX_CUSTOM_SHADER_BYTES = 128 * 1024
+_HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+
+
+def sanitize_hex_color(value: object, fallback: str = "#2D81FF") -> str:
+    """Validate a strict #RRGGBB hex color string, returning `fallback` on invalid input."""
+    s = str(value or "").strip()
+    if _HEX_COLOR_RE.fullmatch(s):
+        return s
+    fb = str(fallback or "").strip()
+    if _HEX_COLOR_RE.fullmatch(fb):
+        return fb
+    return "#2D81FF"
+
+
+def _safe_int_clamp(value: object, default: int, lo: int, hi: int) -> int:
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return max(lo, min(hi, value))
+    if isinstance(value, (float, str)):
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(num):
+            return default
+        return max(lo, min(hi, int(round(num))))
+    return default
 
 CATEGORIES: dict[str, tuple[str, str]] = {
     "all": ("All Effects", "ทั้งหมด"),
@@ -217,29 +249,108 @@ class EffectRegistry:
 
     def scan_custom_dir(self, directory: pathlib.Path) -> int:
         """Discover user `.prismfx.json` + `.glsl` custom fragment shader plugins."""
-        if not directory.exists() or not directory.is_dir():
+        try:
+            if not directory.exists() or not directory.is_dir():
+                return 0
+            base_dir = directory.resolve()
+            meta_paths = sorted(directory.glob("*.prismfx.json"))
+        except OSError:
             return 0
         loaded = 0
         next_shader_id = 1000
-        for meta_path in sorted(directory.glob("*.prismfx.json")):
+        for meta_path in meta_paths:
             try:
-                raw = json.loads(meta_path.read_text(encoding="utf-8"))
-                eid = str(raw.get("id") or meta_path.stem.replace(".prismfx", "")).strip()
-                frag_name = str(raw.get("fragment") or f"{eid}.glsl")
-                frag_path = (meta_path.parent / frag_name).resolve()
-                if not eid or not frag_path.exists():
+                if meta_path.is_symlink():
+                    link_target = str(meta_path.readlink())
+                    if link_target.replace("/", "\\").startswith(("\\\\", "\\?")):
+                        continue
+                resolved_meta = meta_path.resolve()
+                if (
+                    not resolved_meta.is_relative_to(base_dir)
+                    or not resolved_meta.is_file()
+                    or resolved_meta.stat().st_size > MAX_CUSTOM_SHADER_BYTES
+                ):
                     continue
+                raw = json.loads(resolved_meta.read_text(encoding="utf-8-sig"))
+                if not isinstance(raw, dict):
+                    continue
+                raw_eid = raw.get("id")
+                eid = (
+                    raw_eid.strip()
+                    if isinstance(raw_eid, str) and raw_eid.strip()
+                    else meta_path.stem.replace(".prismfx", "").strip()
+                )
+                if not eid or "\x00" in eid:
+                    continue
+
+                if "fragment" in raw and raw["fragment"] is not None:
+                    if not isinstance(raw["fragment"], str):
+                        continue
+                    frag_name = raw["fragment"].strip()
+                else:
+                    frag_name = f"{eid}.glsl"
+
+                # Reject empty, NUL, drive/ADS, UNC (\\ or //), absolute, or traversal paths
+                # BEFORE any filesystem call so Windows never issues outbound SMB auth.
+                if (
+                    not frag_name
+                    or "\x00" in frag_name
+                    or ":" in frag_name
+                    or frag_name.startswith(("\\", "/"))
+                ):
+                    continue
+                frag_rel = pathlib.Path(frag_name)
+                if (
+                    frag_rel.is_absolute()
+                    or frag_rel.drive
+                    or frag_rel.root
+                    or ".." in frag_rel.parts
+                    or frag_rel.suffix.lower() != ".glsl"
+                ):
+                    continue
+
+                candidate = resolved_meta.parent / frag_rel
+                if candidate.is_symlink():
+                    link_target = str(candidate.readlink())
+                    if link_target.replace("/", "\\").startswith(("\\\\", "\\?")):
+                        continue
+                frag_path = candidate.resolve()
+                if (
+                    not frag_path.is_relative_to(base_dir)
+                    or frag_path.suffix.lower() != ".glsl"
+                    or not frag_path.is_file()
+                    or frag_path.stat().st_size > MAX_CUSTOM_SHADER_BYTES
+                ):
+                    continue
+
+                name_en = raw.get("name_en")
+                name_en_s = name_en.strip() if isinstance(name_en, str) and name_en.strip() else eid
+                name_th = raw.get("name_th")
+                name_th_s = name_th.strip() if isinstance(name_th, str) and name_th.strip() else name_en_s
+                desc_en = raw.get("desc_en")
+                desc_en_s = (
+                    desc_en.strip()
+                    if isinstance(desc_en, str) and desc_en.strip()
+                    else "Custom user GLSL shader effect."
+                )
+                desc_th = raw.get("desc_th")
+                desc_th_s = (
+                    desc_th.strip()
+                    if isinstance(desc_th, str) and desc_th.strip()
+                    else "เชดเดอร์ GLSL กำหนดเองโดยผู้ใช้"
+                )
+
                 spec = EffectSpec(
                     id=f"custom_{eid}",
                     shader_id=next_shader_id,
-                    name_en=str(raw.get("name_en") or eid),
-                    name_th=str(raw.get("name_th") or raw.get("name_en") or eid),
+                    name_en=name_en_s,
+                    name_th=name_th_s,
                     category="custom",
-                    desc_en=str(raw.get("desc_en") or "Custom user GLSL shader effect."),
-                    desc_th=str(raw.get("desc_th") or "เชดเดอร์ GLSL กำหนดเองโดยผู้ใช้"),
-                    default_ms=max(80, min(1500, int(raw.get("default_ms", 380)))),
-                    accent_hex=str(raw.get("accent_hex") or "#2D81FF"),
-                    mesh_subdiv=max(2, min(48, int(raw.get("mesh_subdiv", 16)))),
+                    desc_en=desc_en_s,
+                    desc_th=desc_th_s,
+                    default_ms=_safe_int_clamp(raw.get("default_ms"), 380, 80, 1500),
+                    accent_hex=sanitize_hex_color(raw.get("accent_hex"), "#2D81FF"),
+                    mesh_subdiv=_safe_int_clamp(raw.get("mesh_subdiv"), 16, 2, 48),
                     is_custom=True,
                     custom_frag_path=str(frag_path),
                     badge="USER",

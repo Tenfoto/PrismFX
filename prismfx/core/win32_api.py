@@ -12,14 +12,25 @@ from dataclasses import dataclass
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# DLL handles
+# DLL handles (strictly loaded from System32 to prevent CWD/AppDir DLL hijacking)
 # ---------------------------------------------------------------------------
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-psapi = ctypes.WinDLL("psapi", use_last_error=True)
+LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
+LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000
+
+
+def _load_system_dll(name: str) -> ctypes.WinDLL:
+    try:
+        return ctypes.WinDLL(name, use_last_error=True, winmode=LOAD_LIBRARY_SEARCH_SYSTEM32)
+    except TypeError:
+        return ctypes.WinDLL(name, use_last_error=True)
+
+
+user32 = _load_system_dll("user32")
+gdi32 = _load_system_dll("gdi32")
+dwmapi = _load_system_dll("dwmapi")
+kernel32 = _load_system_dll("kernel32")
+shell32 = _load_system_dll("shell32")
+psapi = _load_system_dll("psapi")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -560,6 +571,11 @@ kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+try:
+    kernel32.SetDefaultDllDirectories.argtypes = [wintypes.DWORD]
+    kernel32.SetDefaultDllDirectories.restype = wintypes.BOOL
+except Exception:
+    pass
 
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
@@ -645,6 +661,14 @@ def close_handle(handle: int) -> None:
         kernel32.CloseHandle(handle)
 
 
+def harden_dll_search_order() -> bool:
+    """Restrict default Windows DLL search directories to mitigate CWD/PATH DLL hijacking."""
+    try:
+        return bool(kernel32.SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS))
+    except Exception:
+        return False
+
+
 def is_user_admin() -> bool:
     """Return True if the current process is running with elevated Administrator privileges."""
     try:
@@ -653,9 +677,29 @@ def is_user_admin() -> bool:
         return False
 
 
+def is_process_elevated() -> bool:
+    """Return True if the current process is running with elevated Administrator privileges."""
+    return is_user_admin()
+
+
+def _fnv1a_64(text: str) -> int:
+    h = 0xCBF29CE484222325
+    for b in text.encode("utf-8"):
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
 def register_ipc_message(profile_id: str) -> int:
-    """Register a profile-scoped Win32 IPC window message (ACTIVATE / QUIT)."""
+    """Register a profile-scoped Win32 IPC window message (ACTIVATE)."""
     name = f"PrismFX_IPC_{fnv1a_32(profile_id.lower())}"
+    return int(user32.RegisterWindowMessageW(name) or 0)
+
+
+def register_ipc_quit_message(profile_key: str) -> int:
+    """Register a separate profile-scoped Win32 IPC QUIT message (never UIPI-whitelisted)."""
+    h = _fnv1a_64(str(profile_key).lower())
+    name = f"PrismFX_Quit_{h:016X}"
     return int(user32.RegisterWindowMessageW(name) or 0)
 
 

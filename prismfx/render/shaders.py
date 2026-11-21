@@ -711,11 +711,37 @@ out vec4 fragColor;
 """
 
 
+MAX_CUSTOM_SHADER_BYTES = 128 * 1024
+
+
 def load_custom_fragment_shader(path: str) -> Optional[str]:
-    p = pathlib.Path(path)
-    if not p.exists():
+    if not isinstance(path, str):
         return None
-    src = p.read_text(encoding="utf-8", errors="ignore")
+    raw_path = path.strip()
+    if (
+        not raw_path
+        or "\x00" in raw_path
+        or raw_path.replace("/", "\\").startswith(("\\\\", "\\?"))
+    ):
+        return None
+    p = pathlib.Path(raw_path)
+    if p.suffix.lower() != ".glsl":
+        return None
+    try:
+        if p.is_symlink():
+            link_target = str(p.readlink())
+            if link_target.replace("/", "\\").startswith(("\\\\", "\\?")):
+                return None
+        if not p.is_file():
+            return None
+        resolved = p.resolve()
+        if str(resolved).replace("/", "\\").startswith(("\\\\", "\\?")) or resolved.suffix.lower() != ".glsl":
+            return None
+        if resolved.stat().st_size > MAX_CUSTOM_SHADER_BYTES:
+            return None
+        src = resolved.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
     if "#version" in src:
         return src
     return CUSTOM_SHADER_WRAPPER_HEADER + "\n" + src

@@ -339,7 +339,8 @@ class PrismEngine:
         self._open_stager_thread: Optional[threading.Thread] = None
         self._open_wake = threading.Event()
         self._stop_event = threading.Event()
-        self._stop_lock = threading.Lock()
+        self._stop_lock = threading.RLock()
+        self.last_restore_failed_count: int = 0
         self._win_event_hooks: list[int] = []
         self._win_event_cb_ref = None
         self._raw_wndproc_ref = None
@@ -367,8 +368,12 @@ class PrismEngine:
 
     def update_config(self, cfg: PrismConfig, persist: bool = True) -> None:
         old_ex = tuple(self.config.safety.excluded_exes)
+        old_auto_games = bool(self.config.safety.auto_exclude_games)
         self.config = cfg
-        if tuple(cfg.safety.excluded_exes) != old_ex:
+        if (
+            tuple(cfg.safety.excluded_exes) != old_ex
+            or bool(cfg.safety.auto_exclude_games) != old_auto_games
+        ):
             self._cached_captures.clear()
         if persist:
             self.store.save(cfg)
@@ -690,13 +695,14 @@ class PrismEngine:
                 self.backend.set_window_hidden_alpha(hwnd, False, 255)
 
         count = self.journal.restore_all(
-            uncloak_fn=lambda h: self.backend.set_window_cloaked(h, False) if self.backend.is_valid_window(h) else None,
-            restore_alpha_fn=lambda h, a: self.backend.set_window_hidden_alpha(h, False, a) if self.backend.is_valid_window(h) else None,
-            unpin_fn=lambda h: self.backend.set_window_topmost(h, False) if self.backend.is_valid_window(h) else None,
+            uncloak_fn=lambda h: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_cloaked(h, False)),
+            restore_alpha_fn=lambda h, a: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_hidden_alpha(h, False, a)),
+            unpin_fn=lambda h: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_topmost(h, False)),
             unroll_fn=self._restore_window_height,
-            show_desktop_icons_fn=lambda: self.backend.set_desktop_icons_visible(True),
-            restore_min_animate_fn=lambda orig: self.backend.set_native_min_animate(orig),
+            show_desktop_icons_fn=lambda: bool(self.backend.set_desktop_icons_visible(True)),
+            restore_min_animate_fn=lambda orig: bool(self.backend.set_native_min_animate(orig)),
         )
+        self.last_restore_failed_count = self.journal.last_restore_failed_count
         self._publish_frame()
         return count
 
@@ -745,10 +751,13 @@ class PrismEngine:
         if hwnd:
             self._pending_cache_hwnds.add(hwnd)
 
-    def _restore_window_height(self, hwnd: int, orig_h: int) -> None:
+    def _restore_window_height(self, hwnd: int, orig_h: int) -> bool:
+        if not self.backend.is_valid_window(hwnd):
+            return True
         info = self.backend.get_window_info(hwnd)
-        if info and orig_h > 40:
-            self.backend.move_resize_window(hwnd, info.x, info.y, info.w, orig_h)
+        if not info or orig_h <= 40:
+            return True
+        return bool(self.backend.move_resize_window(hwnd, info.x, info.y, info.w, orig_h))
 
     # ------------------------------------------------------------------
     # Window Controls (Pin, Opacity, Roll-Up, Snap, Tile, Test FX)

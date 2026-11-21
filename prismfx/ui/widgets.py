@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..core.effects import EffectSpec
+from ..core.effects import EffectSpec, sanitize_hex_color
 from .theme import ATLAS, TOKENS, has_thai
 
 
@@ -15,7 +15,7 @@ class ScanlineContainer(QtWidgets.QWidget):
 
     def __init__(self, bg_hex: str = TOKENS["bg_base"], parent=None) -> None:
         super().__init__(parent)
-        self._bg = QtGui.QColor(bg_hex)
+        self._bg = QtGui.QColor(sanitize_hex_color(bg_hex, TOKENS["bg_base"]))
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         p = QtGui.QPainter(self)
@@ -85,14 +85,15 @@ class MetricTile(PanelCard):
     def __init__(self, label: str, value: str, detail: str = "", accent: str = TOKENS["accent"], parent=None) -> None:
         super().__init__(recessed=False, parent=parent)
         self.setFixedHeight(86)
-        self._accent = accent
+        safe_accent = sanitize_hex_color(accent, TOKENS["accent"])
+        self._accent = safe_accent
         outer = QtWidgets.QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         bar = QtWidgets.QFrame()
         bar.setFixedWidth(3)
-        bar.setStyleSheet(f"background-color: {accent}; border: none;")
+        bar.setStyleSheet(f"background-color: {safe_accent}; border: none;")
         outer.addWidget(bar)
 
         inner = QtWidgets.QVBoxLayout()
@@ -249,9 +250,11 @@ class EffectCard(QtWidgets.QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        safe_accent = sanitize_hex_color(spec.accent_hex, TOKENS["accent"])
+
         self._bar = QtWidgets.QFrame()
         self._bar.setFixedWidth(4)
-        self._bar.setStyleSheet(f"background-color: {spec.accent_hex}; border: none;")
+        self._bar.setStyleSheet(f"background-color: {safe_accent}; border: none;")
         outer.addWidget(self._bar)
 
         body = QtWidgets.QVBoxLayout()
@@ -269,7 +272,7 @@ class EffectCard(QtWidgets.QFrame):
         self._badge = QtWidgets.QLabel(spec.badge)
         self._badge.setFont(ATLAS.font_for("mono", 7.5, bold=True))
         self._badge.setStyleSheet(
-            f"background: {TOKENS['bg_recessed']}; color: {spec.accent_hex}; "
+            f"background: {TOKENS['bg_recessed']}; color: {safe_accent}; "
             f"border: 1px solid {TOKENS['line_strong']}; padding: 1px 5px;"
         )
         top.addWidget(self._badge)
