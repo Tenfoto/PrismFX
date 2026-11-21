@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build & publish (e.g. v1.0.0)"
+        description: "Release tag to build & publish (e.g. v1.0.1)"
         required: true
-        default: "v1.0.0"
+        default: "v1.0.1"
 
 permissions:
   contents: write
@@ -49,13 +49,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install PySide6 pyinstaller
 
-      - name: Verify headless core physics, catalog & recovery journal
+      - name: Verify headless core physics, catalog, startup & recovery journal
         shell: pwsh
         run: |
           @'
+          import pathlib
           from prismfx.core.physics import DampedSpring, WobblyMesh, eval_easing
           from prismfx.core.effects import EffectRegistry
           from prismfx.core.catalog import classify_app
+          from prismfx.core.startup import build_task_scheduler_xml, query_startup_status
           sp = DampedSpring(0.0, 1.0, omega=18.0, zeta=1.0)
           for _ in range(165):
               sp.step(1.0 / 165.0)
@@ -63,7 +65,11 @@ jobs:
           reg = EffectRegistry()
           assert reg.shader_effect_count() == 42, reg.shader_effect_count()
           assert classify_app("VALORANT-Win64-Shipping.exe", "UnrealWindow").recommended_exclude
-          print("Core sanity checks passed: 42 shaders registered, spring physics converged.")
+          xml = build_task_scheduler_xml("PrismFX.exe", "--autostart", ".", "USER", elevated=True)
+          assert "HighestAvailable" in xml and "--autostart" in xml
+          st = query_startup_status(pathlib.Path("."), dry_run=True)
+          assert st.mode == "none"
+          print("Core sanity checks passed: 42 shaders, spring physics, startup XML & catalog verified.")
           '@ | python -
 
       - name: Build Portable Bundle (dist/PrismFX-Portable)
@@ -123,18 +129,26 @@ jobs:
           | Package | Best For | Requirements |
           | :--- | :--- | :--- |
           | **`PrismFX-__TAG__-Windows-x64.zip`** *(Recommended)* | Most Windows 11 users — unzip and run `PrismFX.exe` immediately | Windows 11 (64-bit) + OpenGL 3.3 GPU (no Python needed) |
-          | **`PrismFX-__TAG__-Portable.zip`** | Lightweight portable package (~350 KB) with `PrismFX.bat` & silent launcher | Windows 11 + Python 3.12+ + `pip install PySide6` |
+          | **`PrismFX-__TAG__-Portable.zip`** | Lightweight portable package (~420 KB) with native windowless `PrismFX.exe` launcher (zero CMD flash) | Windows 11 + Python 3.12+ + `pip install PySide6` |
           | **`SHA256SUMS.txt`** | Integrity verification checksums | Any SHA-256 verifier (`Get-FileHash`) |
 
           ---
 
-          ### Highlights in __TAG__
+          ### What's New in __TAG__
+
+          - **Windows Auto-Start Manager (2 Official Modes):** Supports both Standard User auto-start via `HKCU\...\Run` (zero UAC prompt, visible in Task Manager Startup Apps) and **Elevated Auto-Start** via Windows Task Scheduler (`LogonTrigger` + `HighestAvailable`) to animate Admin windows (Task Manager, Admin PowerShell, Registry Editor) silently at logon.
+          - **One-Click Administrator Elevation & Seamless Handover:** Relaunch as Administrator with official Windows UAC consent plus cross-instance IPC (`--autostart`, `--replace`, `--quit`) for zero-overlap instance takeover.
+          - **Native Windowless GUI Launcher (`PrismFX.exe`):** Portable bundle now compiles a tiny ~12 KB C# GUI launcher with embedded PrismFX icon and `PerMonitorV2` DPI manifest — zero CMD console window flash.
+          - **Hardened Two-Pass Shutdown & Crash Recovery:** Guaranteed synchronous OS state restoration across `CTRL_CLOSE`, `WM_ENDSESSION`, `SIGINT`/`SIGTERM`, and antivirus/indexer file-lock fallback in `recovery_journal.json`.
+
+          ---
+
+          ### Core Highlights
 
           - **42 Original Bi-Directional GPU Shaders + Custom `.glsl` Plugin API:** Spatial & Fluid (10), Elemental & Energy (10), Cyber & Glitch (8), 3D Architectural (8), Clean & Directional (6), plus Smart Random Pool.
-          - **Zero-Swapchain Offscreen GPU Rendering:** Renders via OpenGL 3.3 Core FBO → `UpdateLayeredWindow`, immune to NVIDIA Overlay (`Alt+Z`) / ShadowPlay / MPO flicker.
+          - **Zero-Swapchain Offscreen GPU Rendering:** Renders via OpenGL 3.3 Core FBO -> `UpdateLayeredWindow`, immune to NVIDIA Overlay (`Alt+Z`) / ShadowPlay / MPO flicker.
           - **Compiz-Style 165 Hz Wobbly Windows & Momentum Physics:** Closed-form `DampedSpring`, 4x4 `WobblyMesh`, elastic edge bounce, drag translucency, Window Flicks, Smart Edge Snap & Smooth Maximize Morph.
           - **Focus & Desktop Controls:** Z-ordered Focus Spotlight (Window Halo / Cursor / Dimmer), Inactive Window Fade, Auto-Minimize Idle Timer, Floating Window Mini-Tiles, Titlebar Middle-Click Roll-Up, and Quick Control Bar (`Ctrl+Alt+W`).
-          - **Zero DLL Injection & Crash Safety:** Strictly out-of-process Win32 hooks, automatic pause for fullscreen games / anti-cheat, and atomic `recovery_journal.json` restoration (or emergency `PrismFX.exe --restore`).
           - **Bilingual Studio UI (EN / TH):** Frameless dark architectural studio with instant `TH / EN` switching.
 
           ---

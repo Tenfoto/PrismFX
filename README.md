@@ -170,7 +170,7 @@ Captured directly on the target Windows 11 24H2 machine via the built-in `--perf
 
 ### Option A — Download Pre-Built Windows Release *(Recommended, No Python Required)*
 
-1. Download **`PrismFX-v1.0.0-Windows-x64.zip`** from [**GitHub Releases**](https://github.com/Tenfoto/PrismFX/releases/latest).
+1. Download **`PrismFX-v1.0.1-Windows-x64.zip`** from [**GitHub Releases**](https://github.com/Tenfoto/PrismFX/releases/latest).
 2. Extract the archive and double-click **`PrismFX\PrismFX.exe`**.
 
 ### Option B — Run from Source
@@ -209,6 +209,9 @@ python build_dist.py --exe
 | `--demo` | Run with deterministic `DemoWindowBackend` (zero OS side effects) |
 | `--profile <dir>` | Isolate config, presets, journal, and FNV-1a single-instance mutex |
 | `--minimized` | Start silently in the Windows System Tray |
+| `--autostart` | Launch via Windows startup (respects `autostart_minimized`) |
+| `--replace` | Gracefully shut down any running instance for this profile and take over |
+| `--quit` | Gracefully shut down any running instance for this profile and exit |
 | `--restore` | Immediately restore all journaled OS window states and exit |
 | `--selftest` | Verify core math, physics, recovery journal, and all 42 GPU shaders |
 | `--uitest` | Non-intrusive cloaked UI hit-test & navigation verification |
@@ -329,7 +332,10 @@ PrismFX/
 ├── run.bat                        # One-click launch
 ├── verify.bat                     # Full automated verification suite
 ├── build_dist.py                  # Reproducible portable / trimmed PyInstaller bundle builder
-├── tools/make_icon.py             # Procedural multi-res .ico/.png generator
+├── tools/
+│   ├── make_icon.py               # Procedural multi-res .ico/.png generator
+│   ├── PrismFXLauncher.cs         # Tiny ~12 KB windowless GUI PrismFX.exe launcher
+│   └── PrismFX.manifest           # PerMonitorV2 DPI & Win11 compatibility manifest
 ├── assets/
 │   ├── prismfx.ico                # Multi-resolution Windows icon
 │   ├── prismfx_256.png            # High-resolution brand emblem
@@ -344,6 +350,7 @@ PrismFX/
     │   ├── catalog.py             # Human-centric App Catalog & anti-cheat auto-exclusions
     │   ├── config.py              # Atomic (.part -> fsync -> replace) ConfigStore + 7 presets
     │   ├── journal.py             # Crash-safe atomic OS mutation recovery journal
+    │   ├── startup.py             # Windows Auto-Start (HKCU Run / Elevated Task) & UAC helper
     │   └── engine.py              # Out-of-process SetWinEventHook + Raw Input coordinator
     ├── render/                    # 165 Hz OpenGL 3.3 Core Renderer & Overlays
     │   ├── shaders.py             # GLSL 330 Core vertex (3D mesh + wobble) & 42 fragments
@@ -361,7 +368,7 @@ PrismFX/
 
 ## ⚠️ Known Windows 11 Platform Limitations & Privileges
 
-- **Elevated (Administrator) Target Windows:** Under Windows UIPI (User Interface Privilege Isolation), a standard-privilege PrismFX instance cannot resize, roll up, or change opacity of elevated (Admin) windows; standard user applications work without admin rights.
+- **Elevated (Administrator) Target Windows:** Under Windows UIPI (User Interface Privilege Isolation), a standard-privilege PrismFX instance cannot animate elevated (Admin) windows; enable **Elevated Auto-Start** or **Relaunch as Administrator** inside PrismFX Studio to animate Task Manager, Admin PowerShell, and Registry Editor seamlessly.
 - **DRM / Hardware-Protected Video Surfaces:** Windows protected media paths (e.g., HDCP Netflix playback) return blank frames from `PrintWindow` by OS security design.
 - **Anti-Cheat / Exclusive Fullscreen Games:** Automatically paused via `SHQueryUserNotificationState` and excluded by the built-in App Catalog to preserve zero-latency gaming and anti-cheat compatibility.
 
