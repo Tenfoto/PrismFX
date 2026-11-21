@@ -1,0 +1,106 @@
+# =============================================================================
+# PrismFX Studio — .gitignore
+# =============================================================================
+
+# --- Python Bytecode & Caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+cython_debug/
+
+# --- Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.python-version
+
+# --- Build, Packaging & Distribution ---
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.spec
+*.whl
+*.zip
+*.7z
+*.msi
+*.exe
+
+# --- PrismFX Runtime Profiles, Logs & Temp Files ---
+*.log
+*.tmp
+*.bak
+*.part
+recovery_journal.json
+prismfx_profile*/
+snapshots/
+
+# --- Secrets, Private Keys & Local Credentials ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*.jks
+*.keystore
+*.secret
+*secret*.json
+*credentials*.json
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+.pypirc
+.npmrc
+
+# --- Windows & macOS OS Clutter ---
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- IDEs & Editors ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~

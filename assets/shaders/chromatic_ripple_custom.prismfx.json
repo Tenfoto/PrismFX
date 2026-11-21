@@ -1,0 +1,11 @@
+{
+  "id": "chromatic_ripple_custom",
+  "name_en": "Chromatic Prism Pulse",
+  "name_th": "คลื่นแสงปริซึม (ปลั๊กอินตัวอย่าง)",
+  "desc_en": "Example hot-loadable custom GLSL fragment shader demonstrating PrismFX's plugin API.",
+  "desc_th": "ตัวอย่างเชดเดอร์ GLSL แบบปลั๊กอินที่ผู้ใช้แก้ไขหรือเพิ่มเองได้ทันที",
+  "fragment": "chromatic_ripple_custom.glsl",
+  "default_ms": 380,
+  "accent_hex": "#38BDF8",
+  "mesh_subdiv": 16
+}
