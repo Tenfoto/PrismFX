@@ -246,38 +246,115 @@ void main() {
 
 ## 🗺️ Architecture Map
 
+### System Pipeline Flowchart
+
+```mermaid
+flowchart TB
+    subgraph OS["Windows 11 OS & Input Layer (Out-of-Process · Zero DLL Injection)"]
+        direction LR
+        WinEvent["Win32 SetWinEventHook<br/>Open · Close · Min · Restore · Cloak"]
+        RawIn["Win32 Raw Input<br/>Zero-Stutter Drag · Flicks · Edge Snap"]
+        DWM["DWM & PrintWindow<br/>BGRA Capture & Window Cloaking"]
+    end
+
+    subgraph CORE["Headless Core Engine (prismfx/core · Zero Qt/UI Imports)"]
+        direction TB
+        Engine["PrismEngine (engine.py)<br/>Event Coordinator & Lifecycle"]
+        Catalog["App Catalog (catalog.py)<br/>Games & Anti-Cheat Exclusions"]
+        Physics["165 Hz Physics (physics.py)<br/>DampedSpring · 4x4 WobblyMesh"]
+        Effects["Effect Registry (effects.py)<br/>42 Built-in + Custom .glsl"]
+        Journal["Config & Journal (journal.py)<br/>Atomic OS State Recovery"]
+    end
+
+    subgraph RENDER["Zero-Swapchain GPU Renderer (prismfx/render · OpenGL 3.3 Core)"]
+        direction LR
+        Shaders["GLSL 330 Shaders (shaders.py)<br/>3D Mesh Vertex + 42 Fragments"]
+        GPU["OffscreenGpuEngine (gl_renderer.py)<br/>QOffscreenSurface · 32x32 VBO FBO"]
+        Overlay["DesktopFxOverlay (overlay.py)<br/>Click-Through ULW_ALPHA · Spotlight"]
+    end
+
+    subgraph STUDIO["Studio UI & Verification (prismfx/ui + harness.py)"]
+        direction LR
+        UI["Frameless Studio (main_window.py)<br/>5 Modules · Bilingual TH/EN · Tray"]
+        Stage["Live GPU Stage (preview_widget.py)<br/>Interactive Shader & Wobbly Sandbox"]
+        Harness["Test Harness (harness.py)<br/>selftest · uitest · perf-log · snapshot"]
+    end
+
+    WinEvent -->|"Window Events"| Engine
+    RawIn -->|"Drag Velocity & Gestures"| Engine
+    DWM -->|"Window Bitmap"| Engine
+
+    Engine <--> Catalog
+    Engine <--> Physics
+    Engine <--> Effects
+    Engine <--> Journal
+    Journal -.->|"Crash / Shutdown Restore"| DWM
+
+    Engine -->|"Animation / Morph / Wobble Jobs"| GPU
+    Physics -->|"16 Control-Point Offsets"| GPU
+    Shaders -->|"Compiled Programs"| GPU
+    GPU -->|"Zero-Copy Premultiplied DIB"| Overlay
+    Overlay -->|"Zero-Flicker Composite"| DWM
+
+    UI <-->|"Settings & Presets"| Engine
+    UI --> Stage
+    GPU -->|"Offscreen Preview Frame"| Stage
+    Harness -.->|"Automated Verification"| Engine
+    Harness -.->|"Offscreen Render Checks"| GPU
+
+    classDef osNode fill:#162033,stroke:#38BDF8,stroke-width:1.5px,color:#F2F1EE
+    classDef coreNode fill:#16241F,stroke:#10B981,stroke-width:1.5px,color:#F2F1EE
+    classDef engineNode fill:#172542,stroke:#2D81FF,stroke-width:2px,color:#FFFFFF
+    classDef renderNode fill:#231936,stroke:#A855F7,stroke-width:1.5px,color:#F2F1EE
+    classDef uiNode fill:#2A1E15,stroke:#F97316,stroke-width:1.5px,color:#F2F1EE
+
+    class WinEvent,RawIn,DWM osNode
+    class Engine engineNode
+    class Catalog,Physics,Effects,Journal coreNode
+    class Shaders,GPU,Overlay renderNode
+    class UI,Stage,Harness uiNode
+
+    style OS fill:#0E1525,stroke:#38BDF8,stroke-width:1px,color:#93C5FD
+    style CORE fill:#0D1916,stroke:#10B981,stroke-width:1px,color:#6EE7B7
+    style RENDER fill:#161024,stroke:#A855F7,stroke-width:1px,color:#D8B4FE
+    style STUDIO fill:#1D140E,stroke:#F97316,stroke-width:1px,color:#FDBA74
+```
+
+### Repository Structure
+
 ```text
 PrismFX/
-├── main.py                      # Single-instance FNV-1a mutex, CLI harness, lifecycle hooks
-├── run.bat                      # One-click launch
-├── verify.bat                   # Full automated verification suite
-├── build_dist.py                # Reproducible portable / trimmed PyInstaller bundle builder
-├── tools/make_icon.py           # Procedural multi-res .ico/.png generator
+├── .github/workflows/release.yml  # Automated Windows x64 EXE & Portable Release CI
+├── main.py                        # Single-instance FNV-1a mutex, CLI harness, lifecycle hooks
+├── run.bat                        # One-click launch
+├── verify.bat                     # Full automated verification suite
+├── build_dist.py                  # Reproducible portable / trimmed PyInstaller bundle builder
+├── tools/make_icon.py             # Procedural multi-res .ico/.png generator
 ├── assets/
-│   ├── prismfx.ico              # Multi-resolution Windows icon
-│   ├── prismfx_256.png          # High-resolution brand emblem
-│   └── shaders/                 # Hot-loadable custom user GLSL shader plugins (.glsl + .prismfx.json)
-├── docs/media/                  # Animated GPU demos (.gif) & Studio screenshots (.png)
+│   ├── prismfx.ico                # Multi-resolution Windows icon
+│   ├── prismfx_256.png            # High-resolution brand emblem
+│   └── shaders/                   # Hot-loadable custom GLSL shader plugins (.glsl + .json)
+├── docs/media/                    # Animated GPU demos (.gif) & Studio screenshots (.png)
 └── prismfx/
-    ├── core/                    # Headless Core Engine (0 Qt/UI imports!)
-    │   ├── win32_api.py         # Direct ctypes Win32/DWM/Shell interop (0 wrapper packages)
-    │   ├── backend.py           # IWindowSystemBackend: Win32WindowBackend <-> DemoWindowBackend
-    │   ├── effects.py           # 42 built-in shaders + Custom GLSL plugin scanner
-    │   ├── physics.py           # Closed-form DampedSpring, 4×4 WobblyMesh, Momentum, Flicks & Snap
-    │   ├── catalog.py           # Human-centric App Catalog & game/anti-cheat auto-exclusions
-    │   ├── config.py            # Atomic (.part -> fsync -> replace) ConfigStore + 7 curated presets
-    │   ├── journal.py           # Crash-safe atomic OS mutation recovery journal
-    │   └── engine.py            # Out-of-process SetWinEventHook + Raw Input coordinator
-    ├── render/                  # 165 Hz OpenGL 3.3 Core Renderer & Overlays
-    │   ├── shaders.py           # GLSL 330 Core vertex (3D mesh + wobble) & fragment (42 shaders)
-    │   ├── gl_renderer.py       # Static 32×32 VBO pipeline, zero-swapchain OffscreenGpuEngine
-    │   ├── preview_widget.py    # Interactive 165 Hz Shader Stage & Wobbly Drag Sandbox
-    │   └── overlay.py           # Click-through DesktopFxOverlay, Z-ordered Spotlight, Mini-Tiles, Quick Bar
-    ├── ui/                      # Token-First Frameless Dark Architectural Studio
-    │   ├── theme.py             # Locked tokens (#121316, 0px corners, 3px scanlines, FC Minimal 1.32x Thai)
-    │   ├── widgets.py           # ScanlineContainer, PanelCard, MetricTile, EffectCard, ArchToggle
-    │   └── main_window.py       # 5 Studio pages (Home, Animations Lab, Physics, Focus, Apps & Safety) + Tray
-    └── harness.py               # Built-in --selftest, --uitest, --overlay-test, --perf-log, --snapshot
+    ├── core/                      # Headless Core Engine (0 Qt/UI imports!)
+    │   ├── win32_api.py           # Direct ctypes Win32/DWM/Shell interop (0 wrapper packages)
+    │   ├── backend.py             # IWindowSystemBackend: Win32 <-> DemoWindowBackend
+    │   ├── effects.py             # 42 built-in shaders + Custom GLSL plugin scanner
+    │   ├── physics.py             # Closed-form DampedSpring, 4×4 WobblyMesh, Flicks & Snap
+    │   ├── catalog.py             # Human-centric App Catalog & anti-cheat auto-exclusions
+    │   ├── config.py              # Atomic (.part -> fsync -> replace) ConfigStore + 7 presets
+    │   ├── journal.py             # Crash-safe atomic OS mutation recovery journal
+    │   └── engine.py              # Out-of-process SetWinEventHook + Raw Input coordinator
+    ├── render/                    # 165 Hz OpenGL 3.3 Core Renderer & Overlays
+    │   ├── shaders.py             # GLSL 330 Core vertex (3D mesh + wobble) & 42 fragments
+    │   ├── gl_renderer.py         # Static 32×32 VBO pipeline, zero-swapchain OffscreenGpuEngine
+    │   ├── preview_widget.py      # Interactive 165 Hz Shader Stage & Wobbly Drag Sandbox
+    │   └── overlay.py             # Click-through DesktopFxOverlay, Spotlight, Tiles, Quick Bar
+    ├── ui/                        # Token-First Frameless Dark Architectural Studio
+    │   ├── theme.py               # Locked tokens (#121316, 0px corners, FC Minimal 1.32x Thai)
+    │   ├── widgets.py             # ScanlineContainer, PanelCard, MetricTile, EffectCard
+    │   └── main_window.py         # 5 Studio pages (Home, Lab, Physics, Focus, Apps) + Tray
+    └── harness.py                 # Built-in --selftest, --uitest, --overlay-test, --perf-log
 ```
 
 ---
