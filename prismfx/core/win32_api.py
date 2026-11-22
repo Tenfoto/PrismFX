@@ -15,6 +15,9 @@ import time
 from typing import Optional
 
 from .catalog import classify_app, is_protected_window_class
+from .logging_setup import get_logger
+
+_log = get_logger("prismfx.core.win32_api")
 
 # ---------------------------------------------------------------------------
 # DLL handles (strictly loaded from System32 to prevent CWD/AppDir DLL hijacking)
@@ -175,6 +178,17 @@ WTS_SESSION_LOCK = 0x7
 WTS_SESSION_UNLOCK = 0x8
 NOTIFY_FOR_THIS_SESSION = 0
 VK_LBUTTON = 0x01
+
+WM_HOTKEY = 0x0312
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+VK_W = 0x57
+VK_R = 0x52
+HOTKEY_ID_QUICK_BAR = 1
+HOTKEY_ID_PANIC_RESTORE = 2
 
 MSGFLT_ALLOW = 1
 IPC_CMD_ACTIVATE = 1
@@ -554,6 +568,10 @@ user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.DispatchMessageW.restype = ctypes.c_ssize_t
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
 
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
@@ -717,8 +735,17 @@ def register_session_notification(hwnd: int) -> bool:
     if not hwnd or wtsapi32 is None:
         return False
     try:
-        return bool(wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION))
-    except Exception:
+        ctypes.set_last_error(0)
+        ok = bool(wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION))
+        if not ok:
+            _log.warning(
+                "WTSRegisterSessionNotification failed for hwnd=%#x (winerr=%d)",
+                int(hwnd),
+                ctypes.get_last_error(),
+            )
+        return ok
+    except Exception as exc:
+        _log.warning("WTSRegisterSessionNotification error for hwnd=%#x: %s", int(hwnd), exc)
         return False
 
 
@@ -728,15 +755,72 @@ def unregister_session_notification(hwnd: int) -> bool:
         return False
     try:
         return bool(wtsapi32.WTSUnRegisterSessionNotification(hwnd))
-    except Exception:
+    except Exception as exc:
+        _log.warning("WTSUnRegisterSessionNotification error for hwnd=%#x: %s", int(hwnd), exc)
         return False
+
+
+def register_global_hotkey(hwnd: int, hotkey_id: int, modifiers: int, vk: int) -> bool:
+    """Register a system-wide Win32 hotkey bound to hwnd (receives WM_HOTKEY)."""
+    if not hwnd:
+        return False
+    try:
+        ctypes.set_last_error(0)
+        ok = bool(user32.RegisterHotKey(int(hwnd), int(hotkey_id), int(modifiers), int(vk)))
+        if not ok:
+            err = ctypes.get_last_error()
+            _log.warning(
+                "RegisterHotKey failed (hwnd=%#x, id=%d, mod=%#x, vk=%#x, winerr=%d)",
+                int(hwnd),
+                int(hotkey_id),
+                int(modifiers),
+                int(vk),
+                err,
+            )
+        return ok
+    except Exception as exc:
+        _log.warning(
+            "RegisterHotKey exception (hwnd=%#x, id=%d, mod=%#x, vk=%#x): %s",
+            int(hwnd),
+            int(hotkey_id),
+            int(modifiers),
+            int(vk),
+            exc,
+        )
+        return False
+
+
+def unregister_global_hotkey(hwnd: int, hotkey_id: int) -> bool:
+    """Unregister a system-wide Win32 hotkey previously bound to hwnd."""
+    if not hwnd:
+        return False
+    try:
+        ctypes.set_last_error(0)
+        return bool(user32.UnregisterHotKey(int(hwnd), int(hotkey_id)))
+    except Exception as exc:
+        _log.warning(
+            "UnregisterHotKey exception (hwnd=%#x, id=%d): %s",
+            int(hwnd),
+            int(hotkey_id),
+            exc,
+        )
+        return False
+
+
+def unpack_lparam_signed_xy(lparam: int) -> tuple[int, int]:
+    """Unpack signed 16-bit (x, y) coordinates from a Win32 LPARAM (supports negative multi-monitor coords)."""
+    lp = int(lparam)
+    x = ctypes.c_short(lp & 0xFFFF).value
+    y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+    return (int(x), int(y))
 
 
 def harden_dll_search_order() -> bool:
     """Restrict default Windows DLL search directories to mitigate CWD/PATH DLL hijacking."""
     try:
         return bool(kernel32.SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS))
-    except Exception:
+    except Exception as exc:
+        _log.warning("SetDefaultDllDirectories failed: %s", exc)
         return False
 
 
@@ -780,7 +864,8 @@ def allow_window_message_uipi(hwnd: int, msg: int) -> bool:
         return False
     try:
         return bool(user32.ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None))
-    except Exception:
+    except Exception as exc:
+        _log.warning("ChangeWindowMessageFilterEx failed (hwnd=%#x, msg=%#x): %s", int(hwnd), int(msg), exc)
         return False
 
 
@@ -827,8 +912,8 @@ def register_console_ctrl_handler(on_close_fn) -> bool:
         if kernel32.SetConsoleCtrlHandler(_handler, True):
             _CONSOLE_CTRL_REFS.append(_handler)
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.warning("SetConsoleCtrlHandler failed: %s", exc)
     return False
 
 
@@ -930,7 +1015,8 @@ def set_window_app_user_model_properties(
             return True
         finally:
             _Release(store_ptr.value)
-    except Exception:
+    except Exception as exc:
+        _log.warning("set_window_app_user_model_properties failed (hwnd=%#x): %s", int(hwnd), exc)
         return False
 
 

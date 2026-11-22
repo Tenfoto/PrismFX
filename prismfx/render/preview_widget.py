@@ -41,7 +41,7 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(270)
+        self.setMinimumHeight(180)
         self.setMouseTracking(True)
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)

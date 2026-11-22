@@ -18,6 +18,7 @@ from typing import Optional
 import shiboken6
 from PySide6 import QtCore, QtGui, QtOpenGL
 
+from ..core.logging_setup import get_logger
 from .shaders import (
     FRAGMENT_SHADER_330,
     VERTEX_SHADER_330,
@@ -26,6 +27,8 @@ from .shaders import (
     hex_to_rgb_f,
     load_custom_fragment_shader_checked,
 )
+
+_log = get_logger("prismfx.render.gl_renderer")
 
 GL_NO_ERROR = 0
 GL_TRIANGLES = 0x0004
@@ -178,18 +181,21 @@ class ShaderPipeline:
         prog = QtOpenGL.QOpenGLShaderProgram()
         if not prog.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Vertex, VERTEX_SHADER_330):
             self.error_log = f"Vertex shader error: {prog.log()}"
+            _log.warning("GL 3.3 built-in vertex shader compile failed: %s", self.error_log)
             _destroy_program(prog)
             self._program = None
             self._locs = None
             return False
         if not prog.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Fragment, FRAGMENT_SHADER_330):
             self.error_log = f"Fragment shader error: {prog.log()}"
+            _log.warning("GL 3.3 built-in fragment shader compile failed: %s", self.error_log)
             _destroy_program(prog)
             self._program = None
             self._locs = None
             return False
         if not prog.link():
             self.error_log = f"Program link error: {prog.log()}"
+            _log.warning("GL 3.3 built-in shader link failed: %s", self.error_log)
             _destroy_program(prog)
             self._program = None
             self._locs = None
@@ -198,6 +204,7 @@ class ShaderPipeline:
         vao = QtOpenGL.QOpenGLVertexArrayObject()
         if not vao.create():
             self.error_log = "Failed to create VAO"
+            _log.warning("GL 3.3 pipeline init failed: %s", self.error_log)
             _destroy_program(prog)
             self._program = None
             self._locs = None
@@ -214,6 +221,7 @@ class ShaderPipeline:
         vbo = QtOpenGL.QOpenGLBuffer(QtOpenGL.QOpenGLBuffer.VertexBuffer)
         if not vbo.create():
             self.error_log = "Failed to create VBO"
+            _log.warning("GL 3.3 pipeline init failed: %s", self.error_log)
             vao.release()
             vao.destroy()
             _destroy_program(prog)
@@ -474,12 +482,14 @@ class ShaderPipeline:
                     self._custom_compile_counts.get(custom_frag_path, 0) + 1
                 )
                 _, err = load_custom_fragment_shader_checked(custom_frag_path)
+                err_msg = err or "Invalid custom shader path"
+                _log.warning("Custom GLSL rejected (%r): %s", custom_frag_path, err_msg)
                 self._custom_programs[custom_frag_path] = _CachedCustomProgram(
                     mtime_ns=-1,
                     size=-1,
                     program=None,
                     locs=None,
-                    error_log=err or "Invalid custom shader path",
+                    error_log=err_msg,
                 )
                 assert self._program is not None and self._locs is not None
                 return self._program, self._locs
@@ -497,12 +507,14 @@ class ShaderPipeline:
                 self._custom_compile_counts[custom_frag_path] = (
                     self._custom_compile_counts.get(custom_frag_path, 0) + 1
                 )
+                err_msg = f"Custom shader unavailable: {exc}"
+                _log.warning("Custom GLSL stat failed (%r): %s", custom_frag_path, exc)
                 self._custom_programs[custom_frag_path] = _CachedCustomProgram(
                     mtime_ns=-1,
                     size=-1,
                     program=None,
                     locs=None,
-                    error_log=f"Custom shader unavailable: {exc}",
+                    error_log=err_msg,
                 )
                 assert self._program is not None and self._locs is not None
                 return self._program, self._locs
@@ -523,12 +535,14 @@ class ShaderPipeline:
             )
             src, err = load_custom_fragment_shader_checked(custom_frag_path)
             if not src:
+                err_msg = err or "Failed to load custom shader"
+                _log.warning("Custom GLSL validation/load failed (%r): %s", custom_frag_path, err_msg)
                 self._custom_programs[custom_frag_path] = _CachedCustomProgram(
                     mtime_ns=mtime_ns,
                     size=size,
                     program=None,
                     locs=None,
-                    error_log=err or "Failed to load custom shader",
+                    error_log=err_msg,
                 )
                 assert self._program is not None and self._locs is not None
                 return self._program, self._locs
@@ -541,6 +555,7 @@ class ShaderPipeline:
             )
             if not compiled:
                 log = (cp.log() or "Custom GLSL shader compile/link failed").strip()
+                _log.warning("Custom GLSL compile/link error (%r): %s", custom_frag_path, log)
                 _destroy_program(cp)
                 self._custom_programs[custom_frag_path] = _CachedCustomProgram(
                     mtime_ns=mtime_ns,
@@ -559,6 +574,7 @@ class ShaderPipeline:
                     gl_funcs = cur_ctx.functions()
             smoke_ok, smoke_err = self._smoke_test_custom_program(cp, locs, gl_funcs)
             if not smoke_ok:
+                _log.warning("Custom GLSL smoke test failed (%r): %s", custom_frag_path, smoke_err)
                 _destroy_program(cp)
                 self._custom_programs[custom_frag_path] = _CachedCustomProgram(
                     mtime_ns=mtime_ns,
@@ -651,6 +667,13 @@ class ShaderPipeline:
         self._vao.release()
         prog.release()
 
+    def invalidate_custom_shaders(self) -> None:
+        """Destroy all cached custom shader programs (caller holds current GL context) and clear caches."""
+        for entry in list(self._custom_programs.values()):
+            _destroy_program(entry.program)
+        self._custom_programs.clear()
+        self._custom_compile_counts.clear()
+
     def cleanup(self) -> None:
         if self._vbo is not None:
             if shiboken6.isValid(self._vbo):
@@ -660,10 +683,7 @@ class ShaderPipeline:
             if shiboken6.isValid(self._vao):
                 self._vao.destroy()
             self._vao = None
-        for entry in list(self._custom_programs.values()):
-            _destroy_program(entry.program)
-        self._custom_programs.clear()
-        self._custom_compile_counts.clear()
+        self.invalidate_custom_shaders()
         _destroy_program(self._program)
         self._program = None
         self._locs = None
@@ -726,6 +746,40 @@ class OffscreenGpuEngine:
     def custom_compile_count(self, path: Optional[str]) -> int:
         return self._pipeline.custom_compile_count(path)
 
+    def invalidate_custom_shaders(self) -> None:
+        """Destroy cached custom GLSL programs so edited shaders recompile on next render/check."""
+        if (
+            self.ready
+            and self._ctx is not None
+            and self._surf is not None
+            and shiboken6.isValid(self._ctx)
+            and shiboken6.isValid(self._surf)
+            and self._ctx.isValid()
+            and self._surf.isValid()
+            and self._ctx.makeCurrent(self._surf)
+        ):
+            try:
+                self._pipeline.invalidate_custom_shaders()
+            finally:
+                self._ctx.doneCurrent()
+        else:
+            self._pipeline._custom_programs.clear()
+            self._pipeline._custom_compile_counts.clear()
+
+    def compile_check_custom_shader(self, frag_path: Optional[str]) -> str:
+        """Compile and smoke-test a custom GLSL shader on demand, returning any error string."""
+        if not frag_path:
+            return ""
+        if not self.ensure_ready() or self._ctx is None or self._surf is None:
+            return self._init_error or "OpenGL 3.3 Core unavailable"
+        if not self._ctx.makeCurrent(self._surf):
+            return "Failed to make OpenGL 3.3 context current"
+        try:
+            self._pipeline._get_program_for(frag_path, gl_funcs=self._ctx.functions())
+        finally:
+            self._ctx.doneCurrent()
+        return self._pipeline.get_custom_shader_error(frag_path)
+
     def ensure_ready(self) -> bool:
         if self.ready:
             return True
@@ -739,11 +793,13 @@ class OffscreenGpuEngine:
         ctx.setFormat(fmt)
         if not ctx.create():
             self._init_error = "OpenGL 3.3 Core context creation failed"
+            _log.warning("GL 3.3 init failed: %s", self._init_error)
             return False
 
         ver = ctx.format().version()
         if ver < (3, 3):
             self._init_error = f"OpenGL 3.3+ required (driver reported {ver[0]}.{ver[1]})"
+            _log.warning("GL 3.3 init failed: %s", self._init_error)
             return False
 
         surf = QtGui.QOffscreenSurface()
@@ -751,10 +807,12 @@ class OffscreenGpuEngine:
         surf.create()
         if not surf.isValid():
             self._init_error = "Failed to create QOffscreenSurface"
+            _log.warning("GL 3.3 init failed: %s", self._init_error)
             surf.destroy()
             return False
         if not ctx.makeCurrent(surf):
             self._init_error = "Failed to make OpenGL 3.3 context current"
+            _log.warning("GL 3.3 init failed: %s", self._init_error)
             surf.destroy()
             return False
 
@@ -775,6 +833,7 @@ class OffscreenGpuEngine:
 
             if not self._pipeline.initialize():
                 self._init_error = self._pipeline.error_log or "ShaderPipeline initialization failed"
+                _log.warning("GL 3.3 init failed: %s", self._init_error)
                 ctx.doneCurrent()
                 surf.destroy()
                 return False
@@ -820,6 +879,7 @@ class OffscreenGpuEngine:
             ctx.doneCurrent()
         except Exception as exc:
             self._init_error = f"OpenGL initialization error: {exc}"
+            _log.warning("GL 3.3 init exception: %s", exc)
             _destroy_texture_obj(mock_tex)
             self._pipeline.cleanup()
             try:
@@ -842,6 +902,7 @@ class OffscreenGpuEngine:
 
     def validate_context(self) -> bool:
         """Check active OpenGL context health (e.g. after sleep/wake or display change); rebuild if lost."""
+        reset_reason = ""
         if (
             self.ready
             and self._ctx is not None
@@ -855,15 +916,23 @@ class OffscreenGpuEngine:
             healthy = True
             try:
                 if self._gl_reset_status_fn is not None:
-                    if int(self._gl_reset_status_fn()) != 0:
+                    status = int(self._gl_reset_status_fn())
+                    if status != 0:
                         healthy = False
-            except Exception:
+                        reset_reason = f"glGetGraphicsResetStatus=0x{status:X}"
+            except Exception as exc:
                 healthy = False
+                reset_reason = f"reset probe exception: {exc}"
             finally:
                 self._ctx.doneCurrent()
             if healthy:
                 return True
 
+        if self.ready or self._ctx is not None:
+            _log.warning(
+                "OpenGL context lost or invalid (%s); rebuilding OffscreenGpuEngine",
+                reset_reason or "context/surface invalid or makeCurrent failed",
+            )
         self.shutdown()
         self._init_attempted = False
         self._init_error = ""

@@ -46,7 +46,7 @@ class SectionHeader(QtWidgets.QWidget):
         lay.setSpacing(2)
 
         self._tag = QtWidgets.QLabel(tag.upper())
-        self._tag.setFont(ATLAS.font_for("mono", 8.5, bold=True))
+        self._tag.setFont(ATLAS.font_for("mono", 8.5, text=tag, bold=True))
         self._tag.setStyleSheet(f"color: {TOKENS['accent_hi']}; letter-spacing: 1.4px;")
         lay.addWidget(self._tag)
 
@@ -55,14 +55,12 @@ class SectionHeader(QtWidgets.QWidget):
         self._title.setStyleSheet(f"color: {TOKENS['ink_primary']};")
         lay.addWidget(self._title)
 
-        if subtitle:
-            self._sub = QtWidgets.QLabel(subtitle)
-            self._sub.setFont(ATLAS.font_for("body", 10.0, text=subtitle))
-            self._sub.setStyleSheet(f"color: {TOKENS['ink_secondary']};")
-            self._sub.setWordWrap(True)
-            lay.addWidget(self._sub)
-        else:
-            self._sub = None
+        self._sub = QtWidgets.QLabel(subtitle)
+        self._sub.setFont(ATLAS.font_for("body", 10.0, text=subtitle))
+        self._sub.setStyleSheet(f"color: {TOKENS['ink_secondary']};")
+        self._sub.setWordWrap(True)
+        self._sub.setVisible(bool(subtitle))
+        lay.addWidget(self._sub)
 
         line = QtWidgets.QFrame()
         line.setFixedHeight(1)
@@ -72,11 +70,18 @@ class SectionHeader(QtWidgets.QWidget):
 
     def set_texts(self, tag: str, title: str, subtitle: str = "") -> None:
         self._tag.setText(tag.upper())
+        self._tag.setFont(ATLAS.font_for("mono", 8.5, text=tag, bold=True))
         self._title.setText(title)
         self._title.setFont(ATLAS.font_for("display", 14.5, text=title, bold=True))
-        if self._sub is not None:
-            self._sub.setText(subtitle)
-            self._sub.setFont(ATLAS.font_for("body", 10.0, text=subtitle))
+        self._sub.setText(subtitle)
+        self._sub.setFont(ATLAS.font_for("body", 10.0, text=subtitle))
+        self._sub.setVisible(bool(subtitle))
+
+    def title_text(self) -> str:
+        return self._title.text()
+
+    def subtitle_text(self) -> str:
+        return self._sub.text()
 
 
 class MetricTile(PanelCard):
@@ -84,7 +89,7 @@ class MetricTile(PanelCard):
 
     def __init__(self, label: str, value: str, detail: str = "", accent: str = TOKENS["accent"], parent=None) -> None:
         super().__init__(recessed=False, parent=parent)
-        self.setFixedHeight(86)
+        self.setFixedHeight(78)
         safe_accent = sanitize_hex_color(accent, TOKENS["accent"])
         self._accent = safe_accent
         outer = QtWidgets.QHBoxLayout(self)
@@ -97,16 +102,16 @@ class MetricTile(PanelCard):
         outer.addWidget(bar)
 
         inner = QtWidgets.QVBoxLayout()
-        inner.setContentsMargins(12, 9, 12, 9)
-        inner.setSpacing(2)
+        inner.setContentsMargins(12, 7, 12, 7)
+        inner.setSpacing(1)
 
         self._lbl = QtWidgets.QLabel(label.upper())
-        self._lbl.setFont(ATLAS.font_for("mono", 8.5, bold=True))
+        self._lbl.setFont(ATLAS.font_for("mono", 8.0, text=label, bold=True))
         self._lbl.setStyleSheet(f"color: {TOKENS['ink_muted']}; background: transparent; border: none;")
         inner.addWidget(self._lbl)
 
         self._val = QtWidgets.QLabel(value)
-        self._val.setFont(ATLAS.font_for("mono", 16.0, bold=True))
+        self._val.setFont(ATLAS.font_for("mono", 16.0, text=value, bold=True))
         self._val.setStyleSheet(f"color: {TOKENS['ink_primary']}; background: transparent; border: none;")
         inner.addWidget(self._val)
 
@@ -117,8 +122,14 @@ class MetricTile(PanelCard):
 
         outer.addLayout(inner, 1)
 
+    def set_label(self, label: str) -> None:
+        txt = label.upper()
+        self._lbl.setText(txt)
+        self._lbl.setFont(ATLAS.font_for("mono", 8.0, text=txt, bold=True))
+
     def set_value(self, value: str, detail: Optional[str] = None) -> None:
         self._val.setText(value)
+        self._val.setFont(ATLAS.font_for("mono", 16.0, text=value, bold=True))
         if detail is not None:
             self._det.setText(detail)
             self._det.setFont(ATLAS.font_for("body", 9.0, text=detail))
@@ -149,22 +160,27 @@ class ArchToggle(QtWidgets.QPushButton):
         if emit:
             self.toggled_state.emit(self._checked)
 
+    def set_texts(self, on_text: str, off_text: str) -> None:
+        self._on_text = on_text
+        self._off_text = off_text
+        self._refresh()
+
     def _flip(self) -> None:
         self._checked = not self._checked
         self._refresh()
         self.toggled_state.emit(self._checked)
 
     def _refresh(self) -> None:
-        self.setFont(ATLAS.font_for("mono", 8.5, bold=True))
+        txt = f"●  {self._on_text}" if self._checked else f"○  {self._off_text}"
+        self.setFont(ATLAS.font_for("mono", 8.5, text=txt, bold=True))
+        self.setText(txt)
         if self._checked:
-            self.setText(f"●  {self._on_text}")
             self.setStyleSheet(
                 f"QPushButton {{ background: {TOKENS['accent']}; border: 1px solid {TOKENS['accent_hi']}; "
                 f"color: #FFFFFF; padding: 4px 12px; }}"
                 f"QPushButton:hover {{ background: #3B8BFF; }}"
             )
         else:
-            self.setText(f"○  {self._off_text}")
             self.setStyleSheet(
                 f"QPushButton {{ background: {TOKENS['bg_recessed']}; border: 1px solid {TOKENS['line_strong']}; "
                 f"color: {TOKENS['ink_muted']}; padding: 4px 12px; }}"
@@ -213,6 +229,26 @@ class SliderRow(QtWidgets.QWidget):
         self.slider.valueChanged.connect(self._on_val)
         lay.addWidget(self.slider)
         self._update_readout(val)
+        self._apply_enabled_style()
+
+    def _apply_enabled_style(self) -> None:
+        if self.isEnabled():
+            self._lbl.setStyleSheet(f"color: {TOKENS['ink_primary']};")
+            self._readout.setStyleSheet(f"color: {TOKENS['accent_hi']};")
+            self.slider.setStyleSheet("")
+        else:
+            self._lbl.setStyleSheet(f"color: {TOKENS['ink_muted']};")
+            self._readout.setStyleSheet(f"color: {TOKENS['ink_muted']};")
+            self.slider.setStyleSheet(
+                f"QSlider::sub-page:horizontal {{ background: {TOKENS['line_strong']}; }}"
+                f"QSlider::handle:horizontal {{ background: {TOKENS['ink_muted']}; "
+                f"border-color: {TOKENS['line_strong']}; }}"
+            )
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.EnabledChange:
+            self._apply_enabled_style()
 
     def _update_readout(self, v: int) -> None:
         txt = self._fmt(v) if self._fmt else f"{v}{self._suffix}"
@@ -244,7 +280,9 @@ class EffectCard(QtWidgets.QFrame):
         self._selected = is_selected
         self._lang = lang
         self.setCursor(QtCore.Qt.PointingHandCursor)
-        self.setFixedHeight(84)
+        self.setMinimumHeight(92)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Minimum)
 
         outer = QtWidgets.QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -263,10 +301,13 @@ class EffectCard(QtWidgets.QFrame):
 
         top = QtWidgets.QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
         title = spec.name_th if lang == "th" else spec.name_en
         self._lbl_title = QtWidgets.QLabel(title)
-        self._lbl_title.setFont(ATLAS.font_for("body", 10.5, text=title, bold=True))
+        self._lbl_title.setFont(ATLAS.font_for("body", 10.2, text=title, bold=True))
         self._lbl_title.setStyleSheet(f"color: {TOKENS['ink_primary']}; background: transparent; border: none;")
+        self._lbl_title.setMinimumWidth(0)
+        self._lbl_title.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         top.addWidget(self._lbl_title, 1)
 
         self._badge = QtWidgets.QLabel(spec.badge)
@@ -275,6 +316,7 @@ class EffectCard(QtWidgets.QFrame):
             f"background: {TOKENS['bg_recessed']}; color: {safe_accent}; "
             f"border: 1px solid {TOKENS['line_strong']}; padding: 1px 5px;"
         )
+        self._badge.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         top.addWidget(self._badge)
         body.addLayout(top)
 
@@ -283,6 +325,8 @@ class EffectCard(QtWidgets.QFrame):
         self._lbl_desc = QtWidgets.QLabel(f"{sub_title} — {desc}" if lang == "th" else desc)
         self._lbl_desc.setFont(ATLAS.font_for("body", 8.8, text=desc))
         self._lbl_desc.setStyleSheet(f"color: {TOKENS['ink_secondary']}; background: transparent; border: none;")
+        self._lbl_desc.setMinimumWidth(0)
+        self._lbl_desc.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Minimum)
         self._lbl_desc.setWordWrap(True)
         body.addWidget(self._lbl_desc, 1)
 
@@ -311,3 +355,230 @@ class EffectCard(QtWidgets.QFrame):
         if event.button() == QtCore.Qt.LeftButton:
             self.selected.emit(self.spec.id)
         super().mousePressEvent(event)
+
+
+class PresetItemWidget(QtWidgets.QFrame):
+    """Uniform-height Home preset card with pixel-accurate grapheme-safe elision and custom delete button."""
+
+    applied = QtCore.Signal(str)
+    delete_requested = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        preset_name: str,
+        desc: str,
+        is_builtin: bool,
+        active: bool,
+        delete_tooltip: str = "Delete preset",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.preset_name = preset_name
+        self.full_desc = desc
+        self.is_builtin = bool(is_builtin)
+        self._active = bool(active)
+        self._btn_delete: Optional[QtWidgets.QPushButton] = None
+        self._last_elide_width: int = -1
+
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFixedHeight(48)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setToolTip(desc)
+
+        outer = QtWidgets.QHBoxLayout(self)
+        outer.setContentsMargins(10, 5, 8, 5)
+        outer.setSpacing(8)
+
+        text_col = QtWidgets.QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(1)
+
+        title_str = f"▸ {preset_name}" if self._active else preset_name
+        self._lbl_title = QtWidgets.QLabel(title_str)
+        self._lbl_title.setFont(ATLAS.font_for("body", 9.2, text=preset_name, bold=True))
+        self._lbl_title.setStyleSheet(
+            f"color: {TOKENS['ink_primary']}; background: transparent; border: none;"
+        )
+        self._lbl_title.setMinimumWidth(0)
+        self._lbl_title.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        text_col.addWidget(self._lbl_title)
+
+        self._lbl_desc = QtWidgets.QLabel()
+        self._lbl_desc.setFont(ATLAS.font_for("body", 8.5, text=desc))
+        self._lbl_desc.setStyleSheet(
+            f"color: {TOKENS['ink_secondary']}; background: transparent; border: none;"
+        )
+        self._lbl_desc.setMinimumWidth(0)
+        self._lbl_desc.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self._lbl_desc.setWordWrap(False)
+        self._lbl_desc.setToolTip(desc)
+        text_col.addWidget(self._lbl_desc)
+
+        outer.addLayout(text_col, 1)
+
+        if not self.is_builtin:
+            btn_del = QtWidgets.QPushButton("✕")
+            btn_del.setObjectName("btn_del_preset")
+            btn_del.setFixedSize(24, 24)
+            btn_del.setCursor(QtCore.Qt.PointingHandCursor)
+            btn_del.setToolTip(delete_tooltip)
+            btn_del.setFont(ATLAS.font_for("mono", 8.5, bold=True))
+            btn_del.setStyleSheet(
+                f"QPushButton {{ background: transparent; border: 1px solid transparent; "
+                f"color: {TOKENS['ink_muted']}; padding: 0px; }}"
+                f"QPushButton:hover {{ background: #3A1A23; border: 1px solid {TOKENS['danger']}; "
+                f"color: #FDA4AF; }}"
+            )
+            btn_del.clicked.connect(lambda _=False: self.delete_requested.emit(self.preset_name))
+            self._btn_delete = btn_del
+            outer.addWidget(btn_del, 0, QtCore.Qt.AlignVCenter)
+
+        self._apply_style()
+        self._update_elided_desc()
+
+    @property
+    def _full_desc(self) -> str:
+        return self.full_desc
+
+    def desc_text(self) -> str:
+        if self.width() != self._last_elide_width:
+            self._update_elided_desc()
+        return self._lbl_desc.text()
+
+    def set_active(self, active: bool) -> None:
+        self._active = bool(active)
+        self._lbl_title.setText(f"▸ {self.preset_name}" if self._active else self.preset_name)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        bg = TOKENS["bg_selected"] if self._active else TOKENS["bg_recessed"]
+        border = TOKENS["accent"] if self._active else TOKENS["line"]
+        self.setStyleSheet(
+            f"PresetItemWidget {{ background-color: {bg}; border: 1px solid {border}; }}"
+            f"PresetItemWidget:hover {{ border: 1px solid {TOKENS['accent_hi']}; }}"
+        )
+
+    def _update_elided_desc(self) -> None:
+        self._last_elide_width = self.width()
+        if not self.full_desc:
+            self._lbl_desc.setText("")
+            return
+        lay = self.layout()
+        margins = lay.contentsMargins() if lay is not None else QtCore.QMargins(10, 5, 8, 5)
+        del_w = (self._btn_delete.width() + 8) if self._btn_delete is not None else 0
+        avail_w = self.width() - margins.left() - margins.right() - del_w - 4
+        if avail_w <= 24:
+            avail_w = max(24, self._lbl_desc.width() if self._lbl_desc.width() > 24 else 220)
+        fm = QtGui.QFontMetrics(self._lbl_desc.font())
+        elided = fm.elidedText(self.full_desc, QtCore.Qt.ElideRight, max(24, avail_w))
+        self._lbl_desc.setText(elided)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_elided_desc()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._update_elided_desc()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self.applied.emit(self.preset_name)
+        super().mousePressEvent(event)
+
+
+class GlobalToastBanner(QtWidgets.QFrame):
+    """App-wide 0px architectural toast notification banner visible across all Studio pages."""
+
+    _KIND_STYLES: dict[str, tuple[str, str, str, str]] = {
+        # kind -> (accent_hex, bg_hex, glyph, glyph_color)
+        "info": (TOKENS["accent"], "#131C2B", "ℹ", TOKENS["accent_hi"]),
+        "ok": (TOKENS["ok"], "#11221C", "✓", TOKENS["ok"]),
+        "warn": (TOKENS["warn"], "#241C0F", "⚠", TOKENS["warn"]),
+        "danger": (TOKENS["danger"], "#261419", "!", "#FDA4AF"),
+    }
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("global_toast_banner")
+        self._message: str = ""
+        self._kind: str = "info"
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
+
+        outer = QtWidgets.QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._bar = QtWidgets.QFrame()
+        self._bar.setFixedWidth(3)
+        outer.addWidget(self._bar)
+
+        inner = QtWidgets.QHBoxLayout()
+        inner.setContentsMargins(10, 7, 8, 7)
+        inner.setSpacing(8)
+
+        self._lbl_icon = QtWidgets.QLabel("ℹ")
+        self._lbl_icon.setFixedWidth(16)
+        self._lbl_icon.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_icon.setFont(ATLAS.font_for("mono", 10.0, bold=True))
+        inner.addWidget(self._lbl_icon, 0, QtCore.Qt.AlignVCenter)
+
+        self._lbl_msg = QtWidgets.QLabel("")
+        self._lbl_msg.setWordWrap(True)
+        self._lbl_msg.setMinimumWidth(0)
+        self._lbl_msg.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self._lbl_msg.setFont(ATLAS.font_for("body", 9.5))
+        self._lbl_msg.setStyleSheet(f"color: {TOKENS['ink_primary']}; background: transparent; border: none;")
+        inner.addWidget(self._lbl_msg, 1)
+
+        self._btn_close = QtWidgets.QPushButton("✕")
+        self._btn_close.setObjectName("btn_toast_close")
+        self._btn_close.setFixedSize(22, 22)
+        self._btn_close.setCursor(QtCore.Qt.PointingHandCursor)
+        self._btn_close.setFont(ATLAS.font_for("mono", 8.5, bold=True))
+        self._btn_close.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid transparent; "
+            f"color: {TOKENS['ink_muted']}; padding: 0px; }}"
+            f"QPushButton:hover {{ border-color: {TOKENS['line_strong']}; color: {TOKENS['ink_primary']}; }}"
+        )
+        self._btn_close.clicked.connect(self.dismiss)
+        inner.addWidget(self._btn_close, 0, QtCore.Qt.AlignVCenter)
+
+        outer.addLayout(inner, 1)
+
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.dismiss)
+
+        self._apply_kind_style("info")
+        self.hide()
+
+    def _apply_kind_style(self, kind: str) -> None:
+        accent, bg, glyph, glyph_color = self._KIND_STYLES.get(kind, self._KIND_STYLES["info"])
+        self._bar.setStyleSheet(f"background-color: {accent}; border: none;")
+        self._lbl_icon.setText(glyph)
+        self._lbl_icon.setStyleSheet(f"color: {glyph_color}; background: transparent; border: none;")
+        self.setStyleSheet(
+            f"GlobalToastBanner {{ background-color: {bg}; border: 1px solid {TOKENS['line_strong']}; }}"
+        )
+
+    def show_toast(self, message: str, kind: str = "info", duration_ms: int = 4500) -> None:
+        self._timer.stop()
+        norm_kind = kind if kind in self._KIND_STYLES else "info"
+        self._kind = norm_kind
+        self._message = str(message)
+        self._apply_kind_style(norm_kind)
+        self._lbl_msg.setText(self._message)
+        self._lbl_msg.setFont(ATLAS.font_for("body", 9.5, text=self._message))
+        self.show()
+        if duration_ms and int(duration_ms) > 0:
+            self._timer.start(int(duration_ms))
+
+    def dismiss(self) -> None:
+        self._timer.stop()
+        self._message = ""
+        self.hide()
+
+    def current_message(self) -> str:
+        return self._message

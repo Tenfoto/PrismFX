@@ -20,9 +20,12 @@ from prismfx.core.backend import DemoWindowBackend, Win32WindowBackend
 from prismfx.core.config import ConfigStore
 from prismfx.core.effects import EffectRegistry
 from prismfx.core.engine import PrismEngine
+from prismfx.core.logging_setup import close_logging, configure_logging, get_logger
 from prismfx.render.gl_renderer import make_gl_format
 from prismfx.ui.main_window import MainWindow
 from prismfx.ui.theme import ATLAS, build_stylesheet
+
+_log = get_logger("prismfx.main")
 
 
 def default_data_dir() -> pathlib.Path:
@@ -101,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
 
     profile_dir = pathlib.Path(args.profile).resolve() if args.profile else default_data_dir().resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging(profile_dir)
+    atexit.register(close_logging)
 
     # Set default OpenGL 3.3 Core surface format BEFORE constructing QApplication
     QtGui.QSurfaceFormat.setDefaultFormat(make_gl_format())
@@ -144,12 +149,14 @@ def main(argv: list[str] | None = None) -> int:
         n = engine.restore_all_os_state()
         failed = getattr(engine, "last_restore_failed_count", 0)
         if failed:
+            _log.warning("Emergency restore incomplete: restored=%d failed=%d", n, failed)
             print(
                 f"PrismFX recovery incomplete: restored {n} OS mutations, {failed} failed "
                 "(some entries may require Administrator privileges).",
                 file=sys.stderr,
             )
             return 1
+        _log.info("Emergency restore complete: restored=%d", n)
         print(f"PrismFX recovery complete: restored {n} OS mutations.")
         return 0
 
@@ -187,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             # Re-nudge in case prior window was still initializing
             _signal_existing_instance(title_exact, ipc_quit_msg, w32.IPC_CMD_QUIT)
         if exists:
+            _log.warning("Timed out waiting for existing instance to exit during --replace (profile=%s)", profile_dir)
             print(
                 "PrismFX: timed out waiting for existing instance to exit during --replace "
                 "(an elevated instance cannot be closed by a standard-user process).",
@@ -195,114 +203,129 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if exists:
+        _log.info("Activated existing PrismFX instance for profile=%s", profile_dir)
         _signal_existing_instance(title_exact, ipc_msg, w32.IPC_CMD_ACTIVATE)
         w32.close_handle(mutex_handle)
         return 0
     atexit.register(lambda: w32.close_handle(mutex_handle))
 
+    _log.info(
+        "PrismFX Studio v%s starting (profile=%s, demo=%s)",
+        __version__,
+        profile_dir,
+        bool(args.demo),
+    )
+
     try:
         w32.shell32.SetCurrentProcessExplicitAppUserModelID("PrismFX.Studio")
     except Exception:
-        pass
+        _log.warning("SetCurrentProcessExplicitAppUserModelID failed", exc_info=True)
 
-    app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName(__app_name__)
-    app.setApplicationVersion(__version__)
-    app.setQuitOnLastWindowClosed(False)
+    try:
+        app = QtWidgets.QApplication(sys.argv)
+        app.setApplicationName(__app_name__)
+        app.setApplicationVersion(__version__)
+        app.setQuitOnLastWindowClosed(False)
 
-    ATLAS.initialize()
-    app.setStyleSheet(build_stylesheet())
+        ATLAS.initialize()
+        app.setStyleSheet(build_stylesheet())
 
-    repo_root = exe_dir
-    icon_path = bundle_dir / "assets" / "prismfx.ico"
-    if not icon_path.exists():
-        icon_path = exe_dir / "assets" / "prismfx.ico"
-    if icon_path.exists():
-        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
-    store = ConfigStore(profile_dir)
-    shader_dirs: list[pathlib.Path] = [bundle_dir / "assets" / "shaders"]
-    if exe_dir != bundle_dir:
-        shader_dirs.append(exe_dir / "assets" / "shaders")
-    shader_dirs.append(store.shaders_dir)
-    registry = EffectRegistry(shader_dirs)
-    backend = DemoWindowBackend(seed=42) if args.demo else Win32WindowBackend()
-    engine = PrismEngine(backend, store, registry)
-    engine.start()
+        repo_root = exe_dir
+        icon_path = bundle_dir / "assets" / "prismfx.ico"
+        if not icon_path.exists():
+            icon_path = exe_dir / "assets" / "prismfx.ico"
+        if icon_path.exists():
+            app.setWindowIcon(QtGui.QIcon(str(icon_path)))
+        store = ConfigStore(profile_dir)
+        shader_dirs: list[pathlib.Path] = [bundle_dir / "assets" / "shaders"]
+        if exe_dir != bundle_dir:
+            shader_dirs.append(exe_dir / "assets" / "shaders")
+        shader_dirs.append(store.shaders_dir)
+        registry = EffectRegistry(shader_dirs)
+        backend = DemoWindowBackend(seed=42) if args.demo else Win32WindowBackend()
+        engine = PrismEngine(backend, store, registry)
+        engine.start()
 
-    # Guaranteed OS state restoration on EVERY shutdown path WITHOUT signal-frame deadlock:
-    # - normal Qt quit / tray exit (aboutToQuit -> engine.stop())
-    # - POSIX/Win32 SIGINT / SIGTERM / SIGBREAK (flag + queued quit + lightweight timer poll)
-    # - Console close / Logoff / Shutdown (SetConsoleCtrlHandler runs on dedicated OS thread)
-    # - Windows session shutdown (commitDataRequest + WM_ENDSESSION)
-    shutdown_requested = threading.Event()
+        # Guaranteed OS state restoration on EVERY shutdown path WITHOUT signal-frame deadlock:
+        # - normal Qt quit / tray exit (aboutToQuit -> engine.stop())
+        # - POSIX/Win32 SIGINT / SIGTERM / SIGBREAK (flag + queued quit + lightweight timer poll)
+        # - Console close / Logoff / Shutdown (SetConsoleCtrlHandler runs on dedicated OS thread)
+        # - Windows session shutdown (commitDataRequest + WM_ENDSESSION)
+        shutdown_requested = threading.Event()
 
-    def _signal_handler(_sig: int, _frame: object) -> None:
-        # NEVER acquire engine/journal locks directly inside a Python signal frame!
-        shutdown_requested.set()
-        try:
-            QtCore.QMetaObject.invokeMethod(app, "quit", QtCore.Qt.QueuedConnection)
-        except Exception:
-            pass
-
-    def _console_ctrl_cleanup(ctrl_type: int) -> None:
-        shutdown_requested.set()
-        if ctrl_type in (w32.CTRL_CLOSE_EVENT, w32.CTRL_LOGOFF_EVENT, w32.CTRL_SHUTDOWN_EVENT):
-            # Runs on Windows' dedicated console control thread before hard OS termination
+        def _signal_handler(_sig: int, _frame: object) -> None:
+            # NEVER acquire engine/journal/logging locks directly inside a Python signal frame!
+            shutdown_requested.set()
             try:
-                engine.stop()
-            except Exception:
-                pass
-        try:
-            QtCore.QMetaObject.invokeMethod(app, "quit", QtCore.Qt.QueuedConnection)
-        except Exception:
-            pass
-
-    sig_timer = QtCore.QTimer(app)
-    sig_timer.setInterval(100)
-
-    def _poll_shutdown_signal() -> None:
-        if shutdown_requested.is_set():
-            sig_timer.stop()
-            app.quit()
-
-    sig_timer.timeout.connect(_poll_shutdown_signal)
-    sig_timer.start()
-
-    atexit.register(engine.stop)
-    app.aboutToQuit.connect(engine.stop)
-    app.commitDataRequest.connect(lambda _mgr: engine.stop())
-    w32.register_console_ctrl_handler(_console_ctrl_cleanup)
-    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
-        sig_num = getattr(signal, sig_name, None)
-        if sig_num is not None:
-            try:
-                signal.signal(sig_num, _signal_handler)
+                QtCore.QMetaObject.invokeMethod(app, "quit", QtCore.Qt.QueuedConnection)
             except Exception:
                 pass
 
-    win = MainWindow(
-        engine,
-        enable_overlays=True,
-        enable_tray=True,
-        icon_path=icon_path,
-        ipc_msg=ipc_msg,
-        ipc_quit_msg=ipc_quit_msg,
-        repo_root=repo_root,
-        profile_arg=args.profile,
-    )
-    win.ensure_native_handle()
+        def _console_ctrl_cleanup(ctrl_type: int) -> None:
+            shutdown_requested.set()
+            if ctrl_type in (w32.CTRL_CLOSE_EVENT, w32.CTRL_LOGOFF_EVENT, w32.CTRL_SHUTDOWN_EVENT):
+                # Runs on Windows' dedicated console control thread before hard OS termination
+                try:
+                    engine.stop()
+                except Exception:
+                    _log.exception("Console control handler engine.stop() failed (ctrl_type=%s)", ctrl_type)
+            try:
+                QtCore.QMetaObject.invokeMethod(app, "quit", QtCore.Qt.QueuedConnection)
+            except Exception:
+                _log.warning("Console control handler failed to queue app.quit()", exc_info=True)
 
-    start_hidden = bool(
-        args.minimized
-        or engine.config.start_minimized_to_tray
-        or (args.autostart and engine.config.autostart_minimized)
-    )
-    if start_hidden:
-        win.hide()
-    else:
-        win.show()
+        sig_timer = QtCore.QTimer(app)
+        sig_timer.setInterval(100)
 
-    return app.exec()
+        def _poll_shutdown_signal() -> None:
+            if shutdown_requested.is_set():
+                sig_timer.stop()
+                _log.info("Shutdown signal received; quitting Qt event loop.")
+                app.quit()
+
+        sig_timer.timeout.connect(_poll_shutdown_signal)
+        sig_timer.start()
+
+        atexit.register(engine.stop)
+        app.aboutToQuit.connect(engine.stop)
+        app.commitDataRequest.connect(lambda _mgr: engine.stop())
+        w32.register_console_ctrl_handler(_console_ctrl_cleanup)
+        for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            sig_num = getattr(signal, sig_name, None)
+            if sig_num is not None:
+                try:
+                    signal.signal(sig_num, _signal_handler)
+                except Exception:
+                    _log.warning("Failed to install signal handler for %s", sig_name, exc_info=True)
+
+        win = MainWindow(
+            engine,
+            enable_overlays=True,
+            enable_tray=True,
+            icon_path=icon_path,
+            ipc_msg=ipc_msg,
+            ipc_quit_msg=ipc_quit_msg,
+            repo_root=repo_root,
+            profile_arg=args.profile,
+        )
+        win.ensure_native_handle()
+
+        start_hidden = bool(
+            args.minimized
+            or engine.config.start_minimized_to_tray
+            or (args.autostart and engine.config.autostart_minimized)
+        )
+        if start_hidden:
+            win.hide()
+        else:
+            win.show()
+
+        rc = app.exec()
+        _log.info("PrismFX Studio exiting cleanly (rc=%s)", rc)
+        return rc
+    except Exception:
+        _log.critical("Unhandled fatal exception in PrismFX Studio", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

@@ -645,6 +645,8 @@ def run_selftest() -> dict:
         (w32.user32, "TranslateMessage"),
         (w32.user32, "DispatchMessageW"),
         (w32.user32, "SetForegroundWindow"),
+        (w32.user32, "RegisterHotKey"),
+        (w32.user32, "UnregisterHotKey"),
     ]
     missing_abi = [
         name for dll, name in abi_targets
@@ -1861,6 +1863,375 @@ def run_selftest() -> dict:
             dummy_cap_w.deleteLater()
         check("sprint2_uwp_uncloak_and_overlay_resume", uwp_uncloak_ok and ov_resume_ok, uwp_detail)
 
+        # 11. Sprint 3 Regression Tests (PFX-C10, PFX-H13, PFX-M08-M10, PFX-P01-P04)
+        from ctypes import wintypes as _wt
+        from .core.logging_setup import (
+            close_logging,
+            configure_logging,
+            flush_logging,
+            get_log_path,
+            get_logger,
+        )
+        from .render.overlay import FloatingTileWindow
+        from .ui.theme import FontAtlas, has_thai
+
+        # (11a) sprint3_global_hotkeys_and_routing: RegisterHotKey/UnregisterHotKey ABI + roundtrip + WM_HOTKEY & WM_NCHITTEST routing
+        hk_abi_ok = (
+            w32.user32.RegisterHotKey.argtypes is not None
+            and w32.user32.RegisterHotKey.restype is not None
+            and w32.user32.UnregisterHotKey.argtypes is not None
+            and w32.user32.UnregisterHotKey.restype is not None
+        )
+        s3_store = ConfigStore(s2_dir / "s3_hotkey_profile")
+        s3_eng = PrismEngine(DemoWindowBackend(seed=42), s3_store, EffectRegistry())
+        s3_win = MainWindow(s3_eng, enable_overlays=False, enable_tray=False)
+        _cloak_and_show_silently(s3_win)
+        hk_rt_ok = False
+        hk_quick_ok = False
+        hk_panic_ok = False
+        nchittest_ok = False
+        shell_guard_ok = False
+        try:
+            s3_hwnd = int(s3_win.winId())
+            # Real Win32 RegisterHotKey / UnregisterHotKey roundtrip using an obscure non-conflicting combo (Ctrl+Alt+Shift+F22)
+            test_hk_id = 0x5F31
+            reg_ok = w32.register_global_hotkey(
+                s3_hwnd, test_hk_id, w32.MOD_CONTROL | w32.MOD_ALT | w32.MOD_SHIFT | w32.MOD_NOREPEAT, 0x85
+            )
+            unreg_ok = w32.unregister_global_hotkey(s3_hwnd, test_hk_id) if reg_ok else False
+            hk_rt_ok = reg_ok and unreg_ok
+
+            # Hide MainWindow (simulating minimized to tray) and verify WM_HOTKEY ID 1 targets _last_real_fg_hwnd!
+            s3_win.hide()
+            QtCore.QCoreApplication.processEvents()
+            demo_wins = s3_eng.backend.list_windows(own_pid=s3_eng.own_pid)
+            target_win_h = demo_wins[1].hwnd if len(demo_wins) > 1 else demo_wins[0].hwnd
+            s3_eng._last_real_fg_hwnd = target_win_h
+            orig_get_fg = s3_eng.backend.get_foreground_hwnd
+            orig_get_info = s3_eng.backend.get_window_info
+            s3_eng.backend.get_foreground_hwnd = lambda: s3_hwnd  # type: ignore[method-assign]
+            s3_win.quick_bar.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+            try:
+                msg_quick = _wt.MSG()
+                msg_quick.hWnd = s3_hwnd
+                msg_quick.message = w32.WM_HOTKEY
+                msg_quick.wParam = w32.HOTKEY_ID_QUICK_BAR
+                msg_quick.lParam = 0
+                handled_q, _ = s3_win.nativeEvent(b"windows_generic_MSG", _ct.addressof(msg_quick))
+                QtCore.QCoreApplication.processEvents()
+                if s3_win.quick_bar.isVisible():
+                    w32.set_window_cloaked(int(s3_win.quick_bar.winId()), True)
+                hk_quick_ok = bool(handled_q) and s3_win.quick_bar._target_hwnd == target_win_h and s3_win.quick_bar.isVisible()
+                # Verify Esc dismisses QuickControlPopup (PFX-M10)
+                esc_ev = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape, QtCore.Qt.NoModifier)
+                QtWidgets.QApplication.sendEvent(s3_win.quick_bar, esc_ev)
+                QtCore.QCoreApplication.processEvents()
+                hk_quick_ok = hk_quick_ok and (not s3_win.quick_bar.isVisible())
+
+                # Verify _pick_real_target_hwnd rejects Shell_TrayWnd/Progman/WorkerW & own-PID QMenu and falls back to _last_real_fg_hwnd
+                from .core.backend import WindowInfo as _WInfo
+                from .core.catalog import classify_app as _cls_app
+
+                fake_shell_map = {
+                    99001: _WInfo(hwnd=99001, title="Taskbar", class_name="Shell_TrayWnd", pid=4001, exe_name="explorer.exe", full_path="", x=0, y=1040, w=1920, h=40, visible=True, minimized=False, maximized=False, topmost=True, opacity=255, classification=_cls_app("explorer.exe", "Shell_TrayWnd")),
+                    99002: _WInfo(hwnd=99002, title="Program Manager", class_name="Progman", pid=4001, exe_name="explorer.exe", full_path="", x=0, y=0, w=1920, h=1080, visible=True, minimized=False, maximized=False, topmost=False, opacity=255, classification=_cls_app("explorer.exe", "Progman")),
+                    99003: _WInfo(hwnd=99003, title="", class_name="WorkerW", pid=4001, exe_name="explorer.exe", full_path="", x=0, y=0, w=1920, h=1080, visible=True, minimized=False, maximized=False, topmost=False, opacity=255, classification=_cls_app("explorer.exe", "WorkerW")),
+                    99004: _WInfo(hwnd=99004, title="TrayMenu", class_name="Qt6100QWindowPopupDropShadowSaveBits", pid=s3_eng.own_pid, exe_name="python.exe", full_path="", x=100, y=100, w=200, h=180, visible=True, minimized=False, maximized=False, topmost=True, opacity=255, classification=_cls_app("python.exe", "Qt6100QWindowPopupDropShadowSaveBits")),
+                }
+                s3_eng.backend.get_window_info = lambda h: fake_shell_map.get(int(h), orig_get_info(h))  # type: ignore[method-assign]
+                picked_ok = True
+                for bad_h in (99001, 99002, 99003, 99004):
+                    s3_eng.backend.get_foreground_hwnd = (lambda bh=bad_h: bh)  # type: ignore[method-assign]
+                    if s3_win._pick_real_target_hwnd(allow_self_fallback=False) != target_win_h:
+                        picked_ok = False
+                # Verify engine mutators refuse to mutate Shell_TrayWnd (defense-in-depth)
+                j_before = s3_eng.journal.pending_count()
+                r_pin = s3_eng.toggle_pin_window(99001)
+                r_roll = s3_eng.toggle_rollup_window(99001)
+                r_op = s3_eng.set_custom_opacity(99001, 50)
+                r_snap = s3_eng.snap_window_to_zone(99001, "left_50")
+                r_tile = s3_eng.minimize_to_tile(99001)
+                shell_mut_blocked = (
+                    r_pin is False
+                    and r_roll is False
+                    and r_op is False
+                    and r_snap is False
+                    and r_tile is False
+                    and 99001 not in s3_eng._pinned
+                    and not s3_eng.is_window_rolled_up(99001)
+                    and s3_eng.journal.pending_count() == j_before
+                    and s3_eng.tile_requests.empty()
+                )
+                shell_guard_ok = picked_ok and shell_mut_blocked
+            finally:
+                s3_eng.backend.get_foreground_hwnd = orig_get_fg  # type: ignore[method-assign]
+                s3_eng.backend.get_window_info = orig_get_info  # type: ignore[method-assign]
+
+            # Verify WM_HOTKEY ID 2 (Ctrl+Alt+Shift+R) triggers Global Panic Restore & Pause + Toast!
+            s3_eng.toggle_pin_window(demo_wins[0].hwnd)
+            msg_panic = _wt.MSG()
+            msg_panic.hWnd = s3_hwnd
+            msg_panic.message = w32.WM_HOTKEY
+            msg_panic.wParam = w32.HOTKEY_ID_PANIC_RESTORE
+            msg_panic.lParam = 0
+            handled_p, _ = s3_win.nativeEvent(b"windows_generic_MSG", _ct.addressof(msg_panic))
+            QtCore.QCoreApplication.processEvents()
+            hk_panic_ok = (
+                bool(handled_p)
+                and (not s3_win.cfg.enabled)
+                and (not s3_win.master_toggle.is_on())
+                and (s3_eng.journal.pending_count() == 0)
+                and bool(s3_win.toast_banner.current_message())
+            )
+
+            # Verify WM_NCHITTEST 6px border zones (top-left, right, bottom-right), out-of-bounds rejection & QSizeGrip
+            _cloak_and_show_silently(s3_win)
+            rc = w32.RECT()
+            if w32.user32.GetWindowRect(s3_hwnd, _ct.byref(rc)):
+                import shiboken6 as _shiboken
+
+                def _hit_at(px: int, py: int) -> tuple[bool, int]:
+                    lp = (px & 0xFFFF) | ((py & 0xFFFF) << 16)
+                    m_ht = _wt.MSG()
+                    m_ht.hWnd = s3_hwnd
+                    m_ht.message = w32.WM_NCHITTEST
+                    m_ht.wParam = 0
+                    m_ht.lParam = lp
+                    return s3_win.nativeEvent(b"windows_generic_MSG", _shiboken.VoidPtr(_ct.addressof(m_ht)))
+
+                h_tl, r_tl = _hit_at(rc.left + 2, rc.top + 2)
+                h_br, r_br = _hit_at(rc.right - 2, rc.bottom - 2)
+                h_r, r_r = _hit_at(rc.right - 2, (rc.top + rc.bottom) // 2)
+                h_oob_tl, _ = _hit_at(rc.left - 50, rc.top - 50)
+                h_oob_br, _ = _hit_at(rc.right + 50, rc.bottom + 50)
+                nchittest_ok = (
+                    h_tl and r_tl == w32.HTTOPLEFT
+                    and h_br and r_br == w32.HTBOTTOMRIGHT
+                    and h_r and r_r == w32.HTRIGHT
+                    and (not h_oob_tl)
+                    and (not h_oob_br)
+                    and hasattr(s3_win, "size_grip")
+                    and isinstance(s3_win.size_grip, QtWidgets.QSizeGrip)
+                )
+        finally:
+            s3_win.full_shutdown()
+            OffscreenGpuEngine.shared().reset_init_attempt()
+
+        check(
+            "sprint3_global_hotkeys_and_routing",
+            hk_abi_ok and hk_rt_ok and hk_quick_ok and shell_guard_ok and hk_panic_ok and nchittest_ok,
+            f"abi={hk_abi_ok} roundtrip={hk_rt_ok} quick={hk_quick_ok} shell_guard={shell_guard_ok} "
+            f"panic={hk_panic_ok} nchittest={nchittest_ok}",
+        )
+
+        # (11b) sprint3_retranslate_defaults_and_ux: flicks_enabled=False, 5/5 SectionHeaders TH->EN->TH, desc_th search, Home real test, battery banner, Strict Clamp vs Bounce, duration/accent preserve, FloatingTile restore button
+        flicks_default_ok = (PrismConfig().physics.flicks_enabled is False)
+        ux_store = ConfigStore(s2_dir / "s3_ux_profile")
+        ux_cfg = ux_store.load()
+        ux_cfg.language = "th"
+        ux_store.save(ux_cfg)
+        ux_eng = PrismEngine(DemoWindowBackend(seed=42), ux_store, EffectRegistry())
+        ux_win = MainWindow(ux_eng, enable_overlays=False, enable_tray=False)
+        _cloak_and_show_silently(ux_win)
+        retrans_ok = False
+        search_desc_th_ok = False
+        home_real_test_ok = False
+        battery_banner_ok = False
+        strict_clamp_dep_ok = False
+        preserve_tune_ok = False
+        tile_ux_ok = False
+        fallback_font_ok = False
+        preset_guard_ok = False
+        tooltips_en_ok = False
+        shader_dir_order_ok = False
+        try:
+            # Verify 5/5 SectionHeaders & hover tooltips TH -> EN -> TH (0 Thai leftovers in EN)
+            th_titles = [sh.title_text() for sh in ux_win._section_headers]
+            ux_win._toggle_language()  # TH -> EN
+            QtCore.QCoreApplication.processEvents()
+            en_titles = [sh.title_text() for sh in ux_win._section_headers]
+            en_dir_txt = ux_win.btn_lab_dir.text()
+            en_tips = [
+                ux_win.lbl_arch_desc.toolTip(),
+                ux_win.tile_journal.toolTip(),
+                ux_win.btn_use_effect_defaults.toolTip(),
+                ux_win.lbl_ease.toolTip(),
+                ux_win.chk_flicks.toolTip(),
+                ux_win.btn_emergency.toolTip(),
+            ]
+            tooltips_en_ok = all(bool(t.strip()) and (not has_thai(t)) for t in en_tips)
+            ux_win._toggle_language()  # EN -> TH
+            QtCore.QCoreApplication.processEvents()
+            th_titles_back = [sh.title_text() for sh in ux_win._section_headers]
+            th_dir_txt = ux_win.btn_lab_dir.text()
+            retrans_ok = (
+                len(ux_win._section_headers) == 5
+                and all(has_thai(t) for t in th_titles)
+                and all((not has_thai(t)) and bool(t.strip()) for t in en_titles)
+                and th_titles_back == th_titles
+                and ("OPEN" in en_dir_txt or "CLOSE" in en_dir_txt)
+                and ("OPEN" in th_dir_txt or "CLOSE" in th_dir_txt)
+                and has_thai(th_dir_txt)
+            )
+
+            # Verify save_user_preset rejects built-in names case-insensitively and sanitizes/deletes custom presets cleanly
+            builtin_blocked = (
+                ux_store.save_user_preset("Prism Studio Default", ux_win.cfg) is None
+                and ux_store.save_user_preset("prism studio default", ux_win.cfg) is None
+            )
+            saved_p = ux_store.save_user_preset("My:Preset/1", ux_win.cfg)
+            saved_stem = saved_p.name.removesuffix(".prismpreset.json") if saved_p is not None else ""
+            deleted_p = ux_store.delete_user_preset(saved_stem) if saved_stem else False
+            preset_guard_ok = builtin_blocked and saved_stem == "MyPreset1" and deleted_p
+
+            # Verify _reload_custom_shaders keeps user store.shaders_dir LAST so user shaders override bundled shaders
+            ux_win._reload_custom_shaders()
+            c_dirs = list(getattr(ux_eng.registry, "_custom_dirs", []))
+            shader_dir_order_ok = bool(c_dirs) and c_dirs[-1] == ux_store.shaders_dir
+
+            # Verify search matches e.desc_th (e.g. "ทาสก์บาร์" appears ONLY in genie_lamp.desc_th)
+            ux_win._select_category("all")
+            ux_win.ed_search.setText("ทาสก์บาร์")
+            QtCore.QCoreApplication.processEvents()
+            search_desc_th_ok = "genie_lamp" in ux_win._effect_cards
+            ux_win.ed_search.clear()
+            QtCore.QCoreApplication.processEvents()
+
+            # Verify Home real test plays the exact effect shown on home_stage (PFX-H13 / UX-03)
+            fired_eids: list[str] = []
+            orig_trig_fn = ux_eng.trigger_effect_for_window
+
+            def _capture_trig(hwnd, trig, override_effect_id=None, reverse_override=None):
+                if override_effect_id:
+                    fired_eids.append(override_effect_id)
+                return None
+
+            ux_eng.trigger_effect_for_window = _capture_trig  # type: ignore[method-assign]
+            try:
+                ux_win._select_home_showcase_effect("cyber_glitch")
+                ux_win.btn_home_test_real.click()
+                QtCore.QCoreApplication.processEvents()
+                home_real_test_ok = (
+                    ux_win._home_preview_effect_id == "cyber_glitch"
+                    and fired_eids == ["cyber_glitch"]
+                )
+            finally:
+                ux_eng.trigger_effect_for_window = orig_trig_fn  # type: ignore[method-assign]
+
+            # Verify Battery Auto-Pause Banner + Temporary Override (Board Resolution #5)
+            orig_bat = ux_eng.backend.is_on_battery
+            ux_eng.backend.is_on_battery = lambda: True  # type: ignore[method-assign]
+            try:
+                ux_win._sync_battery_banner(ux_eng.paused_reason())
+                shown_on_bat = not ux_win.battery_banner.isHidden()
+                ux_win.btn_battery_override.click()
+                QtCore.QCoreApplication.processEvents()
+                hidden_after_override = (
+                    ux_win.battery_banner.isHidden()
+                    and ux_eng.is_battery_pause_overridden()
+                    and ux_eng.paused_reason() == ""
+                )
+                # Re-enabling chk_pause_bat (OFF -> ON) must clear the temporary battery override
+                ux_win.chk_pause_bat.setChecked(False)
+                ux_win.chk_pause_bat.setChecked(True)
+                QtCore.QCoreApplication.processEvents()
+                reset_on_reenable = (not ux_eng.is_battery_pause_overridden()) and (ux_eng.paused_reason() == "battery")
+                battery_banner_ok = shown_on_bat and hidden_after_override and reset_on_reenable
+            finally:
+                ux_eng.backend.is_on_battery = orig_bat  # type: ignore[method-assign]
+
+            # Verify Strict Clamp disables Elastic Edge Bounce + Wobbly OFF disables sliders (PFX-M09)
+            ux_win.chk_momentum.setChecked(True)
+            ux_win.chk_clamp.setChecked(True)
+            ux_win.chk_wobbly.setChecked(False)
+            QtCore.QCoreApplication.processEvents()
+            strict_clamp_dep_ok = (
+                (not ux_win.chk_bounce.isEnabled())
+                and (not ux_win.sl_wob_stiff.isEnabled())
+                and (not ux_win.lbl_clamp_note.isHidden())
+            )
+
+            # Verify switching shaders preserves user-tuned Duration & Accent (PFX-M08)
+            ux_win._select_trigger("open")
+            ux_win.sl_trig_dur.slider.setValue(777)
+            ux_win._set_trigger_accent("#F43F5E")
+            ux_win._on_effect_card_selected("genie_lamp")
+            tc_open = ux_win.cfg.triggers["open"]
+            preserve_tune_ok = (
+                tc_open.effect_id == "genie_lamp"
+                and tc_open.duration_ms == 777
+                and tc_open.accent_hex.upper() == "#F43F5E"
+            )
+
+            # Verify FloatingTileWindow has Tooltip & Restore button (PFX-M10)
+            demo_info = ux_eng.backend.list_windows(own_pid=ux_eng.own_pid)[0]
+            ftw = FloatingTileWindow(demo_info, None, 196, True, lang="th")
+            restored_hwnds: list[int] = []
+            ftw.restored.connect(lambda h: restored_hwnds.append(h))
+            ftw._btn_restore.click()
+            tile_ux_ok = bool(ftw.toolTip()) and restored_hwnds == [demo_info.hwnd]
+            ftw.deleteLater()
+
+            # Verify Thai fallback font scaling guarantees >= 9.5pt without FC Minimal (PFX-P03)
+            fa_fallback = FontAtlas()
+            fa_fallback.thai_family = "Leelawadee UI"
+            fallback_pt = fa_fallback.font_for("body", 8.5, text="ทดสอบภาษาไทย").pointSizeF()
+            fallback_font_ok = fallback_pt >= 9.5
+        finally:
+            ux_win.full_shutdown()
+            OffscreenGpuEngine.shared().reset_init_attempt()
+
+        check(
+            "sprint3_retranslate_defaults_and_ux",
+            flicks_default_ok
+            and retrans_ok
+            and tooltips_en_ok
+            and preset_guard_ok
+            and shader_dir_order_ok
+            and search_desc_th_ok
+            and home_real_test_ok
+            and battery_banner_ok
+            and strict_clamp_dep_ok
+            and preserve_tune_ok
+            and tile_ux_ok
+            and fallback_font_ok,
+            f"flicks_off={flicks_default_ok} retrans_5of5={retrans_ok} tips_en={tooltips_en_ok} "
+            f"preset_guard={preset_guard_ok} shader_order={shader_dir_order_ok} desc_th={search_desc_th_ok} "
+            f"home_real={home_real_test_ok} bat_banner={battery_banner_ok} clamp_dep={strict_clamp_dep_ok} "
+            f"preserve_tune={preserve_tune_ok} tile_ux={tile_ux_ok} fb_font={fallback_font_ok}",
+        )
+
+        # (11c) sprint3_rotating_file_logger: RotatingFileHandler writes UTF-8 prismfx.log into profile_dir (PFX-P04)
+        import logging as _logging
+        from logging.handlers import RotatingFileHandler as _RFH
+
+        prev_log_path = get_log_path()
+        log_test_dir = s2_dir / "s3_logger_profile"
+        logger_ok = False
+        logger_detail = ""
+        try:
+            configured = configure_logging(log_test_dir)
+            test_log = get_logger("prismfx.selftest_probe")
+            sentinel = "SPRINT3_ROTATING_LOGGER_PROBE_ภาษาไทย"
+            test_log.warning("Probe check: %s", sentinel)
+            flush_logging()
+            root_handlers = _logging.getLogger("prismfx").handlers
+            has_rfh = any(isinstance(h, _RFH) for h in root_handlers)
+            log_file = log_test_dir / "prismfx.log"
+            content = log_file.read_text(encoding="utf-8") if log_file.is_file() else ""
+            logger_ok = (
+                configured == log_file.resolve()
+                and log_file.is_file()
+                and has_rfh
+                and sentinel in content
+            )
+            logger_detail = f"file_exists={log_file.is_file()} rfh={has_rfh} sentinel={sentinel in content}"
+        finally:
+            close_logging()
+            if prev_log_path is not None:
+                configure_logging(prev_log_path.parent, filename=prev_log_path.name)
+        check("sprint3_rotating_file_logger", logger_ok, logger_detail)
+
         OffscreenGpuEngine.shared().shutdown()
         OffscreenGpuEngine.shared().reset_init_attempt()
 
@@ -1921,14 +2292,43 @@ def run_uitest(profile_dir: pathlib.Path) -> dict:
     QtCore.QCoreApplication.processEvents()
     check("animations_filter_elemental", len(win._effect_cards) == 10, f"cards={len(win._effect_cards)}")
 
-    # Verify bilingual switch updates text cleanly
-    before_lang = win._lang
-    win.btn_lang.click()
-    QtCore.QCoreApplication.processEvents()
-    check("bilingual_toggle", win._lang != before_lang, f"{before_lang}->{win._lang}")
+    # Verify bilingual switch updates ALL 5/5 SectionHeaders cleanly (TH -> EN -> TH, zero mixed leftovers)
+    from .ui.theme import FontAtlas, has_thai
 
-    # Verify FC Minimal font resolution
-    check("font_atlas_thai", ATLAS.thai_family == "FC Minimal", f"thai={ATLAS.thai_family} mono={ATLAS.mono_family}")
+    if win._lang != "th":
+        win.btn_lang.click()
+        QtCore.QCoreApplication.processEvents()
+    before_lang = win._lang
+    th_hdrs = [sh.title_text() for sh in win._section_headers]
+    win.btn_lang.click()  # TH -> EN
+    QtCore.QCoreApplication.processEvents()
+    en_hdrs = [sh.title_text() for sh in win._section_headers]
+    check("bilingual_toggle", win._lang != before_lang, f"{before_lang}->{win._lang}")
+    win.btn_lang.click()  # EN -> TH
+    QtCore.QCoreApplication.processEvents()
+    th_hdrs_back = [sh.title_text() for sh in win._section_headers]
+    retrans_all_ok = (
+        len(win._section_headers) == 5
+        and all(has_thai(t) for t in th_hdrs)
+        and all((not has_thai(t)) and bool(t.strip()) for t in en_hdrs)
+        and th_hdrs_back == th_hdrs
+    )
+    check(
+        "retranslate_section_headers_5of5",
+        retrans_all_ok,
+        f"headers={len(win._section_headers)} en_clean={all(not has_thai(t) for t in en_hdrs)} restored={th_hdrs_back == th_hdrs}",
+    )
+
+    # Portable Thai font resolution check (PFX-P03: works with FC Minimal OR system Thai fallback >= 9.5pt)
+    fb_atlas = FontAtlas()
+    fb_atlas.thai_family = "Leelawadee UI"
+    active_thai_pt = ATLAS.font_for("body", 8.5, text="ทดสอบ").pointSizeF()
+    fallback_thai_pt = fb_atlas.font_for("body", 8.5, text="ทดสอบ").pointSizeF()
+    check(
+        "font_atlas_thai",
+        bool(ATLAS.thai_family) and active_thai_pt >= 9.5 and fallback_thai_pt >= 9.5,
+        f"thai={ATLAS.thai_family} active_pt={active_thai_pt:.1f} fallback_pt={fallback_thai_pt:.1f} mono={ATLAS.mono_family}",
+    )
 
     win.full_shutdown()
     return results
@@ -2183,13 +2583,14 @@ def run_snapshots(profile_dir: pathlib.Path, out_dir: pathlib.Path) -> list[str]
         ("genie_lamp", 0.45), ("cyber_glitch", 0.42), ("crt_tv_off", 0.48), ("hex_shield", 0.45),
         ("doors_3d", 0.45), ("venetian_blinds", 0.45), ("shatter_glass", 0.38), ("page_peel", 0.45),
     ]
+    gpu_label = (win.home_stage.gpu_renderer_name() or "OpenGL 3.3 GPU").strip()
     cw, ch = 320, 210
     sheet = QtGui.QImage(cw * 4, ch * 3 + 44, QtGui.QImage.Format_RGBA8888)
     sheet.fill(QtGui.QColor(TOKENS["bg_base"]))
     painter = QtGui.QPainter(sheet)
     painter.setPen(QtGui.QColor(TOKENS["accent_hi"]))
     painter.setFont(ATLAS.font_for("mono", 11.0, bold=True))
-    painter.drawText(16, 28, "PRISMFX // REAL GPU OPENGL 3.3 SHADER SHOWCASE (12 OF 42 EFFECTS RENDERED ON RTX 3070 Ti)")
+    painter.drawText(16, 28, f"PRISMFX // REAL GPU OPENGL 3.3 SHADER SHOWCASE (12 OF 42 EFFECTS RENDERED ON {gpu_label})")
 
     fmt = make_gl_format()
     ctx = QtGui.QOpenGLContext()

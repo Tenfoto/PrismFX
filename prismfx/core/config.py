@@ -13,6 +13,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from .effects import EASING_CURVES, sanitize_hex_color
+from .logging_setup import get_logger
+
+_log = get_logger("prismfx.core.config")
 
 _VALID_EASINGS = frozenset(item[0] for item in EASING_CURVES)
 _VALID_SNAP_ZONES = frozenset({
@@ -148,7 +151,7 @@ class PhysicsConfig:
     momentum_strict_clamp: bool = False
     drag_transparency_enabled: bool = True
     drag_opacity_pct: int = 86
-    flicks_enabled: bool = True
+    flicks_enabled: bool = False
     flick_threshold: float = 1450.0
     edge_snap_enabled: bool = True
     smooth_maximize_enabled: bool = True
@@ -512,14 +515,15 @@ class ConfigStore:
         for d in (self.data_dir, self.presets_dir, self.shaders_dir):
             try:
                 d.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
+            except OSError as exc:
+                _log.warning("Failed to create config directory %s: %s", d, exc)
 
     def load(self) -> PrismConfig:
         self.last_load_recovered_corrupt = False
         try:
             exists = self.config_path.exists()
-        except OSError:
+        except OSError as exc:
+            _log.warning("Failed to check config path %s: %s", self.config_path, exc)
             return PrismConfig()
         if not exists:
             cfg = PrismConfig()
@@ -531,22 +535,36 @@ class ConfigStore:
             if not isinstance(raw, dict):
                 raise ValueError("Root config JSON must be an object")
             return PrismConfig.from_dict(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             self.last_load_recovered_corrupt = True
+            bak_path = self.config_path.with_name(f"{self.config_path.name}.corrupt.bak")
             try:
-                bak_path = self.config_path.with_name(f"{self.config_path.name}.corrupt.bak")
                 shutil.copyfile(self.config_path, bak_path)
-            except OSError:
-                pass
+                _log.warning(
+                    "Corrupt config JSON at %s (%s); backed up to %s and restored defaults",
+                    self.config_path,
+                    exc,
+                    bak_path,
+                )
+            except OSError as bak_exc:
+                _log.warning(
+                    "Corrupt config JSON at %s (%s); failed to write backup %s (%s); restored defaults",
+                    self.config_path,
+                    exc,
+                    bak_path,
+                    bak_exc,
+                )
             return PrismConfig()
-        except OSError:
+        except OSError as exc:
+            _log.warning("Failed to read config %s: %s", self.config_path, exc)
             return PrismConfig()
 
     def save(self, cfg: PrismConfig) -> bool:
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
-        except (OSError, TypeError, ValueError):
+        except (OSError, TypeError, ValueError) as exc:
+            _log.warning("Failed to prepare config save to %s: %s", self.config_path, exc)
             return False
         tmp = self.config_path.with_suffix(".json.part")
         for attempt in range(5):
@@ -557,8 +575,13 @@ class ConfigStore:
                     os.fsync(f.fileno())
                 os.replace(tmp, self.config_path)
                 return True
-            except OSError:
+            except OSError as exc:
                 if attempt == 4:
+                    _log.warning(
+                        "Atomic config save to %s failed after 5 attempts (%s); trying direct write",
+                        self.config_path,
+                        exc,
+                    )
                     try:
                         with open(self.config_path, "wb") as f:
                             f.write(payload)
@@ -569,7 +592,8 @@ class ConfigStore:
                         except OSError:
                             pass
                         return True
-                    except OSError:
+                    except OSError as direct_exc:
+                        _log.warning("Direct config save to %s failed: %s", self.config_path, direct_exc)
                         try:
                             tmp.unlink(missing_ok=True)
                         except OSError:
@@ -635,7 +659,12 @@ class ConfigStore:
             return updated
 
     def save_user_preset(self, name: str, cfg: PrismConfig) -> Optional[pathlib.Path]:
+        raw_clean = str(name or "").strip()
         safe = _sanitize_preset_name(name)
+        builtin_lower = {b.lower() for b in BUILTIN_PRESETS}
+        if raw_clean.lower() in builtin_lower or safe.lower() in builtin_lower:
+            _log.warning("Refused to save user preset with reserved built-in name: %r", name)
+            return None
         tmp: Optional[pathlib.Path] = None
         try:
             self.presets_dir.mkdir(parents=True, exist_ok=True)
@@ -651,7 +680,8 @@ class ConfigStore:
                 os.fsync(f.fileno())
             os.replace(tmp, out)
             return out
-        except (OSError, TypeError, ValueError):
+        except (OSError, TypeError, ValueError) as exc:
+            _log.warning("Failed to save user preset %r: %s", safe, exc)
             if tmp is not None:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -659,12 +689,47 @@ class ConfigStore:
                     pass
             return None
 
+    def delete_user_preset(self, name: str) -> bool:
+        if not isinstance(name, str):
+            return False
+        clean_name = name.strip()
+        builtin_lower = {b.lower() for b in BUILTIN_PRESETS}
+        if (
+            not clean_name
+            or name.lower() in builtin_lower
+            or clean_name.lower() in builtin_lower
+            or "\x00" in name
+            or "/" in clean_name
+            or "\\" in clean_name
+            or ":" in clean_name
+            or ".." in clean_name
+            or _is_windows_reserved_name(clean_name)
+        ):
+            return False
+        try:
+            presets_root = self.presets_dir.resolve()
+            candidate = self.presets_dir / f"{clean_name}.prismpreset.json"
+            if candidate.is_symlink():
+                return False
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(presets_root) or not resolved.is_file():
+                return False
+            resolved.unlink()
+            return True
+        except OSError as exc:
+            _log.warning("Failed to delete user preset %r: %s", clean_name, exc)
+            return False
+
     def list_presets(self) -> list[tuple[str, bool]]:
         """Return list of (preset_name, is_builtin)."""
         items: list[tuple[str, bool]] = [(name, True) for name in BUILTIN_PRESETS]
+        builtin_lower = {name.lower() for name in BUILTIN_PRESETS}
         try:
             for f in sorted(self.presets_dir.glob("*.prismpreset.json")):
-                items.append((f.name.replace(".prismpreset.json", ""), False))
+                stem = f.name.removesuffix(".prismpreset.json")
+                if stem.lower() in builtin_lower:
+                    continue
+                items.append((stem, False))
         except OSError:
             pass
         return items

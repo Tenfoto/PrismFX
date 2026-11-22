@@ -23,12 +23,15 @@ from .catalog import classify_app, is_protected_window_class
 from .config import ConfigStore, PrismConfig
 from .effects import EffectRegistry
 from .journal import RecoveryJournal, WindowMutation
+from .logging_setup import get_logger
 from .physics import (
     DragVelocityTracker,
     MomentumBody,
     compute_snap_rect,
     detect_edge_snap_zone,
 )
+
+_log = get_logger("prismfx.core.engine")
 
 
 _WM_APP_SYNC_RAWINPUT = w32.WM_APP + 11
@@ -357,6 +360,7 @@ class PrismEngine:
         self._bg_cache_cursor: int = 0
         self._last_bg_scan: float = 0.0
         self._cached_paused_reason: str = ""
+        self._battery_pause_override: bool = False
         self._hidden_lock = threading.Lock()
         self._last_active_time: dict[int, float] = {}
         self._faded_hwnds: dict[int, tuple[int, bool]] = {}
@@ -433,6 +437,32 @@ class PrismEngine:
             with self._state_lock:
                 self._own_hwnds.add(int(hwnd))
 
+    def is_own_hwnd(self, hwnd: int) -> bool:
+        if not hwnd:
+            return False
+        with self._state_lock:
+            return int(hwnd) in self._own_hwnds
+
+    def is_window_pinned(self, hwnd: int) -> bool:
+        if not hwnd:
+            return False
+        ihwnd = int(hwnd)
+        with self._state_lock:
+            if ihwnd in self._pinned:
+                return True
+        try:
+            info = self.backend.get_window_info(ihwnd)
+            return bool(info and info.topmost)
+        except Exception as exc:
+            _log.debug("is_window_pinned lookup failed for hwnd=%#x: %s", ihwnd, exc)
+            return False
+
+    def is_window_rolled_up(self, hwnd: int) -> bool:
+        if not hwnd:
+            return False
+        with self._state_lock:
+            return int(hwnd) in self._rolled_up
+
     def _window_identity(self, hwnd: int, info: Optional[WindowInfo] = None) -> tuple[int, str, int]:
         """Return (pid, class_name, boot_tick_ms) for crash-journal HWND identity verification."""
         if not hwnd:
@@ -507,8 +537,8 @@ class PrismEngine:
                 self._momentum_wobble_hwnd = 0
                 try:
                     self.on_wobbly_end(wh, 0, 0, True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("on_wobbly_end failed in update_config for hwnd=%#x: %s", wh, exc)
         if not cfg.enabled:
             self._clear_inactive_fades()
             self._release_all_prehidden()
@@ -523,8 +553,8 @@ class PrismEngine:
         if self._raw_input_hwnd:
             try:
                 w32.user32.PostMessageW(self._raw_input_hwnd, _WM_APP_SYNC_RAWINPUT, 0, 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("Failed to post _WM_APP_SYNC_RAWINPUT in update_config: %s", exc)
         self._publish_frame()
 
     def _want_raw_input_mouse(self) -> bool:
@@ -729,9 +759,19 @@ class PrismEngine:
             return "disabled"
         if self.config.safety.pause_on_fullscreen_game and self.backend.is_fullscreen_game():
             return "fullscreen_game"
-        if self.config.safety.pause_on_battery and self.backend.is_on_battery():
+        if self.config.safety.pause_on_battery and (not self._battery_pause_override) and self.backend.is_on_battery():
             return "battery"
         return ""
+
+    def set_battery_pause_override(self, enabled: bool) -> None:
+        with self._state_lock:
+            self._battery_pause_override = bool(enabled)
+        self._apply_paused_reason_transition(self.paused_reason())
+        self._publish_frame()
+
+    def is_battery_pause_overridden(self) -> bool:
+        with self._state_lock:
+            return bool(self._battery_pause_override)
 
     def _cancel_active_interaction_for_pause(self) -> None:
         """Cancel any active drag, wobble, momentum, or precover cleanly when entering fullscreen_game."""
@@ -750,8 +790,8 @@ class PrismEngine:
             if self._hook_tid:
                 try:
                     w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("Failed to post _WM_APP_UNHOOK_DRAG during pause cancel: %s", exc)
             if (not was_wob) and was_mutated:
                 if self.backend.is_valid_window(drag_h):
                     self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
@@ -759,8 +799,8 @@ class PrismEngine:
             if was_wob and self.on_wobbly_end:
                 try:
                     self.on_wobbly_end(drag_h, 0, 0, True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("on_wobbly_end failed during pause cancel for hwnd=%#x: %s", drag_h, exc)
         self._momentum = None
         if self._momentum_wobble_hwnd:
             mw_h = self._momentum_wobble_hwnd
@@ -768,8 +808,8 @@ class PrismEngine:
             if self.on_wobbly_end:
                 try:
                     self.on_wobbly_end(mw_h, 0, 0, True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("on_wobbly_end failed for momentum hwnd=%#x during pause cancel: %s", mw_h, exc)
         self._drag_dpi_recapture_pending = False
         self._wobble_live_pos = None
         self._armed_precover = None
@@ -798,8 +838,8 @@ class PrismEngine:
         if self._raw_input_hwnd:
             try:
                 w32.user32.PostMessageW(self._raw_input_hwnd, _WM_APP_SYNC_RAWINPUT, 0, 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("Failed to post _WM_APP_SYNC_RAWINPUT on pause transition: %s", exc)
 
         if new_paused == "fullscreen_game":
             self._cancel_active_interaction_for_pause()
@@ -810,8 +850,8 @@ class PrismEngine:
         if cb is not None:
             try:
                 cb(new_paused)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning("on_pause_state_changed callback failed (paused=%r): %s", new_paused, exc)
         return True
 
     # ------------------------------------------------------------------
@@ -863,13 +903,13 @@ class PrismEngine:
             if self._hook_tid:
                 try:
                     w32.user32.PostThreadMessageW(self._hook_tid, w32.WM_QUIT, 0, 0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("Failed to post WM_QUIT to hook thread: %s", exc)
             if self._raw_input_tid:
                 try:
                     w32.user32.PostThreadMessageW(self._raw_input_tid, w32.WM_QUIT, 0, 0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("Failed to post WM_QUIT to raw input thread: %s", exc)
             self._momentum = None
             # Pass 1: immediate synchronous restore (critical under CTRL_CLOSE / WM_ENDSESSION deadlines)
             self.restore_all_os_state()
@@ -912,8 +952,8 @@ class PrismEngine:
             if self._hook_tid:
                 try:
                     w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("Failed to post _WM_APP_UNHOOK_DRAG on suspend: %s", exc)
             if (not was_wob) and was_mutated:
                 if self.backend.is_valid_window(drag_h):
                     self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
@@ -921,8 +961,8 @@ class PrismEngine:
             if was_wob and self.on_wobbly_end:
                 try:
                     self.on_wobbly_end(drag_h, 0, 0, True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("on_wobbly_end failed on suspend for hwnd=%#x: %s", drag_h, exc)
         self._momentum = None
         if self._momentum_wobble_hwnd:
             mw_h = self._momentum_wobble_hwnd
@@ -930,8 +970,8 @@ class PrismEngine:
             if self.on_wobbly_end:
                 try:
                     self.on_wobbly_end(mw_h, 0, 0, True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("on_wobbly_end failed on suspend for momentum hwnd=%#x: %s", mw_h, exc)
         self._wobble_live_pos = None
         self._armed_precover = None
         if self._active_precover_hwnd:
@@ -1045,17 +1085,29 @@ class PrismEngine:
             self._pending_dpi_wobble_captures.clear()
             self._pending_prehide.clear()
         for hwnd, (orig_a, _ts, had_layered) in hidden_items:
-            if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            try:
+                if self.backend.is_valid_window(hwnd):
+                    self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            except Exception as exc:
+                _log.warning("restore_all_os_state failed to unhide anim hwnd=%#x: %s", hwnd, exc)
         for hwnd, (orig_a, _ts, had_layered) in wobble_items:
-            if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            try:
+                if self.backend.is_valid_window(hwnd):
+                    self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            except Exception as exc:
+                _log.warning("restore_all_os_state failed to unhide wobble hwnd=%#x: %s", hwnd, exc)
         for hwnd, (orig_a, had_layered) in pre_min_items:
-            if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            try:
+                if self.backend.is_valid_window(hwnd):
+                    self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            except Exception as exc:
+                _log.warning("restore_all_os_state failed to unhide minimized hwnd=%#x: %s", hwnd, exc)
         for hwnd, (_created, _vis, had_layered) in pre_crt_items:
-            if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, 255, had_layered=had_layered)
+            try:
+                if self.backend.is_valid_window(hwnd):
+                    self.backend.set_window_hidden_alpha(hwnd, False, 255, had_layered=had_layered)
+            except Exception as exc:
+                _log.warning("restore_all_os_state failed to unhide creating hwnd=%#x: %s", hwnd, exc)
 
         count = self.journal.restore_all(
             uncloak_fn=lambda h: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_cloaked(h, False)),
@@ -1068,6 +1120,12 @@ class PrismEngine:
             verify_window_fn=self._verify_journal_mutation,
         )
         self.last_restore_failed_count = self.journal.last_restore_failed_count
+        if self.last_restore_failed_count > 0:
+            _log.warning(
+                "restore_all_os_state finished with %d failed journal mutation(s) (restored=%d)",
+                self.last_restore_failed_count,
+                count,
+            )
         self._publish_frame()
         return count
 
@@ -1215,7 +1273,7 @@ class PrismEngine:
     # ------------------------------------------------------------------
     def toggle_pin_window(self, hwnd: int) -> bool:
         info = self.backend.get_window_info(hwnd)
-        if not info:
+        if not info or is_protected_window_class(info.class_name):
             return False
         new_state = not info.topmost
         ok = bool(self.backend.set_window_topmost(hwnd, new_state))
@@ -1234,7 +1292,7 @@ class PrismEngine:
 
     def set_custom_opacity(self, hwnd: int, opacity_pct: int) -> bool:
         info = self.backend.get_window_info(hwnd)
-        if not info:
+        if not info or is_protected_window_class(info.class_name):
             return False
         had_layered, cur_alpha = self.backend.get_window_layered_state(hwnd)
         if cur_alpha is None:
@@ -1265,7 +1323,7 @@ class PrismEngine:
 
     def toggle_rollup_window(self, hwnd: int) -> bool:
         info = self.backend.get_window_info(hwnd)
-        if not info:
+        if not info or is_protected_window_class(info.class_name):
             return False
         with self._state_lock:
             orig_h = self._rolled_up.get(hwnd)
@@ -1300,7 +1358,7 @@ class PrismEngine:
         from_cap_override: Optional[tuple[int, int, bytes]] = None,
     ) -> bool:
         info = self.backend.get_window_info(hwnd)
-        if not info:
+        if not info or is_protected_window_class(info.class_name):
             return False
         if zone == "minimize":
             return self.backend.minimize_window(hwnd)
@@ -1346,7 +1404,7 @@ class PrismEngine:
 
     def minimize_to_tile(self, hwnd: int) -> bool:
         info = self.backend.get_window_info(hwnd)
-        if not info:
+        if not info or is_protected_window_class(info.class_name):
             return False
         cap: Optional[tuple[int, int, bytes]] = None
         with self._cache_lock:
@@ -1644,8 +1702,8 @@ class PrismEngine:
         if self.on_animation_queued:
             try:
                 self.on_animation_queued(job)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning("on_animation_queued callback failed (job_id=%d): %s", job.job_id, exc)
         return job
 
     def _stage_open_window(self, hwnd: int, trigger: str = "open") -> bool:
@@ -1817,8 +1875,8 @@ class PrismEngine:
         if self.on_animation_queued:
             try:
                 self.on_animation_queued(job)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning("on_animation_queued callback failed (job_id=%d): %s", job.job_id, exc)
         return job
 
     def _stage_morph_window(
@@ -1877,8 +1935,9 @@ class PrismEngine:
             self._active_precover_hwnd = hwnd
             try:
                 self.on_precover_show(pjob)
-            except Exception:
+            except Exception as exc:
                 self._active_precover_hwnd = 0
+                _log.warning("on_precover_show failed in _stage_morph_window for hwnd=%#x: %s", hwnd, exc)
 
         if not already_hidden:
             pid, cls_name, boot_ms = self._window_identity(hwnd)
@@ -1955,8 +2014,8 @@ class PrismEngine:
             try:
                 self.on_morph_queued(mjob)
                 return mjob
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning("on_morph_queued callback failed for hwnd=%#x: %s", pm.hwnd, exc)
         self.finish_hidden_handoff(pm.hwnd, pm.orig_alpha, had_layered=pm.had_layered)
         return None
 
@@ -1994,8 +2053,8 @@ class PrismEngine:
                             bgra_bytes=fresh[2],
                         )
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("on_wobbly_texture_update failed for hwnd=%#x: %s", hwnd, exc)
         else:
             if hwnd == self._drag_hwnd:
                 self._drag_size_changed_at = cap_now
@@ -2204,7 +2263,7 @@ class PrismEngine:
                             self._known_visible_hwnds.add(hwnd)
                         self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
             except Exception:
-                logging.getLogger(__name__).exception("Unhandled exception in PrismFX-OpenStager _open_stager_loop")
+                _log.exception("Unhandled exception in PrismFX-OpenStager _open_stager_loop")
 
             self._stop_event.wait(0.010)
 
@@ -2350,13 +2409,13 @@ class PrismEngine:
                 if self._hook_tid:
                     try:
                         w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.debug("Watchdog failed to post _WM_APP_UNHOOK_DRAG (invalid hwnd): %s", exc)
                 if self.on_wobbly_end:
                     try:
                         self.on_wobbly_end(drag_h, 0, 0, True)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.warning("Watchdog on_wobbly_end failed for invalid hwnd=%#x: %s", drag_h, exc)
             elif self._cached_paused_reason == "fullscreen_game":
                 self._drag_lbutton_up_since = 0.0
             elif not w32.is_lbutton_down():
@@ -2376,8 +2435,8 @@ class PrismEngine:
                     if self._hook_tid:
                         try:
                             w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _log.debug("Watchdog failed to post _WM_APP_UNHOOK_DRAG (stale drag): %s", exc)
                     if (not was_wob) and was_mutated:
                         if self.backend.is_valid_window(drag_h):
                             self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
@@ -2390,8 +2449,8 @@ class PrismEngine:
                             x, y, _, _ = w32.get_extended_frame_bounds(drag_h)
                         try:
                             self.on_wobbly_end(drag_h, x, y, True)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _log.warning("Watchdog on_wobbly_end failed for stale drag hwnd=%#x: %s", drag_h, exc)
             else:
                 self._drag_lbutton_up_since = 0.0
 
@@ -2441,8 +2500,8 @@ class PrismEngine:
                             if self.on_wobbly_end:
                                 try:
                                     self.on_wobbly_end(mh, nx, ny, False)
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    _log.warning("on_wobbly_end failed after momentum stop for hwnd=%#x: %s", mh, exc)
 
                 if now - last_fast >= 0.04:
                     last_fast = now
@@ -2459,7 +2518,7 @@ class PrismEngine:
                     last_slow = now
                     self._housekeeping_tick(now)
             except Exception:
-                logging.getLogger(__name__).exception("Unhandled exception in PrismFX-Core _poll_loop")
+                _log.exception("Unhandled exception in PrismFX-Core _poll_loop")
 
             if self._momentum is not None:
                 sleep_sec = max(0.0025, 1.0 / max(30, min(360, int(self.config.target_fps))))
@@ -2468,6 +2527,11 @@ class PrismEngine:
             self._stop_event.wait(sleep_sec)
 
     def _housekeeping_tick(self, now: float) -> None:
+        # Auto-clear temporary battery pause override once AC power is restored
+        if self._battery_pause_override and not self.backend.is_on_battery():
+            with self._state_lock:
+                self._battery_pause_override = False
+
         # Refresh paused_reason ONCE per 350 ms here (zero SHQueryUserNotificationState on hooks!)
         paused = self.paused_reason()
         self._apply_paused_reason_transition(paused)
@@ -2947,8 +3011,8 @@ class PrismEngine:
         if self.on_precover_cancel:
             try:
                 self.on_precover_cancel(h)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning("on_precover_cancel callback failed for hwnd=%#x: %s", h, exc)
 
     def _is_taskbar_point(self, cx: int, cy: int) -> bool:
         raw_h = w32.window_from_point(cx, cy)

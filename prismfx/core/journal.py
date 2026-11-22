@@ -16,6 +16,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
+from .logging_setup import get_logger
+
+_log = get_logger("prismfx.core.journal")
+
 
 @dataclass
 class WindowMutation:
@@ -65,10 +69,12 @@ class RecoveryJournal:
         try:
             raw = json.loads(candidate.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
+                _log.warning("Recovery journal %s root JSON is not an object", candidate)
                 return False
             loaded_windows: dict[int, WindowMutation] = {}
             win_list = raw.get("windows", [])
             if not isinstance(win_list, list):
+                _log.warning("Recovery journal %s 'windows' entry is not a list", candidate)
                 return False
             for item in win_list:
                 if not isinstance(item, dict) or "hwnd" not in item:
@@ -104,7 +110,8 @@ class RecoveryJournal:
             self._desktop_icons_hidden_by_app = bool(raw.get("desktop_icons_hidden_by_app", False))
             self._original_min_animate = None if orig_min is None else bool(orig_min)
             return True
-        except Exception:
+        except Exception as exc:
+            _log.warning("Failed to load recovery journal %s: %s", candidate, exc)
             return False
 
     def _load_existing(self) -> None:
@@ -121,7 +128,8 @@ class RecoveryJournal:
         """Atomically write payload to `.json.part` -> fsync -> `os.replace` (caller holds `_io_lock`)."""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
+        except OSError as exc:
+            _log.warning("Failed to ensure recovery journal dir %s: %s", self.path.parent, exc)
             return False
         tmp = self.path.with_suffix(".json.part")
         data = json.dumps(payload, indent=2).encode("utf-8")
@@ -133,12 +141,18 @@ class RecoveryJournal:
                     os.fsync(f.fileno())
                 os.replace(tmp, self.path)
                 return True
-            except PermissionError:
+            except PermissionError as exc:
                 if attempt == 5:
                     # Never fall back to non-atomic direct overwrite; preserve valid .part for recovery
+                    _log.warning(
+                        "Atomic replace of recovery journal %s failed after 6 attempts: %s",
+                        self.path,
+                        exc,
+                    )
                     return False
                 time.sleep(0.008 * (attempt + 1))
-            except OSError:
+            except OSError as exc:
+                _log.warning("Failed to write recovery journal %s: %s", self.path, exc)
                 return False
         return False
 
@@ -444,7 +458,8 @@ class RecoveryJournal:
             if verify_window_fn is not None:
                 try:
                     valid_identity = bool(verify_window_fn(m))
-                except Exception:
+                except Exception as exc:
+                    _log.warning("Journal verify_window_fn failed for hwnd=%s: %s", m.hwnd, exc)
                     valid_identity = False
                 if not valid_identity:
                     win_results[m.hwnd] = (True, True, True, True)
@@ -462,7 +477,8 @@ class RecoveryJournal:
                         restored += 1
                     else:
                         failed += 1
-                except Exception:
+                except Exception as exc:
+                    _log.warning("Journal uncloak_fn failed for hwnd=%s: %s", m.hwnd, exc)
                     failed += 1
 
             if m.original_alpha is not None:
@@ -477,7 +493,8 @@ class RecoveryJournal:
                         restored += 1
                     else:
                         failed += 1
-                except Exception:
+                except Exception as exc:
+                    _log.warning("Journal restore_alpha failed for hwnd=%s: %s", m.hwnd, exc)
                     failed += 1
 
             if m.pinned_by_app:
@@ -487,7 +504,8 @@ class RecoveryJournal:
                         restored += 1
                     else:
                         failed += 1
-                except Exception:
+                except Exception as exc:
+                    _log.warning("Journal unpin_fn failed for hwnd=%s: %s", m.hwnd, exc)
                     failed += 1
 
             if m.rolled_up and m.original_height is not None:
@@ -497,7 +515,8 @@ class RecoveryJournal:
                         restored += 1
                     else:
                         failed += 1
-                except Exception:
+                except Exception as exc:
+                    _log.warning("Journal unroll_fn failed for hwnd=%s: %s", m.hwnd, exc)
                     failed += 1
 
             win_results[m.hwnd] = (ok_cloak, ok_alpha, ok_pin, ok_roll)
@@ -510,7 +529,8 @@ class RecoveryJournal:
                     restored += 1
                 else:
                     failed += 1
-            except Exception:
+            except Exception as exc:
+                _log.warning("Journal show_desktop_icons_fn failed: %s", exc)
                 failed += 1
 
         ok_min_anim = False
@@ -521,7 +541,8 @@ class RecoveryJournal:
                     restored += 1
                 else:
                     failed += 1
-            except Exception:
+            except Exception as exc:
+                _log.warning("Journal restore_min_animate_fn failed: %s", exc)
                 failed += 1
 
         with self._lock:

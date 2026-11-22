@@ -31,6 +31,7 @@ from ..core.engine import (
     is_proportional_dpi_scale,
 )
 from ..core.physics import WobblyMesh, eval_easing
+from ..ui.theme import ATLAS, TOKENS
 from .gl_renderer import OffscreenGpuEngine
 
 _OVERSCAN_LARGE_SHADER_IDS = frozenset({3, 6, 7, 8, 10, 15, 29, 31, 33, 34, 35, 41, 42})
@@ -1510,16 +1511,24 @@ class FloatingTileWindow(QtWidgets.QWidget):
 
     restored = QtCore.Signal(int)
 
-    def __init__(self, info: WindowInfo, bgra: Optional[tuple[int, int, bytes]], size_px: int, topmost: bool) -> None:
+    def __init__(
+        self,
+        info: WindowInfo,
+        bgra: Optional[tuple[int, int, bytes]],
+        size_px: int,
+        topmost: bool,
+        lang: str = "th",
+    ) -> None:
         super().__init__(None)
         self.target_hwnd = info.hwnd
+        self._lang: str = "en" if str(lang).lower() == "en" else "th"
         flags = QtCore.Qt.FramelessWindowHint | QtCore.Qt.Tool
         if topmost:
             flags |= QtCore.Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setFixedSize(size_px, int(size_px * 0.72) + 26)
         self.setCursor(QtCore.Qt.PointingHandCursor)
-        self._title = info.title[:28]
+        self._title = info.title[:64]
         self._exe = info.exe_name
         self._pix: Optional[QtGui.QPixmap] = None
         if bgra:
@@ -1530,17 +1539,66 @@ class FloatingTileWindow(QtWidgets.QWidget):
             )
         self._drag_origin: Optional[QtCore.QPoint] = None
 
+        t = TOKENS
+        self._btn_restore = QtWidgets.QPushButton("⤢", self)
+        self._btn_restore.setFixedSize(22, 20)
+        self._btn_restore.setCursor(QtCore.Qt.PointingHandCursor)
+        self._btn_restore.setFocusPolicy(QtCore.Qt.NoFocus)
+        self._btn_restore.setFont(ATLAS.font_for("mono", 9.0))
+        self._btn_restore.setStyleSheet(
+            f"QPushButton {{ background: {t['bg_elevated']}; color: {t['ink_primary']}; "
+            f"border: 1px solid {t['line_strong']}; padding: 0px; }}"
+            f"QPushButton:hover {{ background: {t['accent']}; border-color: {t['accent_hi']}; color: #FFFFFF; }}"
+            f"QPushButton:pressed {{ background: {t['bg_selected']}; }}"
+        )
+        self._btn_restore.clicked.connect(self._on_restore_clicked)
+        self._position_restore_button()
+        self.retranslate(self._lang)
+
+    def _position_restore_button(self) -> None:
+        self._btn_restore.move(max(2, self.width() - 25), max(2, self.height() - 23))
+
+    def _on_restore_clicked(self) -> None:
+        self.restored.emit(self.target_hwnd)
+        self.close()
+
+    def retranslate(self, lang: str) -> None:
+        self._lang = "en" if str(lang).lower() == "en" else "th"
+        if self._lang == "th":
+            self.setToolTip(
+                "ลากด้วยคลิกซ้ายเพื่อย้ายไทล์ • ดับเบิลคลิก, คลิกขวา หรือกดปุ่ม ⤢ เพื่อคืนหน้าต่าง"
+            )
+            self._btn_restore.setToolTip("คืนหน้าต่าง")
+        else:
+            self.setToolTip(
+                "Left-drag to move tile • Double-click, right-click, or click ⤢ to restore window"
+            )
+            self._btn_restore.setToolTip("Restore Window")
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._position_restore_button()
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        t = TOKENS
         p = QtGui.QPainter(self)
-        p.fillRect(self.rect(), QtGui.QColor("#17181C"))
-        p.setPen(QtGui.QPen(QtGui.QColor("#2D81FF"), 1))
+        p.fillRect(self.rect(), QtGui.QColor(t["bg_elevated"]))
+        p.setPen(QtGui.QPen(QtGui.QColor(t["accent"]), 1))
         p.drawRect(0, 0, self.width() - 1, self.height() - 1)
         if self._pix:
             p.drawPixmap(2, 2, self.width() - 4, self.height() - 28, self._pix)
-        p.fillRect(1, self.height() - 25, self.width() - 2, 24, QtGui.QColor("#0B0C0E"))
-        p.setPen(QtGui.QColor("#F2F1EE"))
-        p.setFont(QtGui.QFont("Segoe UI", 8))
-        p.drawText(6, self.height() - 8, self._title or self._exe)
+        p.fillRect(1, self.height() - 25, self.width() - 2, 24, QtGui.QColor(t["bg_recessed"]))
+        title_str = self._title or self._exe
+        font = ATLAS.font_for("body", 8.8, text=title_str)
+        p.setFont(font)
+        p.setPen(QtGui.QColor(t["ink_primary"]))
+        avail_w = max(16, self.width() - 35)
+        elided = QtGui.QFontMetrics(font).elidedText(title_str, QtCore.Qt.ElideRight, avail_w)
+        p.drawText(
+            QtCore.QRect(6, self.height() - 25, avail_w, 24),
+            QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+            elided,
+        )
         p.end()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -1554,6 +1612,11 @@ class FloatingTileWindow(QtWidgets.QWidget):
         if self._drag_origin is not None:
             self.move(event.globalPosition().toPoint() - self._drag_origin)
 
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self._drag_origin = None
+        super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
         self.restored.emit(self.target_hwnd)
         self.close()
@@ -1566,13 +1629,22 @@ class QuickControlPopup(QtWidgets.QWidget):
         super().__init__(parent)
         self.engine = engine
         self._target_hwnd: int = 0
+        self._last_info: Optional[WindowInfo] = None
+        self._armed_outside_close: bool = False
+        self._lang: str = str(getattr(engine.config, "language", "th") or "th")
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setFixedWidth(360)
+
+        t = TOKENS
         self.setStyleSheet(
-            "QWidget { background: #121316; color: #F2F1EE; font-family: 'Segoe UI'; }"
-            "QPushButton { background: #17181C; border: 1px solid #2A2D36; padding: 6px 10px; color: #F2F1EE; }"
-            "QPushButton:hover { border-color: #2D81FF; background: #1E2430; }"
-            "QLabel { background: transparent; }"
+            f"QWidget {{ background: {t['bg_base']}; color: {t['ink_primary']}; "
+            f"font-family: \"{ATLAS.body_family}\", \"{ATLAS.thai_family}\"; }}"
+            f"QPushButton {{ background: {t['bg_elevated']}; border: 1px solid {t['line']}; "
+            f"padding: 6px 6px; color: {t['ink_primary']}; }}"
+            f"QPushButton:hover {{ border-color: {t['accent']}; background: {t['bg_hover']}; }}"
+            f"QPushButton:pressed {{ background: {t['bg_selected']}; }}"
+            f"QLabel {{ background: transparent; }}"
         )
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 14)
@@ -1580,63 +1652,129 @@ class QuickControlPopup(QtWidgets.QWidget):
 
         hdr = QtWidgets.QHBoxLayout()
         self._lbl_title = QtWidgets.QLabel("QUICK WINDOW CONTROLS")
-        self._lbl_title.setStyleSheet("color: #74AAFF; font-weight: bold; font-size: 11px;")
-        btn_x = QtWidgets.QPushButton("✕")
-        btn_x.setFixedSize(26, 24)
-        btn_x.clicked.connect(self.hide)
+        self._lbl_title.setStyleSheet(f"color: {t['accent_hi']}; background: transparent;")
+        self._btn_close = QtWidgets.QPushButton("✕")
+        self._btn_close.setFixedSize(26, 24)
+        self._btn_close.clicked.connect(self.hide)
         hdr.addWidget(self._lbl_title, 1)
-        hdr.addWidget(btn_x)
+        hdr.addWidget(self._btn_close)
         root.addLayout(hdr)
 
         self._lbl_meta = QtWidgets.QLabel("No active target window")
-        self._lbl_meta.setStyleSheet("color: #9CA3AF; font-size: 11px;")
+        self._lbl_meta.setStyleSheet(f"color: {t['ink_secondary']}; background: transparent;")
         root.addWidget(self._lbl_meta)
 
         row1 = QtWidgets.QHBoxLayout()
-        for label, cb in [
-            ("Pin Top", self._on_pin),
-            ("Roll-Up", self._on_rollup),
-            ("Mini Tile", self._on_tile),
-            ("Test FX", self._on_test_fx),
-        ]:
-            b = QtWidgets.QPushButton(label)
-            b.clicked.connect(cb)
+        row1.setSpacing(6)
+        self._btn_pin = QtWidgets.QPushButton("Pin Top")
+        self._btn_pin.clicked.connect(self._on_pin)
+        self._btn_rollup = QtWidgets.QPushButton("Roll-Up")
+        self._btn_rollup.clicked.connect(self._on_rollup)
+        self._btn_tile = QtWidgets.QPushButton("Mini Tile")
+        self._btn_tile.clicked.connect(self._on_tile)
+        self._btn_test_fx = QtWidgets.QPushButton("Test FX")
+        self._btn_test_fx.clicked.connect(self._on_test_fx)
+        for b in (self._btn_pin, self._btn_rollup, self._btn_tile, self._btn_test_fx):
             row1.addWidget(b)
         root.addLayout(row1)
 
         op_row = QtWidgets.QHBoxLayout()
-        op_row.addWidget(QtWidgets.QLabel("Opacity"))
+        self._lbl_op_caption = QtWidgets.QLabel("Opacity")
+        self._lbl_op_caption.setStyleSheet(f"color: {t['ink_primary']}; background: transparent;")
+        op_row.addWidget(self._lbl_op_caption)
         self._sl_op = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self._sl_op.setRange(25, 100)
         self._sl_op.setValue(100)
         self._sl_op.valueChanged.connect(self._on_opacity)
         self._lbl_op = QtWidgets.QLabel("100%")
+        self._lbl_op.setStyleSheet(f"color: {t['ink_secondary']}; background: transparent;")
         op_row.addWidget(self._sl_op, 1)
         op_row.addWidget(self._lbl_op)
         root.addLayout(op_row)
 
-        snap_lbl = QtWidgets.QLabel("SMART SNAP ZONES")
-        snap_lbl.setStyleSheet("color: #74AAFF; font-size: 10px; font-weight: bold;")
-        root.addWidget(snap_lbl)
+        self._lbl_snap_hdr = QtWidgets.QLabel("SMART SNAP ZONES")
+        self._lbl_snap_hdr.setStyleSheet(f"color: {t['accent_hi']}; background: transparent;")
+        root.addWidget(self._lbl_snap_hdr)
         grid = QtWidgets.QGridLayout()
         grid.setSpacing(4)
         zones = [
-            ("L 50%", "left_50"), ("R 50%", "right_50"), ("L 66%", "left_66"), ("R 33%", "right_33"),
-            ("Center", "center_50"), ("Top", "top_50"), ("Bottom", "bottom_50"), ("Max", "maximize"),
+            ("ซ้าย 50%", "L 50%", "left_50"),
+            ("ขวา 50%", "R 50%", "right_50"),
+            ("ซ้าย 66%", "L 66%", "left_66"),
+            ("ขวา 33%", "R 33%", "right_33"),
+            ("กลาง", "Center", "center_50"),
+            ("บน", "Top", "top_50"),
+            ("ล่าง", "Bottom", "bottom_50"),
+            ("เต็มจอ", "Max", "maximize"),
         ]
-        for idx, (lbl, z) in enumerate(zones):
-            b = QtWidgets.QPushButton(lbl)
+        self._snap_btns: list[tuple[QtWidgets.QPushButton, str, str]] = []
+        for idx, (lbl_th, lbl_en, z) in enumerate(zones):
+            b = QtWidgets.QPushButton(lbl_en)
             b.clicked.connect(lambda _=False, zone=z: self._on_snap(zone))
             grid.addWidget(b, idx // 4, idx % 4)
+            self._snap_btns.append((b, lbl_th, lbl_en))
         root.addLayout(grid)
+
+        self.retranslate(self._lang)
+
+    def retranslate(self, lang: Optional[str] = None) -> None:
+        raw_lang = lang if lang is not None else getattr(self.engine.config, "language", "th")
+        is_th = str(raw_lang or "th").lower() != "en"
+        self._lang = "th" if is_th else "en"
+
+        if self._last_info is not None:
+            friendly = self._last_info.classification.friendly_name.upper()
+            title_txt = f"ควบคุมด่วน // {friendly}" if is_th else f"QUICK CONTROL // {friendly}"
+            safety = (
+                self._last_info.classification.fx_safety_th
+                if is_th
+                else self._last_info.classification.fx_safety
+            )
+            meta_txt = f"{self._last_info.exe_name} (PID {self._last_info.pid}) • {safety}"
+        else:
+            title_txt = "ควบคุมหน้าต่างด่วน" if is_th else "QUICK WINDOW CONTROLS"
+            meta_txt = "ยังไม่ได้เลือกหน้าต่างเป้าหมาย" if is_th else "No active target window"
+
+        self._lbl_title.setText(title_txt)
+        self._lbl_title.setFont(ATLAS.font_for("mono", 8.8, text=title_txt, bold=True))
+        self._lbl_meta.setText(meta_txt)
+        self._lbl_meta.setFont(ATLAS.font_for("body", 8.6, text=meta_txt))
+
+        self._btn_close.setFont(ATLAS.font_for("mono", 9.0))
+        self._btn_close.setToolTip("ปิด (Esc)" if is_th else "Close (Esc)")
+
+        action_labels = [
+            (self._btn_pin, "ปักหมุด", "Pin Top"),
+            (self._btn_rollup, "ม้วนขึ้น", "Roll-Up"),
+            (self._btn_tile, "ย่อไทล์", "Mini Tile"),
+            (self._btn_test_fx, "ทดสอบ FX", "Test FX"),
+        ]
+        for btn, th_txt, en_txt in action_labels:
+            txt = th_txt if is_th else en_txt
+            btn.setText(txt)
+            btn.setFont(ATLAS.font_for("body", 8.8, text=txt))
+
+        op_txt = "ความโปร่งใส" if is_th else "Opacity"
+        self._lbl_op_caption.setText(op_txt)
+        self._lbl_op_caption.setFont(ATLAS.font_for("body", 8.8, text=op_txt))
+        self._lbl_op.setFont(ATLAS.font_for("mono", 8.8))
+
+        snap_hdr_txt = "จัดวางหน้าต่างอัตโนมัติ" if is_th else "SMART SNAP ZONES"
+        self._lbl_snap_hdr.setText(snap_hdr_txt)
+        self._lbl_snap_hdr.setFont(ATLAS.font_for("mono", 8.2, text=snap_hdr_txt, bold=True))
+
+        for btn, th_txt, en_txt in self._snap_btns:
+            txt = th_txt if is_th else en_txt
+            btn.setText(txt)
+            btn.setFont(ATLAS.font_for("body", 8.5, text=txt))
 
     def show_for_window(self, hwnd: int) -> None:
         info = self.engine.backend.get_window_info(hwnd)
         if not info:
             return
         self._target_hwnd = hwnd
-        self._lbl_title.setText(f"QUICK CONTROL // {info.classification.friendly_name.upper()}")
-        self._lbl_meta.setText(f"{info.exe_name} (PID {info.pid}) • {info.classification.fx_safety}")
+        self._last_info = info
+        self.retranslate(self.engine.config.language)
         pct = max(25, min(100, int(round(info.opacity / 2.55))))
         self._sl_op.blockSignals(True)
         self._sl_op.setValue(pct)
@@ -1649,9 +1787,35 @@ class QuickControlPopup(QtWidgets.QWidget):
         ph = max(1, self.height())
         px, py, _, _ = clamp_to_virtual_screens(lx - pw // 2, ly - 40, pw, ph, margin=8)
         self.move(px, py)
+        self._armed_outside_close = False
         self.show()
         self.raise_()
+        if not self.testAttribute(QtCore.Qt.WA_ShowWithoutActivating):
+            self.activateWindow()
+            self.setFocus(QtCore.Qt.PopupFocusReason)
+            self._armed_outside_close = True
         self.engine.register_own_hwnd(int(self.winId()))
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.hide()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def event(self, event: QtCore.QEvent) -> bool:
+        if (
+            event.type() == QtCore.QEvent.WindowDeactivate
+            and self._armed_outside_close
+            and self.isVisible()
+        ):
+            self._armed_outside_close = False
+            self.hide()
+        return super().event(event)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self._armed_outside_close = False
+        super().hideEvent(event)
 
     def _on_pin(self) -> None:
         if self._target_hwnd:

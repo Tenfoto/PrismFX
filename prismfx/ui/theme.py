@@ -133,10 +133,12 @@ class FontAtlas:
                         self.loaded_font_files.append(str(fp))
 
     def font_for(self, role: str, base_pt: float, text: str = "", bold: bool = False) -> QtGui.QFont:
-        use_thai = has_thai(text) and self.thai_family == "FC Minimal"
-        if use_thai:
+        if text and has_thai(text):
             fam = self.thai_family
-            pt = max(9.0, base_pt * THAI_SCALE)
+            if self.thai_family in ("FC Minimal", "THSarabun"):
+                pt = max(9.5, base_pt * THAI_SCALE)
+            else:
+                pt = max(9.5, base_pt * 1.12)
         elif role == "display":
             fam = self.display_family
             pt = base_pt
@@ -299,6 +301,56 @@ def build_stylesheet() -> str:
     QCheckBox::indicator:checked {{
         background: {t["accent"]};
         border: 1px solid {t["accent_hi"]};
+    }}
+    QLabel:disabled {{
+        color: {t["ink_muted"]};
+    }}
+    QPushButton:disabled {{
+        background-color: {t["bg_recessed"]};
+        color: {t["ink_muted"]};
+        border: 1px solid {t["line"]};
+    }}
+    QPushButton[accent="true"]:disabled {{
+        background-color: {t["bg_recessed"]};
+        color: {t["ink_muted"]};
+        border: 1px solid {t["line"]};
+    }}
+    QPushButton[danger="true"]:disabled {{
+        background-color: {t["bg_recessed"]};
+        color: {t["ink_muted"]};
+        border: 1px solid {t["line"]};
+    }}
+    QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled {{
+        background-color: {t["bg_base"]};
+        color: {t["ink_muted"]};
+        border: 1px solid {t["line"]};
+    }}
+    QSlider::groove:horizontal:disabled {{
+        background: {t["bg_base"]};
+        border: 1px solid {t["line"]};
+    }}
+    QSlider::sub-page:horizontal:disabled {{
+        background: {t["line_strong"]};
+    }}
+    QSlider::handle:horizontal:disabled {{
+        background: {t["line_strong"]};
+        border: 1px solid {t["line"]};
+    }}
+    QCheckBox:disabled {{
+        color: {t["ink_muted"]};
+    }}
+    QCheckBox::indicator:disabled {{
+        background: {t["bg_base"]};
+        border: 1px solid {t["line"]};
+    }}
+    QCheckBox::indicator:checked:disabled {{
+        background: {t["accent_dim"]};
+        border: 1px solid {t["line_strong"]};
+    }}
+    QSizeGrip {{
+        width: 14px;
+        height: 14px;
+        background: transparent;
     }}
     QTableWidget {{
         background-color: {t["bg_recessed"]};

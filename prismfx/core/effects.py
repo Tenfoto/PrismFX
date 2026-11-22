@@ -12,6 +12,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .logging_setup import get_logger
+
+_log = get_logger("prismfx.core.effects")
+
 MAX_CUSTOM_SHADER_BYTES = 128 * 1024
 _HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 
@@ -244,18 +248,36 @@ class EffectRegistry:
         self._effects: dict[str, EffectSpec] = {e.id: e for e in BUILTIN_EFFECTS}
         self._order: list[str] = [e.id for e in BUILTIN_EFFECTS]
         self._next_custom_shader_id: int = 1000
-        if custom_dirs:
-            for d in custom_dirs:
-                self.scan_custom_dir(d)
+        self._custom_shader_ids: dict[str, int] = {}
+        self._custom_dirs: list[pathlib.Path] = [pathlib.Path(d) for d in (custom_dirs or [])]
+        for d in self._custom_dirs:
+            self.scan_custom_dir(d)
+
+    def reload_custom_dirs(self, custom_dirs: Optional[list[pathlib.Path]] = None) -> int:
+        """Remove all loaded custom shaders and rescan configured custom shader directories."""
+        if custom_dirs is not None:
+            self._custom_dirs = [pathlib.Path(d) for d in custom_dirs]
+
+        custom_ids = [eid for eid, spec in self._effects.items() if spec.is_custom]
+        for eid in custom_ids:
+            self._effects.pop(eid, None)
+        self._order = [eid for eid in self._order if eid in self._effects]
+
+        total_loaded = 0
+        for d in self._custom_dirs:
+            total_loaded += self.scan_custom_dir(d)
+        return total_loaded
 
     def scan_custom_dir(self, directory: pathlib.Path) -> int:
         """Discover user `.prismfx.json` + `.glsl` custom fragment shader plugins."""
+        directory = pathlib.Path(directory)
         try:
             if not directory.exists() or not directory.is_dir():
                 return 0
             base_dir = directory.resolve()
             meta_paths = sorted(directory.glob("*.prismfx.json"))
-        except OSError:
+        except OSError as exc:
+            _log.warning("Failed to scan custom shader directory %s: %s", directory, exc)
             return 0
         loaded = 0
         for meta_path in meta_paths:
@@ -344,9 +366,12 @@ class EffectRegistry:
                 existing = self._effects.get(full_id)
                 if existing is not None and existing.is_custom:
                     shader_id = existing.shader_id
+                elif full_id in self._custom_shader_ids:
+                    shader_id = self._custom_shader_ids[full_id]
                 else:
                     shader_id = self._next_custom_shader_id
                     self._next_custom_shader_id += 1
+                    self._custom_shader_ids[full_id] = shader_id
 
                 spec = EffectSpec(
                     id=full_id,
@@ -367,7 +392,8 @@ class EffectRegistry:
                 if spec.id not in self._order:
                     self._order.append(spec.id)
                 loaded += 1
-            except Exception:
+            except Exception as exc:
+                _log.warning("Failed to load custom shader metadata %s: %s", meta_path, exc)
                 continue
         return loaded
 
