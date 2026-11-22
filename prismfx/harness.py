@@ -1601,6 +1601,266 @@ def run_selftest() -> dict:
             f"cache_mb={cache_bytes / (1024 * 1024):.1f} m02={m02_ok} m03={m03_ok} "
             f"m04_journal={m04_fail_journal_ok} m04_vd={m04_vd_ok}",
         )
+
+        # (10d) Live Win32 Hook & RawInput Thread Startup/Shutdown Regression (unhashable ctypes callback fix)
+        from .core.backend import Win32WindowBackend
+        from .core.engine import _ACTIVE_NATIVE_CALLBACKS, _ACTIVE_NATIVE_CALLBACKS_LOCK
+
+        live_store = ConfigStore(s2_dir / "live_threads_profile")
+        live_cfg = live_store.load()
+        live_cfg.safety.suppress_native_min_anim = False
+        live_cfg.safety.pause_on_fullscreen_game = False
+        live_cfg.safety.pause_on_battery = False
+        live_store.save(live_cfg)
+        live_eng = PrismEngine(Win32WindowBackend(), live_store, EffectRegistry())
+        live_threads_ok = False
+        live_detail = ""
+        try:
+            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                cb_before = len(_ACTIVE_NATIVE_CALLBACKS)
+            live_eng.start()
+            wait_deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < wait_deadline:
+                if live_eng._hook_tid and live_eng._raw_input_tid and len(live_eng._win_event_hooks) == 6 and live_eng._raw_input_registered:
+                    break
+                time.sleep(0.02)
+            threads_alive = all(
+                t is not None and t.is_alive()
+                for t in (
+                    live_eng._poll_thread,
+                    live_eng._open_stager_thread,
+                    live_eng._hook_thread,
+                    live_eng._raw_input_thread,
+                )
+            )
+            hooks_installed = len(live_eng._win_event_hooks) == 6
+            raw_ready = (live_eng._raw_input_hwnd > 0) and live_eng._raw_input_registered
+            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                cb_during = len(_ACTIVE_NATIVE_CALLBACKS)
+            live_eng.stop()
+            threads_stopped = all(
+                t is None or (not t.is_alive())
+                for t in (
+                    live_eng._poll_thread,
+                    live_eng._open_stager_thread,
+                    live_eng._hook_thread,
+                    live_eng._raw_input_thread,
+                )
+            )
+            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                cb_after = len(_ACTIVE_NATIVE_CALLBACKS)
+            live_threads_ok = (
+                threads_alive
+                and hooks_installed
+                and raw_ready
+                and (cb_during >= cb_before + 2)
+                and threads_stopped
+                and (len(live_eng._win_event_hooks) == 0)
+                and (not live_eng._raw_input_registered)
+                and (cb_after == cb_before)
+            )
+            live_detail = (
+                f"alive={threads_alive} hooks={hooks_installed} raw={raw_ready} "
+                f"cbs={cb_before}->{cb_during}->{cb_after} stopped={threads_stopped}"
+            )
+        finally:
+            live_eng.stop()
+            live_eng.journal.close()
+        check("sprint2_live_hook_and_rawinput_threads", live_threads_ok, live_detail)
+
+        # (10e) Borderless Fullscreen False-Positive Guards (NVIDIA Overlay / Maximized Frameless / Shell)
+        mon_autohide = w32.MonitorRect("\\\\.\\DISPLAY1", 0, 0, 1920, 1080, 0, 0, 1920, 1080, True)
+        frameless_max_style = w32.WS_VISIBLE | w32.WS_POPUP | w32.WS_MAXIMIZE
+        overlay_exes = (
+            "NVIDIA Overlay.exe",
+            "NVIDIA Share.exe",
+            "Share.exe",
+            "GameBar.exe",
+            "RadeonSoftware.exe",
+            "LosslessScaling.exe",
+            "Overwolf.exe",
+            "obs64.exe",
+        )
+        overlays_rejected = all(
+            not w32.is_borderless_fullscreen_candidate(
+                "Chrome_WidgetWin_1", ov_exe, borderless_style, 0, (0, 0, 1920, 1080), mon_autohide
+            )
+            for ov_exe in overlay_exes
+        )
+        overlay_cat_ok = (
+            classify_app("Share.exe").category == "GPU Overlay"
+            and classify_app("Share.exe").recommended_exclude is True
+            and classify_app("Overwolf.exe").category == "GPU Overlay"
+            and classify_app("Overwolf.exe").recommended_exclude is True
+        )
+        maximized_frameless_rejected = (
+            not w32.is_borderless_fullscreen_candidate(
+                "Chrome_WidgetWin_1", "Antigravity.exe", frameless_max_style, 0, (0, 0, 1920, 1080), mon_autohide, is_zoomed=True
+            )
+            and not w32.is_borderless_fullscreen_candidate(
+                "Qt6120QWindowIcon", "CustomFramelessApp.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_autohide, is_zoomed=True
+            )
+            and not w32.is_borderless_fullscreen_candidate(
+                "OverlayHUD", "CustomOverlay.exe", borderless_style, w32.WS_EX_LAYERED, (0, 0, 1920, 1080), mon_autohide
+            )
+            and not w32.is_borderless_fullscreen_candidate(
+                "ApplicationFrameWindow", "ApplicationFrameHost.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_autohide
+            )
+            and not w32.is_borderless_fullscreen_candidate(
+                "CabinetWClass", "explorer.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_autohide
+            )
+        )
+        real_games_still_detected = (
+            w32.is_borderless_fullscreen_candidate(
+                "UnrealWindow", "SomeDX12Game.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_autohide, is_zoomed=False
+            )
+            and w32.is_borderless_fullscreen_candidate(
+                "UnrealWindow", "VALORANT-Win64-Shipping.exe", frameless_max_style, 0, (0, 0, 1920, 1080), mon_autohide, is_zoomed=True
+            )
+        )
+        check(
+            "sprint2_borderless_false_positive_guards",
+            overlays_rejected and overlay_cat_ok and maximized_frameless_rejected and real_games_still_detected,
+            f"ov_rej={overlays_rejected} ov_cat={overlay_cat_ok} max_fl_rej={maximized_frameless_rejected} "
+            f"games_ok={real_games_still_detected}",
+        )
+
+        # (10f) UWP Cloak/Uncloak Guard (IME/CoreWindow non-poisoning) + Overlay SW_HIDE Resume Playback
+        uwp_store = ConfigStore(s2_dir / "uwp_resume_profile")
+        uwp_eng = PrismEngine(DemoWindowBackend(seed=42), uwp_store, EffectRegistry())
+        dummy_cap_w = QtWidgets.QWidget()
+        dummy_cap_w.setWindowTitle("UWPSettingsProbe")
+        dummy_cap_w.resize(640, 420)
+        dummy_hwnd = int(dummy_cap_w.winId())
+        w32.set_window_cloaked(dummy_hwnd, True)
+        uwp_ov = DesktopFxOverlay(uwp_eng)
+        uwp_uncloak_ok = False
+        ov_resume_ok = False
+        uwp_detail = ""
+        orig_get_cls = w32.get_class_name
+        try:
+            for s in uwp_ov._surface_pool:
+                if s.hwnd:
+                    w32.set_window_cloaked(s.hwnd, True)
+
+            staged_opens: list[tuple[int, str]] = []
+            uwp_eng._stage_open_window = lambda h, trig="open": (staged_opens.append((h, trig)) or True)  # type: ignore[method-assign]
+            uwp_eng._last_cloak_ts = time.perf_counter() - 5.0
+            base_cloak_ts = uwp_eng._last_cloak_ts
+
+            # Protected/unknown IME & CoreWindow cloaks/uncloaks must NOT poison _last_cloak_ts or _recent_uncloak_times
+            ime_hwnd, msctf_hwnd, core_hwnd = 888001, 888002, 888003
+            cls_overrides = {
+                ime_hwnd: "IME",
+                msctf_hwnd: "MSCTFIME UI",
+                core_hwnd: "Windows.UI.Core.CoreWindow",
+                dummy_hwnd: "ApplicationFrameWindow",
+            }
+            w32.get_class_name = lambda h: cls_overrides.get(int(h), orig_get_cls(h))  # type: ignore[assignment]
+
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_CLOAKED, ime_hwnd)
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_CLOAKED, msctf_hwnd)
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_CLOAKED, core_hwnd)
+            cloak_ts_clean = (uwp_eng._last_cloak_ts == base_cloak_ts)
+
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_UNCLOAKED, ime_hwnd)
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_UNCLOAKED, msctf_hwnd)
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_UNCLOAKED, core_hwnd)
+            burst_clean = (len(uwp_eng._recent_uncloak_times) == 0)
+
+            # Real UWP ApplicationFrameWindow uncloak immediately after IME cloaks MUST stage Open!
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_UNCLOAKED, dummy_hwnd)
+            uwp_opened_once = (staged_opens == [(dummy_hwnd, "open")])
+
+            # Close via CLOAK -> HIDE (without DESTROY) must clear _cloaked_hwnds so reused UWP HWND can reopen!
+            with uwp_eng._state_lock:
+                uwp_eng._known_visible_hwnds.add(dummy_hwnd)
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_CLOAKED, dummy_hwnd)
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_HIDE, dummy_hwnd)
+            cleared_on_hide = (dummy_hwnd not in uwp_eng._cloaked_hwnds)
+            uwp_eng._last_cloak_ts = time.perf_counter() - 1.0
+            uwp_eng._recent_uncloak_times.clear()
+            uwp_eng._handle_win_event(w32.EVENT_OBJECT_UNCLOAKED, dummy_hwnd)
+            reused_uwp_opened = (len(staged_opens) == 2 and staged_opens[-1] == (dummy_hwnd, "open"))
+            uwp_uncloak_ok = cloak_ts_clean and burst_clean and uwp_opened_once and cleared_on_hide and reused_uwp_opened
+
+            # Overlay SW_HIDE (fullscreen_game pause) -> Resume -> Open/Minimize/Restore/Wobbly rendering recovery
+            uwp_ov.set_fullscreen_game_paused(True)
+            all_hidden_paused = bool(uwp_ov._surface_pool) and all(
+                (not s.is_visible) and (not s.is_parked) for s in uwp_ov._surface_pool
+            )
+            uwp_ov.set_fullscreen_game_paused(False)
+
+            raw_128 = bytes([255, 129, 45, 255]) * (128 * 96)
+            now_r = time.perf_counter()
+            uwp_eng.animation_queue.put_nowait(
+                AnimationJob(
+                    job_id=91,
+                    hwnd=1001,
+                    trigger="minimize",
+                    effect_id="genie_lamp",
+                    shader_id=6,
+                    reverse=False,
+                    duration_ms=120,
+                    easing="out_cubic",
+                    intensity=1.0,
+                    accent_hex="#2D81FF",
+                    x=100,
+                    y=100,
+                    w=128,
+                    h=96,
+                    img_w=128,
+                    img_h=96,
+                    bgra_bytes=raw_128,
+                    started_at=now_r,
+                )
+            )
+            uwp_ov._drain_jobs()
+            for it in uwp_ov._active:
+                if it.surface.hwnd:
+                    w32.set_window_cloaked(it.surface.hwnd, True)
+            anim_active_after_resume = (
+                len(uwp_ov._active) == 1
+                and uwp_ov._active[0].surface.is_visible
+                and uwp_ov._timer.isActive()
+            )
+            uwp_ov._on_wobbly_start(
+                WobblyDragStart(
+                    hwnd=1002, x=220, y=140, w=128, h=96,
+                    img_w=128, img_h=96, bgra_bytes=raw_128,
+                    grab_u=0.5, grab_v=0.1, orig_alpha=255, init_dx=12, init_dy=4,
+                )
+            )
+            if uwp_ov._wobble is not None and uwp_ov._wobble.surface.hwnd:
+                w32.set_window_cloaked(uwp_ov._wobble.surface.hwnd, True)
+            wob_active_after_resume = (
+                uwp_ov._wobble is not None and uwp_ov._wobble.surface.is_visible
+            )
+            uwp_ov._tick()
+            # Finish cleanly
+            for it in uwp_ov._active:
+                it.start_time = now_r - 1.0
+            uwp_ov._on_wobbly_end(1002, 240, 150, True)
+            uwp_ov._tick()
+            clean_finish = (
+                len(uwp_ov._active) == 0
+                and uwp_ov._wobble is None
+                and (not uwp_ov._timer.isActive())
+            )
+            ov_resume_ok = all_hidden_paused and anim_active_after_resume and wob_active_after_resume and clean_finish
+            uwp_detail = (
+                f"cloak_clean={cloak_ts_clean} burst_clean={burst_clean} uwp_open={uwp_opened_once} "
+                f"reused={reused_uwp_opened} hidden={all_hidden_paused} anim_res={anim_active_after_resume} "
+                f"wob_res={wob_active_after_resume} finish={clean_finish}"
+            )
+        finally:
+            w32.get_class_name = orig_get_cls  # type: ignore[assignment]
+            uwp_ov.shutdown()
+            uwp_eng.journal.close()
+            dummy_cap_w.close()
+            dummy_cap_w.deleteLater()
+        check("sprint2_uwp_uncloak_and_overlay_resume", uwp_uncloak_ok and ov_resume_ok, uwp_detail)
+
         OffscreenGpuEngine.shared().shutdown()
         OffscreenGpuEngine.shared().reset_init_attempt()
 

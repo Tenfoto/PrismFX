@@ -503,4 +503,5 @@ class DemoWindowBackend(IWindowSystemBackend):
             monitor_rect=mon,
             is_cloaked=False,
             is_iconic=fg.minimized,
+            is_zoomed=fg.maximized,
         )

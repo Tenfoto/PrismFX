@@ -36,7 +36,7 @@ _WM_APP_UNHOOK_DRAG = w32.WM_APP + 12
 
 MAX_CAPTURE_CACHE_BYTES = 64 * 1024 * 1024  # Strict 64 MB capture cache memory budget
 
-_ACTIVE_NATIVE_CALLBACKS: set[object] = set()
+_ACTIVE_NATIVE_CALLBACKS: dict[int, object] = {}
 _ACTIVE_NATIVE_CALLBACKS_LOCK = threading.Lock()
 
 _INTERNAL_CREATE_CLASS_SUBSTRS = (
@@ -825,12 +825,19 @@ class PrismEngine:
         self._open_wake.clear()
         self._apply_paused_reason_transition(self.paused_reason())
         self._sync_native_min_anim(active=True)
-        # Seed known visible windows so focusing/Alt-Tabbing existing apps never false-triggers Open!
-        seed_vis = {
-            w.hwnd for w in self.backend.list_windows(own_pid=self.own_pid) if not w.minimized
-        }
+        # Seed known visible windows so focusing/Alt-Tabbing existing apps never false-triggers Open,
+        # and prime one-time event-driven capture queue for already-open desktop windows (zero polling)!
+        initial_wins = [
+            w for w in self.backend.list_windows(own_pid=self.own_pid) if not w.minimized
+        ]
+        seed_vis = {w.hwnd for w in initial_wins}
         with self._state_lock:
             self._known_visible_hwnds = seed_vis
+        if not self.backend.is_demo:
+            prime_hwnds = [w.hwnd for w in initial_wins if not self.is_excluded(w)][:6]
+            if prime_hwnds:
+                with self._cache_lock:
+                    self._pending_cache_hwnds.update(prime_hwnds)
         self._poll_thread = threading.Thread(target=self._poll_loop, name="PrismFX-Core", daemon=True)
         self._poll_thread.start()
         if not self.backend.is_demo:
@@ -1541,10 +1548,12 @@ class PrismEngine:
                     cap_data = (cached[0], cached[1], cached[2])
                 else:
                     fresh = self.backend.capture_window_bgra(hwnd, allow_screen_fallback=not did_hide)
-                    # Brand-new pre-hidden windows occasionally need 8-24ms to paint their very first frame
-                    if trigger == "open" and did_hide and (not fresh or _is_mostly_blank_bgra(fresh[2])):
-                        for _ in range(3):
-                            time.sleep(0.008)
+                    # Newly opened or cold-restored pre-hidden windows (Electron/Chromium/UWP) may need
+                    # 10-40ms to repaint their compositor surface before PrintWindow returns non-blank pixels
+                    if trigger in ("open", "restore") and did_hide and (not fresh or _is_mostly_blank_bgra(fresh[2])):
+                        retries = 4 if trigger == "restore" else 3
+                        for _ in range(retries):
+                            time.sleep(0.010 if trigger == "restore" else 0.008)
                             fresh = self.backend.capture_window_bgra(hwnd, allow_screen_fallback=False)
                             if fresh and not _is_mostly_blank_bgra(fresh[2]):
                                 break
@@ -2771,44 +2780,48 @@ class PrismEngine:
                 pass
 
         self._win_event_cb_ref = _on_win_event
+        cb_key = id(_on_win_event)
         with _ACTIVE_NATIVE_CALLBACKS_LOCK:
-            _ACTIVE_NATIVE_CALLBACKS.add(_on_win_event)
-        flags = w32.WINEVENT_OUTOFCONTEXT | w32.WINEVENT_SKIPOWNPROCESS
-        # Note: EVENT_OBJECT_LOCATIONCHANGE is intentionally NOT hooked globally (zero taskbar/cursor flood!)
-        ranges = [
-            (w32.EVENT_SYSTEM_FOREGROUND, w32.EVENT_SYSTEM_FOREGROUND),
-            (w32.EVENT_SYSTEM_MENUPOPUPSTART, w32.EVENT_SYSTEM_MENUPOPUPEND),
-            (w32.EVENT_SYSTEM_MOVESIZESTART, w32.EVENT_SYSTEM_MOVESIZEEND),
-            (w32.EVENT_SYSTEM_MINIMIZESTART, w32.EVENT_SYSTEM_MINIMIZEEND),
-            (w32.EVENT_OBJECT_CREATE, w32.EVENT_OBJECT_HIDE),
-            (w32.EVENT_OBJECT_CLOAKED, w32.EVENT_OBJECT_UNCLOAKED),
-        ]
-        for lo, hi in ranges:
-            h = w32.user32.SetWinEventHook(lo, hi, 0, self._win_event_cb_ref, 0, 0, flags)
-            if h:
-                self._win_event_hooks.append(int(h))
+            _ACTIVE_NATIVE_CALLBACKS[cb_key] = _on_win_event
+        try:
+            flags = w32.WINEVENT_OUTOFCONTEXT | w32.WINEVENT_SKIPOWNPROCESS
+            # Note: EVENT_OBJECT_LOCATIONCHANGE is intentionally NOT hooked globally (zero taskbar/cursor flood!)
+            ranges = [
+                (w32.EVENT_SYSTEM_FOREGROUND, w32.EVENT_SYSTEM_FOREGROUND),
+                (w32.EVENT_SYSTEM_MENUPOPUPSTART, w32.EVENT_SYSTEM_MENUPOPUPEND),
+                (w32.EVENT_SYSTEM_MOVESIZESTART, w32.EVENT_SYSTEM_MOVESIZEEND),
+                (w32.EVENT_SYSTEM_MINIMIZESTART, w32.EVENT_SYSTEM_MINIMIZEEND),
+                (w32.EVENT_OBJECT_CREATE, w32.EVENT_OBJECT_HIDE),
+                (w32.EVENT_OBJECT_CLOAKED, w32.EVENT_OBJECT_UNCLOAKED),
+            ]
+            for lo, hi in ranges:
+                h = w32.user32.SetWinEventHook(lo, hi, 0, self._win_event_cb_ref, 0, 0, flags)
+                if h:
+                    self._win_event_hooks.append(int(h))
 
-        # Blocking GetMessageW: < 0.2 ms wakeup latency & 0% CPU when idle
-        msg = w32.wintypes.MSG()
-        while not self._stop_event.is_set():
-            ret = w32.user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
-            if ret <= 0:
-                break
-            if msg.message == _WM_APP_UNHOOK_DRAG:
-                self._detach_drag_location_hook()
-                continue
-            w32.user32.TranslateMessage(ctypes.byref(msg))
-            w32.user32.DispatchMessageW(ctypes.byref(msg))
-
-        self._hook_tid = 0
-        all_unhooked = self._detach_drag_location_hook()
-        for h in self._win_event_hooks:
-            if not w32.user32.UnhookWinEvent(h):
-                all_unhooked = False
-        self._win_event_hooks.clear()
-        if all_unhooked:
-            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
-                _ACTIVE_NATIVE_CALLBACKS.discard(_on_win_event)
+            # Blocking GetMessageW: < 0.2 ms wakeup latency & 0% CPU when idle
+            msg = w32.wintypes.MSG()
+            while not self._stop_event.is_set():
+                ret = w32.user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                if ret <= 0:
+                    break
+                if msg.message == _WM_APP_UNHOOK_DRAG:
+                    self._detach_drag_location_hook()
+                    continue
+                w32.user32.TranslateMessage(ctypes.byref(msg))
+                w32.user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            logging.getLogger(__name__).exception("Unhandled exception in PrismFX-Hooks _hook_pump_loop")
+        finally:
+            self._hook_tid = 0
+            all_unhooked = self._detach_drag_location_hook()
+            for h in self._win_event_hooks:
+                if not w32.user32.UnhookWinEvent(h):
+                    all_unhooked = False
+            self._win_event_hooks.clear()
+            if all_unhooked:
+                with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                    _ACTIVE_NATIVE_CALLBACKS.pop(cb_key, None)
 
     def _raw_input_loop(self) -> None:
         """100% asynchronous Win32 Raw Input mouse click sink (RIDEV_INPUTSINK on HWND_MESSAGE).
@@ -2877,50 +2890,54 @@ class PrismEngine:
             return w32.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         self._raw_wndproc_ref = _raw_wndproc
+        raw_cb_key = id(_raw_wndproc)
         with _ACTIVE_NATIVE_CALLBACKS_LOCK:
-            _ACTIVE_NATIVE_CALLBACKS.add(_raw_wndproc)
-        wc = w32.WNDCLASSEXW()
-        wc.cbSize = ctypes.sizeof(w32.WNDCLASSEXW)
-        wc.lpfnWndProc = self._raw_wndproc_ref
-        wc.hInstance = hinst
-        wc.lpszClassName = cls_name
-        atom = w32.user32.RegisterClassExW(ctypes.byref(wc))
-        if not atom and ctypes.get_last_error() != 1410:
-            self._raw_input_tid = 0
-            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
-                _ACTIVE_NATIVE_CALLBACKS.discard(_raw_wndproc)
-            return
-
-        sink_hwnd = int(
-            w32.user32.CreateWindowExW(
-                0, cls_name, "", 0, 0, 0, 0, 0, w32.wintypes.HWND(w32.HWND_MESSAGE), 0, hinst, None
-            )
-            or 0
-        )
-        self._raw_input_hwnd = sink_hwnd
+            _ACTIVE_NATIVE_CALLBACKS[raw_cb_key] = _raw_wndproc
+        sink_hwnd = 0
+        class_registered = False
         destroyed_ok = True
-        if sink_hwnd:
-            _sync_reg(sink_hwnd)
-            msg = w32.wintypes.MSG()
-            while not self._stop_event.is_set():
-                ret = w32.user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
-                if ret <= 0:
-                    break
-                w32.user32.TranslateMessage(ctypes.byref(msg))
-                w32.user32.DispatchMessageW(ctypes.byref(msg))
+        try:
+            wc = w32.WNDCLASSEXW()
+            wc.cbSize = ctypes.sizeof(w32.WNDCLASSEXW)
+            wc.lpfnWndProc = self._raw_wndproc_ref
+            wc.hInstance = hinst
+            wc.lpszClassName = cls_name
+            atom = w32.user32.RegisterClassExW(ctypes.byref(wc))
+            if not atom and ctypes.get_last_error() != 1410:
+                return
+            class_registered = True
 
+            sink_hwnd = int(
+                w32.user32.CreateWindowExW(
+                    0, cls_name, "", 0, 0, 0, 0, 0, w32.wintypes.HWND(w32.HWND_MESSAGE), 0, hinst, None
+                )
+                or 0
+            )
+            self._raw_input_hwnd = sink_hwnd
+            if sink_hwnd:
+                _sync_reg(sink_hwnd)
+                msg = w32.wintypes.MSG()
+                while not self._stop_event.is_set():
+                    ret = w32.user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                    if ret <= 0:
+                        break
+                    w32.user32.TranslateMessage(ctypes.byref(msg))
+                    w32.user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            logging.getLogger(__name__).exception("Unhandled exception in PrismFX-RawInput _raw_input_loop")
+        finally:
             if self._raw_input_registered:
                 rid = w32.RAWINPUTDEVICE(0x01, 0x02, w32.RIDEV_REMOVE, 0)
                 w32.user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(w32.RAWINPUTDEVICE))
                 self._raw_input_registered = False
-            destroyed_ok = bool(w32.user32.DestroyWindow(sink_hwnd))
-
-        self._raw_input_hwnd = 0
-        self._raw_input_tid = 0
-        unreg_ok = bool(w32.user32.UnregisterClassW(cls_name, hinst))
-        if destroyed_ok and unreg_ok:
-            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
-                _ACTIVE_NATIVE_CALLBACKS.discard(_raw_wndproc)
+            if sink_hwnd:
+                destroyed_ok = bool(w32.user32.DestroyWindow(sink_hwnd))
+            self._raw_input_hwnd = 0
+            self._raw_input_tid = 0
+            unreg_ok = bool(w32.user32.UnregisterClassW(cls_name, hinst)) if class_registered else True
+            if destroyed_ok and unreg_ok:
+                with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                    _ACTIVE_NATIVE_CALLBACKS.pop(raw_cb_key, None)
 
     def _cancel_active_precover(self) -> None:
         h = self._active_precover_hwnd
@@ -3021,12 +3038,12 @@ class PrismEngine:
             root_is_own = root in self._own_hwnds
         with self._cache_lock:
             cached = self._cached_captures.get(root) if root else None
-        if (
-            not root
-            or root_is_own
-            or cached is None
-            or w32.user32.IsIconic(root)
-        ):
+        if not root or root_is_own or w32.user32.IsIconic(root):
+            return
+        if cached is None:
+            # Prime capture immediately on LBUTTONDOWN so snapshot is ready before LBUTTONUP/MINIMIZESTART/HIDE!
+            with self._cache_lock:
+                self._pending_cache_hwnds.add(root)
             return
         action = self._classify_caption_min_close(root, cx, cy)
         if action and self._trigger_enabled(action):
@@ -3891,39 +3908,50 @@ class PrismEngine:
                         self._known_visible_hwnds.add(hwnd)
             return
         if event == w32.EVENT_OBJECT_CLOAKED:
-            self._last_cloak_ts = time.perf_counter()
             with self._state_lock:
-                if hwnd in self._known_visible_hwnds:
+                was_known_vis = hwnd in self._known_visible_hwnds
+                if was_known_vis:
                     self._cloaked_hwnds.add(hwnd)
                 self._known_visible_hwnds.discard(hwnd)
+            # Only record cloak timestamp for real previously-visible app windows (never IME/MSCTFIME/CoreWindow!)
+            if was_known_vis:
+                self._last_cloak_ts = time.perf_counter()
             return
         if event == w32.EVENT_OBJECT_UNCLOAKED:
             now = time.perf_counter()
-            self._recent_uncloak_times = [t for t in self._recent_uncloak_times if (now - t) < 0.065]
-            self._recent_uncloak_times.append(now)
+            with self._hidden_lock:
+                already_pending_open = hwnd in self._pending_opens
+            if already_pending_open:
+                # Already legitimately staged on SHOW -> mark first_uncloaked_at & wake OpenStager immediately!
+                self._stage_open_window(hwnd, "open")
+                return
             with self._state_lock:
                 was_cloaked_known = hwnd in self._cloaked_hwnds
-            # Virtual Desktop switch guard: single-window desktop switch (>100ms apart) or multi-window burst
-            if (
-                was_cloaked_known
-                or (now - self._last_cloak_ts) < 0.25
-                or len(self._recent_uncloak_times) >= 2
-            ):
+                is_known_vis = hwnd in self._known_visible_hwnds
+            # Virtual Desktop switch guard (1): previously visible window returning from cloak
+            if was_cloaked_known:
                 with self._state_lock:
                     self._cloaked_hwnds.discard(hwnd)
                     self._known_visible_hwnds.add(hwnd)
                 self._unhide_if_prehidden(hwnd)
                 return
-            with self._state_lock:
-                is_known_vis = hwnd in self._known_visible_hwnds
             if is_known_vis or hwnd in self._prehidden_minimized or w32.user32.IsIconic(hwnd):
                 return
+            # Filter non-app / shell / IME / CoreWindow HWNDs BEFORE updating Virtual Desktop burst counter!
             style = w32.user32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE)
             if (style & w32.WS_CHILD) or not (style & w32.WS_CAPTION) or w32.is_overlay_exstyle(hwnd):
                 self._unhide_if_prehidden(hwnd)
                 return
             cls = w32.get_class_name(hwnd)
             if not cls or is_protected_window_class(cls) or any(sub in cls for sub in _INTERNAL_CREATE_CLASS_SUBSTRS):
+                self._unhide_if_prehidden(hwnd)
+                return
+            # Virtual Desktop switch guard (2): burst of >=2 real app windows uncloaking or right after real app cloak
+            self._recent_uncloak_times = [t for t in self._recent_uncloak_times if (now - t) < 0.065]
+            self._recent_uncloak_times.append(now)
+            if (now - self._last_cloak_ts) < 0.25 or len(self._recent_uncloak_times) >= 2:
+                with self._state_lock:
+                    self._known_visible_hwnds.add(hwnd)
                 self._unhide_if_prehidden(hwnd)
                 return
             if not self._stage_open_window(hwnd, "open"):
@@ -3937,6 +3965,7 @@ class PrismEngine:
                 return
             with self._state_lock:
                 self._known_visible_hwnds.discard(hwnd)
+                self._cloaked_hwnds.discard(hwnd)
             if hwnd in self._pending_opens:
                 self.finish_hidden_handoff(hwnd, 255)
             with self._cache_lock:

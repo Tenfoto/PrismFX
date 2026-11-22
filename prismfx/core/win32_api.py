@@ -1350,6 +1350,22 @@ _BORDERLESS_EXCLUDED_BROWSERS = frozenset({
     "waterfox.exe",
 })
 
+_BORDERLESS_EXCLUDED_HOSTS = frozenset({
+    "explorer.exe",
+    "applicationframehost.exe",
+    "systemsettings.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "textinputhost.exe",
+    "lockapp.exe",
+    "dwm.exe",
+    "obs64.exe",
+    "share.exe",
+    "nvidia share.exe",
+    "nvidia overlay.exe",
+})
+
 
 def is_borderless_fullscreen_candidate(
     class_name: str,
@@ -1360,6 +1376,7 @@ def is_borderless_fullscreen_candidate(
     monitor_rect: MonitorRect,
     is_cloaked: bool = False,
     is_iconic: bool = False,
+    is_zoomed: bool = False,
 ) -> bool:
     """Pure testable predicate for borderless fullscreen DX12/Vulkan game detection.
 
@@ -1380,7 +1397,20 @@ def is_borderless_fullscreen_candidate(
         return False
 
     exe_low = (exe_name or "").strip().lower()
-    if exe_low in _BORDERLESS_EXCLUDED_BROWSERS:
+    if exe_low in _BORDERLESS_EXCLUDED_BROWSERS or exe_low in _BORDERLESS_EXCLUDED_HOSTS:
+        return False
+
+    app_cls = classify_app(exe_name, cls) if (exe_low or cls) else None
+    if app_cls is not None and app_cls.category in ("System Shell", "GPU Overlay"):
+        return False
+
+    is_known_game = bool(exe_low) and (app_cls is not None and app_cls.category == "Game / Anti-Cheat")
+
+    # Reject transparent HUD overlays (WS_EX_LAYERED) & maximized frameless desktop apps
+    # (e.g. Electron/Qt/UWP apps on auto-hide taskbar) unless explicitly a known game!
+    if (ex_style & WS_EX_LAYERED) and not is_known_game:
+        return False
+    if (is_zoomed or bool(style & WS_MAXIMIZE)) and not is_known_game:
         return False
 
     if monitor_rect is None or monitor_rect.width < 640 or monitor_rect.height < 480:
@@ -1402,7 +1432,6 @@ def is_borderless_fullscreen_candidate(
         return False
 
     is_borderless_style = ((style & WS_CAPTION) != WS_CAPTION) and not bool(style & WS_THICKFRAME)
-    is_known_game = bool(exe_low) and (classify_app(exe_name, cls).category == "Game / Anti-Cheat")
     return is_borderless_style or is_known_game
 
 
@@ -1459,6 +1488,7 @@ def is_borderless_fullscreen_hwnd(hwnd: int, own_pid: int = 0) -> bool:
         monitor_rect=mon,
         is_cloaked=cloaked,
         is_iconic=False,
+        is_zoomed=bool(user32.IsZoomed(hwnd)),
     )
 
 
@@ -1849,6 +1879,9 @@ class Win32LayeredSurface:
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     )
             self._parked = False
+        else:
+            # Invalidate potentially stale screen DC/DIB (e.g. after display mode switch)
+            self._free_dib()
         return ok
 
     def park(self) -> bool:

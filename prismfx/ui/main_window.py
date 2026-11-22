@@ -122,8 +122,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_engine_pause_changed, QtCore.Qt.QueuedConnection
         )
         engine.on_pause_state_changed = self._dispatch_pause_from_thread
-        if engine._cached_paused_reason == "fullscreen_game":
-            self._on_engine_pause_changed("fullscreen_game")
+        self._on_engine_pause_changed(engine._cached_paused_reason)
 
         self._build_shell()
         self._apply_target_fps()

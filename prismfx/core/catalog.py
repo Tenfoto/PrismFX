@@ -135,6 +135,8 @@ _KNOWN_APPS: dict[str, tuple[str, str, str, bool, str, str]] = {
                            "NVIDIA Overlay (Alt+Z) — protected to prevent overlay flicker.", "โอเวอร์เลย์ NVIDIA (Alt+Z) — ป้องกันอัตโนมัติเพื่อไม่ให้จอค้าง/กระพริบ"),
     "nvidia share.exe": ("NVIDIA Share", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
                          "NVIDIA Share HUD — protected automatically.", "NVIDIA Share HUD — ป้องกันอัตโนมัติ"),
+    "share.exe": ("NVIDIA Share / ShadowPlay", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
+                  "NVIDIA ShadowPlay capture overlay — protected automatically.", "โอเวอร์เลย์บันทึกหน้าจอ NVIDIA ShadowPlay — ป้องกันอัตโนมัติ"),
     "nvsphelper64.exe": ("NVIDIA Share Helper", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
                          "NVIDIA capture helper — protected automatically.", "ตัวช่วยบันทึกภาพ NVIDIA — ป้องกันอัตโนมัติ"),
     "nvcontainer.exe": ("NVIDIA Container", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
@@ -162,6 +164,9 @@ _KNOWN_APPS: dict[str, tuple[str, str, str, bool, str, str]] = {
 _GAME_PATTERNS = (
     "-win64-shipping.exe", "unityplayer", "anticheat", "easyanticheat", "battleye",
     "riotclient", "vanguard", "faceit", "eanticheat",
+)
+
+_OVERLAY_PATTERNS = (
     "nvidia overlay", "nvidia share", "nvcontainer", "nvsphelper",
     "gamebar", "rtss", "overwolf", "gameoverlayui", "losslessscaling", "radeonsoftware", "amdrsserv",
 )
@@ -201,6 +206,20 @@ def classify_app(exe_name: str, window_class: str = "") -> AppClassification:
             recommended_exclude=auto_ex,
             reason_en=r_en,
             reason_th=r_th,
+        )
+
+    if any(pat in low for pat in _OVERLAY_PATTERNS):
+        pretty = clean_exe.rsplit(".", 1)[0]
+        return AppClassification(
+            exe_name=clean_exe,
+            friendly_name=pretty,
+            category="GPU Overlay",
+            category_th="โอเวอร์เลย์การ์ดจอ",
+            fx_safety="Auto-Excluded (Protected)",
+            fx_safety_th="ยกเว้นอัตโนมัติ (โอเวอร์เลย์)",
+            recommended_exclude=True,
+            reason_en="Detected GPU/capture overlay process — auto-excluded to prevent flicker.",
+            reason_th="ตรวจพบโอเวอร์เลย์การ์ดจอหรือโปรแกรมบันทึกหน้าจอ — ยกเว้นอัตโนมัติเพื่อกันกระพริบ",
         )
 
     if any(pat in low for pat in _GAME_PATTERNS):
