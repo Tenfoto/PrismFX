@@ -5,7 +5,9 @@ Designed for 165 Hz (<1.5 ms GPU cost) with zero external shader compiler depend
 
 from __future__ import annotations
 
+import math
 import pathlib
+import re
 from typing import Optional
 
 VERTEX_SHADER_330 = r"""#version 330 core
@@ -151,7 +153,7 @@ void main() {
         pos.y = 1.0 - (slatCenter + newLocal) * 2.0;
         pos.z = slatY * sin(angle) * 0.35;
         v_shade = clamp(cos(angle), 0.2, 1.0);
-        v_alpha_mul = smoothstep(1.0, 0.82, stagger);
+        v_alpha_mul = 1.0 - smoothstep(0.82, 1.0, stagger);
     } else if (u_effect == 31) {
         // Isometric 3D Card Flip around Y-axis
         float angle = pc * PI * 0.55 * amp;
@@ -183,12 +185,15 @@ void main() {
         float rot = st * (rnd2 - 0.5) * 6.5 * amp;
         float cs = cos(rot), sn = sin(rot);
         rel = mat2(cs, -sn, sn, cs) * rel * (1.0 - 0.45 * st);
-        vec2 blast = normalize(cNdc + vec2(0.001, 0.05)) * (0.25 + rnd3 * 0.65) * st * amp;
+        vec2 blastRaw = cNdc + vec2(0.001, 0.05);
+        float blastLen = length(blastRaw);
+        vec2 blastDir = (blastLen > 1e-5) ? (blastRaw / blastLen) : vec2(0.0, 1.0);
+        vec2 blast = blastDir * (0.25 + rnd3 * 0.65) * st * amp;
         pos.xy = cNdc + rel + blast;
         pos.y -= st * st * 1.15 * amp;
         pos.z = (rnd1 - 0.5) * st * 0.9;
         v_shade = 0.8 + 0.35 * abs(cs);
-        v_alpha_mul = smoothstep(1.0, 0.65, st);
+        v_alpha_mul = 1.0 - smoothstep(0.65, 1.0, st);
     } else if (u_effect == 34) {
         // Helix Ribbon Twist
         float twist = (pc * 2.2 + a_uv.y * pc * 2.5) * PI * 0.5 * amp;
@@ -224,7 +229,7 @@ void main() {
         pos.x = cNdc.x + (loc.x * 2.0 / grid.x) * cos(angle);
         pos.z = (loc.x * 2.0 / grid.x) * sin(angle) * 0.9;
         v_shade = clamp(0.35 + 0.65 * cos(angle), 0.2, 1.0);
-        v_alpha_mul = smoothstep(1.0, 0.78, st);
+        v_alpha_mul = 1.0 - smoothstep(0.78, 1.0, st);
     } else if (u_effect == 38) {
         // Directional Slide
         pos.x += pc * 1.25 * amp;
@@ -333,7 +338,7 @@ vec2 voronoi(vec2 x) {
             }
         }
     }
-    return vec2(sqrt(md), id);
+    return vec2(sqrt(max(md, 0.0)), id);
 }
 
 float hexDist(vec2 p) {
@@ -354,10 +359,10 @@ vec4 hexCoords(vec2 uv) {
 }
 
 vec4 sampleWin(vec2 uv) {
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    if (!(uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0)) {
         return vec4(0.0);
     }
-    return texture(u_tex, uv);
+    return textureLod(u_tex, uv, 0.0);
 }
 
 void main() {
@@ -390,7 +395,8 @@ void main() {
         vec2 d = uv - 0.5;
         float dist = length(d);
         float wave = sin(dist * 34.0 - p * 14.0) * exp(-dist * 2.5) * p * 0.055 * amp;
-        vec2 ruv = uv + normalize(d + 1e-4) * wave;
+        vec2 dir = (dist > 1e-5) ? (d / dist) : vec2(0.0);
+        vec2 ruv = uv + dir * wave;
         col = sampleWin(ruv);
         col.rgb += u_accent * abs(wave) * 8.0;
         alpha = col.a * (1.0 - smoothstep(0.3, 1.0, p));
@@ -440,9 +446,9 @@ void main() {
             alpha = spark * fade * (1.0 - p);
         } else {
             float charBand = smoothstep(0.0, 0.11, edge);
-            float fireBand = smoothstep(0.08, 0.0, edge);
+            float fireBand = 1.0 - smoothstep(0.0, 0.08, edge);
             col.rgb = mix(vec3(0.07, 0.03, 0.02), col.rgb, charBand);
-            vec3 fireCol = mix(vec3(1.0, 0.25, 0.02), vec3(1.0, 0.92, 0.45), smoothstep(0.06, 0.005, edge));
+            vec3 fireCol = mix(vec3(1.0, 0.25, 0.02), vec3(1.0, 0.92, 0.45), 1.0 - smoothstep(0.005, 0.06, edge));
             col.rgb += fireCol * fireBand * 2.1 * amp;
         }
     }
@@ -455,7 +461,7 @@ void main() {
         if (edge < 0.0) {
             alpha = 0.0;
         } else {
-            float arc = smoothstep(0.09, 0.0, edge);
+            float arc = 1.0 - smoothstep(0.0, 0.09, edge);
             vec3 plasma = mix(vec3(0.55, 0.15, 1.0), vec3(0.15, 0.95, 1.0), n2);
             col.rgb = mix(col.rgb, plasma * 1.9, arc);
             col.rgb += plasma * arc * 0.9 * amp;
@@ -468,7 +474,7 @@ void main() {
         float st = clamp((p - shardDelay * 0.55) / (1.0 - shardDelay * 0.55), 0.0, 1.0);
         vec2 drift = (hash22(vec2(vor.y * 17.0, 3.1)) - 0.5) * st * 0.18 * amp;
         col = sampleWin(uv + drift);
-        float crack = smoothstep(0.08, 0.0, abs(vor.x - 0.45));
+        float crack = 1.0 - smoothstep(0.0, 0.08, abs(vor.x - 0.45));
         float frost = smoothstep(0.0, 0.4, p);
         col.rgb = mix(col.rgb, vec3(0.68, 0.92, 1.0), frost * 0.32 + crack * 0.55 * frost);
         alpha = col.a * (1.0 - smoothstep(0.4, 1.0, st));
@@ -489,13 +495,14 @@ void main() {
     else if (u_effect == 15) {
         vec2 d = uv - u_anchor;
         float r = length(d);
-        float angle = atan(d.y, d.x);
+        float angle = (r > 1e-5) ? atan(d.y, d.x) : 0.0;
         float pull = p * p * 1.35 * amp;
         float swirl = (3.8 * p * amp) / (r + 0.18);
         float newR = r * (1.0 + pull * 2.4);
         vec2 suv = u_anchor + vec2(cos(angle + swirl), sin(angle + swirl)) * newR;
         col = sampleWin(suv);
-        float ring = exp(-pow((r - (0.35 * (1.0 - p) + 0.03)) * 18.0, 2.0)) * sin(p * PI);
+        float dRing = (r - (0.35 * (1.0 - p) + 0.03)) * 18.0;
+        float ring = exp(-(dRing * dRing)) * sin(p * PI);
         col.rgb += mix(u_accent, vec3(1.0, 0.75, 0.35), 0.45) * ring * 1.6;
         alpha = max(col.a * (1.0 - smoothstep(0.6, 1.0, p)), ring * 0.85);
     }
@@ -528,7 +535,7 @@ void main() {
         if (edge < 0.0) {
             alpha = 0.0;
         } else {
-            float glow = smoothstep(0.18, 0.0, edge);
+            float glow = 1.0 - smoothstep(0.0, 0.18, edge);
             vec3 aur = 0.5 + 0.5 * cos(vec3(0.0, 2.0, 4.0) + uv.x * 5.0 + p * 4.0);
             col.rgb = mix(col.rgb, aur * 1.5, glow * 0.85);
         }
@@ -538,8 +545,9 @@ void main() {
         vec2 d = uv - 0.5;
         float r = length(d);
         float ringR = p * 0.85;
-        float band = exp(-pow((r - ringR) * 18.0, 2.0));
-        vec2 dir = normalize(d + 1e-4);
+        float dBand = (r - ringR) * 18.0;
+        float band = exp(-(dBand * dBand));
+        vec2 dir = (r > 1e-5) ? (d / r) : vec2(0.0);
         col.r = sampleWin(uv - dir * band * 0.06 * amp).r;
         col.g = sampleWin(uv - dir * band * 0.04 * amp).g;
         col.b = sampleWin(uv - dir * band * 0.02 * amp).b;
@@ -556,7 +564,7 @@ void main() {
         if (front < 0.0) {
             alpha = 0.0;
         } else {
-            float flame = smoothstep(0.16, 0.0, front);
+            float flame = 1.0 - smoothstep(0.0, 0.16, front);
             col.rgb += mix(vec3(1.0, 0.35, 0.05), vec3(1.0, 0.88, 0.35), flame) * flame * 1.5;
         }
     }
@@ -612,13 +620,18 @@ void main() {
     }
     // 25: Mosaic Deconstruct
     else if (u_effect == 25) {
-        float blocks = mix(240.0, 10.0, pow(p, 0.7));
-        vec2 grid = vec2(blocks, blocks * 0.65);
-        vec2 cell = floor(uv * grid);
-        vec2 muv = (cell + 0.5) / grid;
-        col = sampleWin(muv);
-        float rnd = hash12(cell);
-        alpha = col.a * step(p * 1.02, rnd * 0.85 + 0.15);
+        if (p <= 1e-4) {
+            col = sampleWin(uv);
+            alpha = col.a * v_alpha_mul;
+        } else {
+            float blocks = mix(240.0, 10.0, pow(max(p, 1e-6), 0.7));
+            vec2 grid = vec2(blocks, blocks * 0.65);
+            vec2 cell = floor(uv * grid);
+            vec2 muv = (cell + 0.5) / grid;
+            col = sampleWin(muv);
+            float rnd = hash12(cell);
+            alpha = col.a * step(p * 1.02, rnd * 0.85 + 0.15);
+        }
     }
     // 26: Hologram De-Sync
     else if (u_effect == 26) {
@@ -633,7 +646,8 @@ void main() {
     }
     // 27: VHS Tape Warp
     else if (u_effect == 27) {
-        float band = exp(-pow((uv.y - fract(p * 1.5)) * 12.0, 2.0));
+        float dBand = (uv.y - fract(p * 1.5)) * 12.0;
+        float band = exp(-(dBand * dBand));
         float skew = band * 0.09 * sin(uv.y * 45.0) * amp;
         col.r = sampleWin(uv + vec2(skew + 0.015 * p, 0.0)).r;
         col.g = sampleWin(uv + vec2(skew, 0.0)).g;
@@ -650,8 +664,8 @@ void main() {
         if (edge < 0.0) {
             alpha = 0.0;
         } else {
-            float cellRim = smoothstep(0.08, 0.0, hc.x) * smoothstep(0.28, 0.0, edge);
-            float frontGlow = smoothstep(0.1, 0.0, edge);
+            float cellRim = (1.0 - smoothstep(0.0, 0.08, hc.x)) * (1.0 - smoothstep(0.0, 0.28, edge));
+            float frontGlow = 1.0 - smoothstep(0.0, 0.1, edge);
             col.rgb += u_accent * (cellRim * 1.6 + frontGlow * 1.2) * amp;
         }
     }
@@ -712,39 +726,571 @@ out vec4 fragColor;
 
 
 MAX_CUSTOM_SHADER_BYTES = 128 * 1024
+MAX_CUSTOM_LOOP_ITERATIONS = 64
+MAX_CUSTOM_NESTED_LOOP_ITERATIONS = 256
+
+_GLSL_LINE_CONT_RE = re.compile(r"\\[ \t]*\n")
+_GLSL_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
+_GLSL_EXTENSION_RE = re.compile(r"^\s*#\s*extension\b", re.MULTILINE)
+_GLSL_VERSION_RE = re.compile(r"^\s*#\s*version\b([^\n]*)", re.MULTILINE)
+_GLSL_UNBOUNDED_LOOP_RE = re.compile(r"\b(while|do)\b")
+_GLSL_NUM_PAT = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[uUfF]?"
+_GLSL_DEFINE_NUM_RE = re.compile(rf"^\s*#\s*define\s+([A-Za-z_]\w*)\s+({_GLSL_NUM_PAT})\s*$")
+_GLSL_CMP_LR_RE = re.compile(rf"^([A-Za-z_]\w*)\s*(<=|<|>=|>)\s*({_GLSL_NUM_PAT})$")
+_GLSL_CMP_RL_RE = re.compile(rf"^({_GLSL_NUM_PAT})\s*(<=|<|>=|>)\s*([A-Za-z_]\w*)$")
+_GLSL_CONST_TRUE_RE = re.compile(r"^(?:true|[+-]?(?:[1-9]\d*|0*\.[0-9]*[1-9][0-9]*)[uUfF]?)$", re.IGNORECASE)
+_GLSL_RESERVED_DEFINE_NAMES = frozenset({
+    "while", "do", "for", "if", "else", "switch", "case", "default", "break", "continue",
+    "return", "discard", "void", "bool", "int", "uint", "float", "double", "true", "false",
+    "const", "uniform", "in", "out", "inout", "struct", "layout", "main",
+})
 
 
-def load_custom_fragment_shader(path: str) -> Optional[str]:
-    if not isinstance(path, str):
+def _splice_glsl_continuations(src: str) -> str:
+    """Normalize line endings and splice GLSL §3.3 backslash line continuations."""
+    normalized = src.replace("\r\n", "\n").replace("\r", "\n")
+    return _GLSL_LINE_CONT_RE.sub("", normalized)
+
+
+def _strip_glsl_comments(src: str) -> str:
+    """Strip // and /* ... */ GLSL comments while preserving line breaks and token boundaries."""
+    def _repl(match: re.Match[str]) -> str:
+        txt = match.group(0)
+        if txt.startswith("/*"):
+            nl = txt.count("\n")
+            return ("\n" * nl) if nl else " "
+        return ""
+    return _GLSL_COMMENT_RE.sub(_repl, src)
+
+
+def _preprocess_glsl_for_scan(src: str) -> str:
+    return _strip_glsl_comments(_splice_glsl_continuations(src))
+
+
+def _has_unc_symlink(raw_path: str) -> bool:
+    """Inspect local symlink targets via lstat/readlink without ever calling os.stat on a UNC target."""
+    cur = pathlib.Path(raw_path)
+    for _ in range(8):
+        try:
+            if not cur.is_symlink():
+                return False
+            target = str(cur.readlink())
+        except OSError:
+            return False
+        if "\x00" in target or target.replace("/", "\\").startswith(("\\\\", "\\?")):
+            return True
+        tpath = pathlib.Path(target)
+        cur = tpath if tpath.is_absolute() else (cur.parent / tpath)
+    return False
+
+
+def _parse_glsl_number(token: str) -> Optional[float]:
+    cleaned = token.strip().rstrip("uUfF")
+    try:
+        val = float(cleaned)
+    except ValueError:
         return None
+    return val if math.isfinite(val) else None
+
+
+def _split_top_level(expr: str, sep: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(expr):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == sep and depth == 0:
+            parts.append(expr[start:idx])
+            start = idx + 1
+    parts.append(expr[start:])
+    return parts
+
+
+def _strip_outer_parens(expr: str) -> str:
+    s = expr.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        wraps = True
+        for idx, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and idx != len(s) - 1:
+                    wraps = False
+                    break
+        if wraps and depth == 0:
+            s = s[1:-1].strip()
+        else:
+            break
+    return s
+
+
+def _skip_ws(s: str, pos: int) -> int:
+    n = len(s)
+    while pos < n and s[pos].isspace():
+        pos += 1
+    return pos
+
+
+def _match_balanced(s: str, open_pos: int, open_ch: str, close_ch: str) -> Optional[int]:
+    """Return index immediately AFTER the matching close_ch, or None if unclosed."""
+    n = len(s)
+    if open_pos >= n or s[open_pos] != open_ch:
+        return None
+    depth = 1
+    i = open_pos + 1
+    while i < n and depth > 0:
+        ch = s[i]
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+        i += 1
+    return i if depth == 0 else None
+
+
+def _parse_stmt_span(s: str, pos: int, depth: int = 0) -> Optional[tuple[int, int]]:
+    """Return (body_start, body_end) for a GLSL statement starting at/after `pos`."""
+    if depth > 64:
+        return None
+    start = _skip_ws(s, pos)
+    n = len(s)
+    if start >= n:
+        return None
+    if s[start] == "{":
+        end = _match_balanced(s, start, "{", "}")
+        return (start, end) if end is not None else None
+    if s[start] == ";":
+        return (start, start + 1)
+
+    m_kw = re.match(r"(for|if|switch)\b", s[start:])
+    if m_kw:
+        kw = m_kw.group(1)
+        p_open = _skip_ws(s, start + len(kw))
+        p_after = _match_balanced(s, p_open, "(", ")")
+        if p_after is None:
+            return None
+        sub = _parse_stmt_span(s, p_after, depth + 1)
+        if sub is None:
+            return None
+        end = sub[1]
+        if kw == "if":
+            after_ws = _skip_ws(s, end)
+            if re.match(r"else\b", s[after_ws:]):
+                else_sub = _parse_stmt_span(s, after_ws + 4, depth + 1)
+                if else_sub is None:
+                    return None
+                end = else_sub[1]
+        return (start, end)
+
+    # Simple statement terminated by top-level ';'
+    p_depth = 0
+    b_depth = 0
+    i = start
+    while i < n:
+        ch = s[i]
+        if ch == "(":
+            p_depth += 1
+        elif ch == ")":
+            p_depth = max(0, p_depth - 1)
+        elif ch == "{":
+            b_depth += 1
+        elif ch == "}":
+            if b_depth == 0:
+                return None
+            b_depth -= 1
+        elif ch == ";" and p_depth == 0 and b_depth == 0:
+            return (start, i + 1)
+        i += 1
+    return None
+
+
+def _find_inout_functions(stripped: str) -> set[str]:
+    """Return user-defined function names that take `out` or `inout` parameters."""
+    names: set[str] = set()
+    skip_kw = {"if", "for", "while", "switch", "return"}
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", stripped):
+        fn = m.group(1)
+        if fn in skip_kw:
+            continue
+        p_after = _match_balanced(stripped, m.end() - 1, "(", ")")
+        if p_after is None:
+            continue
+        after_ws = _skip_ws(stripped, p_after)
+        if after_ws < len(stripped) and stripped[after_ws] in ("{", ";"):
+            params = stripped[m.end() : p_after - 1]
+            if re.search(r"\b(out|inout)\b", params):
+                names.add(fn)
+    return names
+
+
+def _find_user_function_bodies(stripped: str) -> list[tuple[str, int, int]]:
+    """Return list of (fn_name, body_start, body_end) for user function definitions."""
+    fns: list[tuple[str, int, int]] = []
+    skip_kw = {"if", "for", "while", "switch", "else", "return"}
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", stripped):
+        fn = m.group(1)
+        if fn in skip_kw:
+            continue
+        p_after = _match_balanced(stripped, m.end() - 1, "(", ")")
+        if p_after is None:
+            continue
+        brace_pos = _skip_ws(stripped, p_after)
+        if brace_pos < len(stripped) and stripped[brace_pos] == "{":
+            body_end = _match_balanced(stripped, brace_pos, "{", "}")
+            if body_end is not None:
+                fns.append((fn, brace_pos, body_end))
+    return fns
+
+
+def _mutates_var(code: str, var: str, inout_funcs: set[str]) -> bool:
+    """Return True if `code` assigns to, increments/decrements, or passes `var` to an out/inout function."""
+    v = re.escape(var)
+    if re.search(rf"(?:\+\+|--)\s*(?<!\.){v}\b|(?<!\.)\b{v}\s*(?:\+\+|--)", code):
+        return True
+    if re.search(rf"(?<!\.)\b{v}\s*(?:\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|=(?!=))", code):
+        return True
+    for fn in inout_funcs:
+        for m in re.finditer(rf"\b{re.escape(fn)}\s*\(", code):
+            p_after = _match_balanced(code, m.end() - 1, "(", ")")
+            if p_after is not None:
+                args_txt = code[m.end() : p_after - 1]
+                if re.search(rf"(?<!\.)\b{v}\b", args_txt):
+                    return True
+    return False
+
+
+def _extract_step_delta(step_expr: str, var: str) -> Optional[float]:
+    """Parse a single non-comma step expression updating `var` by a constant delta."""
+    if "," in step_expr:
+        return None
+    v = re.escape(var)
+    s = _strip_outer_parens(step_expr)
+    if re.fullmatch(rf"(?:\+\+\s*{v}|{v}\s*\+\+)", s):
+        return 1.0
+    if re.fullmatch(rf"(?:--\s*{v}|{v}\s*--)", s):
+        return -1.0
+    m_add = re.fullmatch(rf"{v}\s*\+=\s*({_GLSL_NUM_PAT})", s)
+    if m_add:
+        return _parse_glsl_number(m_add.group(1))
+    m_sub = re.fullmatch(rf"{v}\s*-=\s*({_GLSL_NUM_PAT})", s)
+    if m_sub:
+        val = _parse_glsl_number(m_sub.group(1))
+        return (-val) if val is not None else None
+    m_eq = re.fullmatch(rf"{v}\s*=\s*{v}\s*([+-])\s*({_GLSL_NUM_PAT})", s)
+    if m_eq:
+        val = _parse_glsl_number(m_eq.group(2))
+        if val is None:
+            return None
+        return val if m_eq.group(1) == "+" else -val
+    return None
+
+
+def _validate_for_header(
+    header: Optional[str], inout_funcs: set[str]
+) -> tuple[bool, str, str, int]:
+    if header is None:
+        return (False, "Malformed 'for' loop header in custom shader", "", 0)
+    parts = _split_top_level(header, ";")
+    if len(parts) != 3:
+        return (False, "Malformed 'for' loop header in custom shader", "", 0)
+    init_part, cond_part, step_part = (p.strip() for p in parts)
+    if not cond_part or _GLSL_CONST_TRUE_RE.fullmatch(_strip_outer_parens(cond_part)):
+        return (False, "Unbounded or constant-true 'for' loop condition in custom shader", "", 0)
+    if not step_part:
+        return (False, "Missing loop increment in 'for' loop header", "", 0)
+    if "," in init_part:
+        return (False, "Disallowed comma operator in 'for' loop initializer", "", 0)
+    if "," in cond_part:
+        return (False, "Disallowed comma operator in 'for' loop condition", "", 0)
+    if "," in step_part:
+        return (False, "Disallowed comma operator in 'for' loop step", "", 0)
+    if "||" in cond_part:
+        return (False, "Disallowed logical OR in 'for' loop condition", "", 0)
+
+    flip_op = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
+    matched_bound: Optional[tuple[str, str, float]] = None
+    for raw_conj in cond_part.split("&&"):
+        conj = _strip_outer_parens(raw_conj)
+        m_lr = _GLSL_CMP_LR_RE.fullmatch(conj)
+        if m_lr:
+            val = _parse_glsl_number(m_lr.group(3))
+            if val is not None:
+                matched_bound = (m_lr.group(1), m_lr.group(2), val)
+                break
+        m_rl = _GLSL_CMP_RL_RE.fullmatch(conj)
+        if m_rl:
+            val = _parse_glsl_number(m_rl.group(1))
+            if val is not None:
+                matched_bound = (m_rl.group(3), flip_op[m_rl.group(2)], val)
+                break
+
+    if matched_bound is None:
+        return (
+            False,
+            f"Missing bounded numeric comparison in 'for' loop (<= {MAX_CUSTOM_LOOP_ITERATIONS} iterations max)",
+            "",
+            0,
+        )
+
+    var, op, bound = matched_bound
+    if abs(bound) > MAX_CUSTOM_LOOP_ITERATIONS:
+        return (
+            False,
+            f"'for' loop bound {bound:g} exceeds maximum of {MAX_CUSTOM_LOOP_ITERATIONS} iterations",
+            "",
+            0,
+        )
+
+    if _mutates_var(cond_part, var, inout_funcs):
+        return (False, f"'for' loop condition must not mutate induction variable '{var}'", "", 0)
+
+    step_delta = _extract_step_delta(step_part, var)
+    if step_delta is None or abs(step_delta) < 1e-3:
+        return (False, f"'for' loop step for '{var}' must use a single non-zero constant increment", "", 0)
+
+    init_clean = _strip_outer_parens(init_part)
+    m_init = re.fullmatch(
+        rf"(?:(?:lowp|mediump|highp)\s+)?(?:(?:int|uint|float)\s+)?{re.escape(var)}\s*=\s*({_GLSL_NUM_PAT})",
+        init_clean,
+    )
+    start_val = _parse_glsl_number(m_init.group(1)) if m_init else None
+    if start_val is None or abs(start_val) > 1024.0:
+        return (
+            False,
+            f"'for' loop on '{var}' requires an explicit numeric literal initializer",
+            "",
+            0,
+        )
+
+    iters = 0
+    if op in ("<", "<="):
+        if step_delta <= 0.0:
+            return (False, f"'for' loop on '{var}' steps away from upper bound", "", 0)
+        span = bound - start_val
+        if span >= 0.0:
+            iters = (
+                int(math.floor(span / step_delta)) + 1
+                if op == "<="
+                else int(math.ceil(span / step_delta))
+            )
+            if iters > MAX_CUSTOM_LOOP_ITERATIONS:
+                return (
+                    False,
+                    f"'for' loop iteration count ({iters}) exceeds maximum of {MAX_CUSTOM_LOOP_ITERATIONS}",
+                    "",
+                    0,
+                )
+    else:
+        if step_delta >= 0.0:
+            return (False, f"'for' loop on '{var}' steps away from lower bound", "", 0)
+        span = start_val - bound
+        if span >= 0.0:
+            dec = -step_delta
+            iters = (
+                int(math.floor(span / dec)) + 1
+                if op == ">="
+                else int(math.ceil(span / dec))
+            )
+            if iters > MAX_CUSTOM_LOOP_ITERATIONS:
+                return (
+                    False,
+                    f"'for' loop iteration count ({iters}) exceeds maximum of {MAX_CUSTOM_LOOP_ITERATIONS}",
+                    "",
+                    0,
+                )
+    return (True, "", var, iters)
+
+
+def validate_custom_glsl_source(src: str) -> tuple[bool, str]:
+    """Static pre-validator for custom GLSL 330 Core fragment shaders (Board Resolution #4)."""
+    if not isinstance(src, str) or not src.strip():
+        return (False, "Custom shader source is empty")
+
+    # Phase 1 & 2: normalize newlines, splice GLSL §3.3 '\\\n' continuations, then strip comments
+    stripped = _preprocess_glsl_for_scan(src)
+
+    # Preprocessor allowlist: ONLY `#version 330 core` (max 1) and bare numeric `#define <IDENT> <num>`
+    version_count = 0
+    for line in stripped.split("\n"):
+        if "#" not in line:
+            continue
+        if not re.match(r"^\s*#", line) or line.count("#") > 1:
+            return (False, "Disallowed preprocessor token '#' in custom shader")
+        if _GLSL_EXTENSION_RE.match(line):
+            return (False, "Disallowed '#extension' directive in custom shader")
+        m_ver = _GLSL_VERSION_RE.match(line)
+        if m_ver:
+            version_count += 1
+            if version_count > 1:
+                return (False, "Duplicate '#version' directive in custom shader")
+            ver_spec = " ".join(m_ver.group(1).split())
+            if ver_spec != "330 core":
+                return (
+                    False,
+                    f"Unsupported '#version {ver_spec}' directive (only '#version 330 core' is allowed)",
+                )
+            continue
+        m_def = _GLSL_DEFINE_NUM_RE.fullmatch(line)
+        if m_def:
+            def_name = m_def.group(1)
+            if def_name in _GLSL_RESERVED_DEFINE_NAMES or _parse_glsl_number(m_def.group(2)) is None:
+                return (False, f"Disallowed '#define {def_name}' directive in custom shader")
+            continue
+        return (
+            False,
+            "Disallowed preprocessor directive in custom shader (only '#version 330 core' and numeric '#define' allowed)",
+        )
+
+    m_loop = _GLSL_UNBOUNDED_LOOP_RE.search(stripped)
+    if m_loop:
+        return (
+            False,
+            f"Disallowed '{m_loop.group(1)}' loop in custom shader (only bounded for-loops <= {MAX_CUSTOM_LOOP_ITERATIONS} allowed)",
+        )
+
+    inout_funcs = _find_inout_functions(stripped)
+
+    # Parse every `for` occurrence: reject any `\bfor\b` not immediately followed by `\s*\(`
+    parsed_loops: list[tuple[int, str, int, int, str, int]] = []
+    for m_for in re.finditer(r"\bfor\b", stripped):
+        open_pos = _skip_ws(stripped, m_for.end())
+        if open_pos >= len(stripped) or stripped[open_pos] != "(":
+            return (False, "Malformed 'for' construct in custom shader (must be followed by '(')")
+        close_after = _match_balanced(stripped, open_pos, "(", ")")
+        if close_after is None:
+            return (False, "Unclosed 'for' loop header in custom shader")
+        header = stripped[open_pos + 1 : close_after - 1]
+        ok, err, var, iters = _validate_for_header(header, inout_funcs)
+        if not ok:
+            return (False, err)
+        body_span = _parse_stmt_span(stripped, close_after)
+        if body_span is None:
+            return (False, "Malformed 'for' loop body in custom shader")
+        body_start, body_end = body_span
+        body_text = stripped[body_start:body_end]
+        if _mutates_var(body_text, var, inout_funcs):
+            return (False, f"'for' loop body must not mutate induction variable '{var}'")
+        parsed_loops.append((m_for.start(), var, body_start, body_end, body_text, iters))
+
+    # Enforce nested loop iteration product <= MAX_CUSTOM_NESTED_LOOP_ITERATIONS (256)
+    direct_products: list[int] = []
+    for idx, (h_start, _var, _b_start, _b_end, _b_text, iters) in enumerate(parsed_loops):
+        prod = max(1, iters)
+        for p_idx, (_ph, _pvar, pb_start, pb_end, _pb_text, p_iters) in enumerate(parsed_loops):
+            if p_idx != idx and pb_start <= h_start < pb_end:
+                prod *= max(1, p_iters)
+                if prod > MAX_CUSTOM_NESTED_LOOP_ITERATIONS:
+                    return (
+                        False,
+                        f"Nested 'for' loop iteration product ({prod}) exceeds maximum of {MAX_CUSTOM_NESTED_LOOP_ITERATIONS}",
+                    )
+        direct_products.append(prod)
+
+    # Also enforce iteration product across helper function calls inside loops
+    fn_bodies = _find_user_function_bodies(stripped)
+    fn_iters: dict[str, int] = {}
+    for fn_name, f_start, f_end in fn_bodies:
+        best = 1
+        for (h_start, _v, _bs, _be, _bt, _it), dprod in zip(parsed_loops, direct_products):
+            if f_start <= h_start < f_end:
+                best = max(best, dprod)
+        if best > 1:
+            fn_iters[fn_name] = max(fn_iters.get(fn_name, 1), best)
+
+    if fn_iters:
+        # Propagate loop cost through chained helper calls
+        for _ in range(4):
+            changed = False
+            for fn_name, f_start, f_end in fn_bodies:
+                f_src = stripped[f_start:f_end]
+                cur_cost = fn_iters.get(fn_name, 1)
+                for callee, c_cost in list(fn_iters.items()):
+                    if callee != fn_name and re.search(rf"\b{re.escape(callee)}\s*\(", f_src):
+                        # If callee is called inside a loop of fn_name, cost multiplies; else max
+                        best_in_fn = cur_cost
+                        for (h_start, _v, bs, be, bt, _it), dprod in zip(parsed_loops, direct_products):
+                            if f_start <= h_start < f_end and re.search(rf"\b{re.escape(callee)}\s*\(", bt):
+                                best_in_fn = max(best_in_fn, dprod * c_cost)
+                        best_in_fn = max(best_in_fn, c_cost)
+                        if best_in_fn > cur_cost:
+                            fn_iters[fn_name] = best_in_fn
+                            cur_cost = best_in_fn
+                            changed = True
+            if not changed:
+                break
+
+        for (_h_start, _v, _bs, _be, b_text, _it), dprod in zip(parsed_loops, direct_products):
+            for callee, c_cost in fn_iters.items():
+                if re.search(rf"\b{re.escape(callee)}\s*\(", b_text):
+                    total = dprod * c_cost
+                    if total > MAX_CUSTOM_NESTED_LOOP_ITERATIONS:
+                        return (
+                            False,
+                            f"Nested 'for' loop iteration product via '{callee}()' ({total}) exceeds maximum of {MAX_CUSTOM_NESTED_LOOP_ITERATIONS}",
+                        )
+
+    return (True, "")
+
+
+def load_custom_fragment_shader_checked(path: str) -> tuple[Optional[str], str]:
+    """Validate, decode, sandbox-check, and wrap a custom .glsl fragment shader."""
+    if not isinstance(path, str):
+        return (None, "Invalid custom shader path")
     raw_path = path.strip()
     if (
         not raw_path
         or "\x00" in raw_path
         or raw_path.replace("/", "\\").startswith(("\\\\", "\\?"))
     ):
-        return None
+        return (None, "Unsafe or UNC custom shader path rejected")
     p = pathlib.Path(raw_path)
     if p.suffix.lower() != ".glsl":
-        return None
+        return (None, "Custom shader file must have a .glsl extension")
+    if _has_unc_symlink(raw_path):
+        return (None, "Custom shader symlink to UNC path rejected")
     try:
-        if p.is_symlink():
-            link_target = str(p.readlink())
-            if link_target.replace("/", "\\").startswith(("\\\\", "\\?")):
-                return None
         if not p.is_file():
-            return None
+            return (None, "Custom shader file not found")
         resolved = p.resolve()
         if str(resolved).replace("/", "\\").startswith(("\\\\", "\\?")) or resolved.suffix.lower() != ".glsl":
-            return None
+            return (None, "Resolved custom shader path is invalid")
         if resolved.stat().st_size > MAX_CUSTOM_SHADER_BYTES:
-            return None
-        src = resolved.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return None
-    if "#version" in src:
-        return src
-    return CUSTOM_SHADER_WRAPPER_HEADER + "\n" + src
+            return (None, f"Custom shader exceeds {MAX_CUSTOM_SHADER_BYTES} byte limit")
+        raw_bytes = resolved.read_bytes()
+    except OSError as exc:
+        return (None, f"Failed to read custom shader: {exc}")
+
+    if len(raw_bytes) > MAX_CUSTOM_SHADER_BYTES:
+        return (None, f"Custom shader exceeds {MAX_CUSTOM_SHADER_BYTES} byte limit")
+
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")) and not raw_bytes.startswith(
+        (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")
+    ):
+        src = raw_bytes.decode("utf-16", errors="replace")
+    else:
+        src = raw_bytes.decode("utf-8-sig", errors="replace")
+
+    if "\x00" in src:
+        return (None, "Custom shader contains unexpected NUL bytes")
+
+    ok, err = validate_custom_glsl_source(src)
+    if not ok:
+        return (None, err)
+
+    stripped = _preprocess_glsl_for_scan(src)
+    if _GLSL_VERSION_RE.search(stripped):
+        return (src, "")
+    return (CUSTOM_SHADER_WRAPPER_HEADER + "\n" + src, "")
+
+
+def load_custom_fragment_shader(path: str) -> Optional[str]:
+    src, _err = load_custom_fragment_shader_checked(path)
+    return src
 
 
 def hex_to_rgb_f(hex_color: str) -> tuple[float, float, float]:

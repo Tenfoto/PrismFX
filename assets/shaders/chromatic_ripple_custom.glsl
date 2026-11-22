@@ -6,7 +6,7 @@ void main() {
     vec2 center = v_uv - 0.5;
     float dist = length(center);
     float ring = sin(dist * 28.0 - p * 16.0) * exp(-dist * 2.2) * p * 0.045 * u_intensity;
-    vec2 dir = normalize(center + 1e-4);
+    vec2 dir = (dist > 1e-5) ? (center / dist) : vec2(0.0);
 
     vec4 col;
     col.r = texture(u_tex, v_uv + dir * (ring + 0.015 * p)).r;

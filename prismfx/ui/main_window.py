@@ -15,7 +15,7 @@ from ..core import startup as win_startup
 from ..core import win32_api as w32
 from ..core.config import BUILTIN_PRESETS, PrismConfig
 from ..core.effects import CATEGORIES, EASING_CURVES, TRIGGER_TYPES, EffectSpec
-from ..core.engine import PrismEngine, SpotlightState
+from ..core.engine import PrismEngine, SpotlightState, TileRequest
 from ..core.physics import SNAP_PRESETS
 from ..render.gl_renderer import OffscreenGpuEngine
 from ..render.overlay import DesktopFxOverlay, FloatingTileWindow, QuickControlPopup, SpotlightOverlay
@@ -39,6 +39,7 @@ class MainWindow(QtWidgets.QMainWindow):
     """Frameless architectural desktop studio controlling PrismEngine & GPU overlays."""
 
     startupStatusReady = QtCore.Signal(object)
+    spotlightStateChanged = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -70,6 +71,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.start_with_windows_admin = (self._startup_status.mode == "elevated_task")
         self.startupStatusReady.connect(self._apply_startup_status, QtCore.Qt.QueuedConnection)
         self._native_bound = False
+        self._wts_registered = False
         self._drag_pos: Optional[QtCore.QPoint] = None
         self._active_page = "home"
         self._active_trigger = "open"
@@ -102,6 +104,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.quick_bar = QuickControlPopup(engine)
 
         if self.spotlight_overlay is not None:
+            self.spotlightStateChanged.connect(
+                self.spotlight_overlay.apply_state, QtCore.Qt.QueuedConnection
+            )
             engine.on_spotlight_changed = self._dispatch_spotlight_from_thread
 
         self._build_shell()
@@ -257,6 +262,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.engine.register_own_hwnd(hwnd)
             if not self._native_bound:
                 self._native_bound = True
+                if not self._wts_registered:
+                    self._wts_registered = bool(w32.register_session_notification(hwnd))
                 if self._ipc_msg:
                     # UIPI hardening: whitelist ONLY the Activate message, NEVER self._ipc_quit_msg
                     w32.allow_window_message_uipi(hwnd, self._ipc_msg)
@@ -311,9 +318,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     elif msg.message in (w32.WM_QUERYENDSESSION, w32.WM_ENDSESSION):
                         # Synchronously restore all hidden/pre-hidden windows before Windows logs off or shuts down
                         self.engine.stop()
+                    elif msg.message == w32.WM_POWERBROADCAST:
+                        if msg.wParam == w32.PBT_APMSUSPEND:
+                            if self.fx_overlay is not None:
+                                self.fx_overlay.cancel_all_active()
+                            self.engine.on_system_suspend()
+                        elif msg.wParam in (w32.PBT_APMRESUMEAUTOMATIC, w32.PBT_APMRESUMESUSPEND):
+                            QtCore.QTimer.singleShot(0, self._on_system_wake_or_display_change)
+                    elif msg.message == w32.WM_DISPLAYCHANGE:
+                        QtCore.QTimer.singleShot(0, self._on_system_wake_or_display_change)
+                    elif msg.message == w32.WM_WTSSESSION_CHANGE:
+                        if msg.wParam == w32.WTS_SESSION_LOCK:
+                            if self.fx_overlay is not None:
+                                self.fx_overlay.cancel_all_active()
+                            self.engine.on_system_suspend()
+                        elif msg.wParam == w32.WTS_SESSION_UNLOCK:
+                            QtCore.QTimer.singleShot(0, self._on_system_wake_or_display_change)
         except Exception:
             pass
         return super().nativeEvent(eventType, message)
+
+    def _on_system_wake_or_display_change(self) -> None:
+        if self._shutdown_started:
+            return
+        if self.fx_overlay is not None:
+            self.fx_overlay.cancel_all_active()
+        self.engine.on_system_resume_or_display_change()
+        OffscreenGpuEngine.shared().validate_context()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._persist_geometry()
@@ -1995,13 +2026,31 @@ class MainWindow(QtWidgets.QMainWindow):
             self._tr("พร้อมกู้คืนสถานะอัตโนมัติ", "Auto-recovery armed"),
         )
 
+        # Close & pop any floating tiles whose target window was destroyed
+        while True:
+            try:
+                dead_hwnd = self.engine.destroyed_tile_hwnds.get_nowait()
+            except queue.Empty:
+                break
+            dead_tw = self._tile_windows.pop(dead_hwnd, None)
+            if dead_tw is not None:
+                dead_tw.close()
+
         # Spawn any queued floating window tiles on UI thread
         while True:
             try:
-                info = self.engine.tile_requests.get_nowait()
+                req = self.engine.tile_requests.get_nowait()
             except queue.Empty:
                 break
-            cap = self.engine.backend.capture_window_bgra(info.hwnd)
+            if isinstance(req, TileRequest):
+                info = req.info
+                cap = req.capture if req.capture is not None else self.engine.backend.capture_window_bgra(info.hwnd)
+            else:
+                info = req
+                cap = self.engine.backend.capture_window_bgra(info.hwnd)
+            old_tw = self._tile_windows.pop(info.hwnd, None)
+            if old_tw is not None:
+                old_tw.close()
             tw = FloatingTileWindow(info, cap, self.cfg.focus.tile_size_px, self.cfg.focus.tiles_topmost)
             tw.restored.connect(self._on_tile_restored)
             offset = len(self._tile_windows) * 28
@@ -2015,8 +2064,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.restore_from_tile(hwnd)
 
     def _dispatch_spotlight_from_thread(self, state: SpotlightState) -> None:
-        if self.spotlight_overlay is not None:
-            QtCore.QTimer.singleShot(0, lambda s=state: self.spotlight_overlay.apply_state(s))  # type: ignore[union-attr]
+        if self._shutdown_started or self.spotlight_overlay is None:
+            return
+        try:
+            self.spotlightStateChanged.emit(state)
+        except RuntimeError:
+            pass
 
     # ------------------------------------------------------------------
     # Hotkeys, Tray & Custom Window Dragging
@@ -2088,6 +2141,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def full_shutdown(self) -> None:
         self._shutdown_started = True
+        self.engine.on_spotlight_changed = None
+        if self._wts_registered:
+            self._wts_registered = False
+            try:
+                w32.unregister_session_notification(int(self.winId()))
+            except Exception:
+                pass
         self._persist_geometry()
         self._ui_timer.stop()
         self.home_stage.cleanup_gl()

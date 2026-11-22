@@ -31,6 +31,10 @@ dwmapi = _load_system_dll("dwmapi")
 kernel32 = _load_system_dll("kernel32")
 shell32 = _load_system_dll("shell32")
 psapi = _load_system_dll("psapi")
+try:
+    wtsapi32: Optional[ctypes.WinDLL] = _load_system_dll("wtsapi32")
+except OSError:
+    wtsapi32 = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,6 +64,7 @@ WS_EX_APPWINDOW = 0x00040000
 WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
 
+LWA_COLORKEY = 0x00000001
 LWA_ALPHA = 0x00000002
 ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
@@ -157,6 +162,15 @@ HT_RESIZE_BORDERS = frozenset({
 WM_CLOSE = 0x0010
 WM_QUERYENDSESSION = 0x0011
 WM_ENDSESSION = 0x0016
+WM_DISPLAYCHANGE = 0x007E
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND = 0x0004
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_APMRESUMEAUTOMATIC = 0x0012
+WM_WTSSESSION_CHANGE = 0x02B1
+WTS_SESSION_LOCK = 0x7
+WTS_SESSION_UNLOCK = 0x8
+NOTIFY_FOR_THIS_SESSION = 0
 VK_LBUTTON = 0x01
 
 MSGFLT_ALLOW = 1
@@ -225,10 +239,10 @@ class SIZE(ctypes.Structure):
 
 class BLENDFUNCTION(ctypes.Structure):
     _fields_ = [
-        ("BlendOp", ctypes.c_byte),
-        ("BlendFlags", ctypes.c_byte),
-        ("SourceConstantAlpha", ctypes.c_byte),
-        ("AlphaFormat", ctypes.c_byte),
+        ("BlendOp", ctypes.c_ubyte),
+        ("BlendFlags", ctypes.c_ubyte),
+        ("SourceConstantAlpha", ctypes.c_ubyte),
+        ("AlphaFormat", ctypes.c_ubyte),
     ]
 
 
@@ -268,10 +282,10 @@ class BITMAPINFO(ctypes.Structure):
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):
     _fields_ = [
-        ("ACLineStatus", ctypes.c_byte),
-        ("BatteryFlag", ctypes.c_byte),
-        ("BatteryLifePercent", ctypes.c_byte),
-        ("SystemStatusFlag", ctypes.c_byte),
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
         ("BatteryLifeTime", wintypes.DWORD),
         ("BatteryFullLifeTime", wintypes.DWORD),
     ]
@@ -541,6 +555,43 @@ user32.GetRawInputData.argtypes = [
 user32.GetRawInputData.restype = wintypes.UINT
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetDC.argtypes = [wintypes.HWND]
+user32.GetDC.restype = wintypes.HDC
+user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+user32.ReleaseDC.restype = ctypes.c_int
+user32.EnumWindows.argtypes = [ENUMWINDOWSPROC, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.EnumDisplayMonitors.argtypes = [
+    wintypes.HDC, ctypes.POINTER(RECT), MONITORENUMPROC, wintypes.LPARAM,
+]
+user32.EnumDisplayMonitors.restype = wintypes.BOOL
+user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = ctypes.c_ssize_t
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+
+gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+gdi32.CreateCompatibleDC.restype = wintypes.HDC
+gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC, ctypes.POINTER(BITMAPINFO), wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD,
+]
+gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+gdi32.SelectObject.restype = wintypes.HGDIOBJ
+gdi32.BitBlt.argtypes = [
+    wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
+]
+gdi32.BitBlt.restype = wintypes.BOOL
+gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+gdi32.DeleteObject.restype = wintypes.BOOL
+gdi32.DeleteDC.argtypes = [wintypes.HDC]
+gdi32.DeleteDC.restype = wintypes.BOOL
 
 dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long  # Avoid auto-raising PermissionError on cross-proc calls
@@ -571,11 +622,22 @@ kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+kernel32.GetTickCount64.argtypes = []
+kernel32.GetTickCount64.restype = ctypes.c_uint64
 try:
     kernel32.SetDefaultDllDirectories.argtypes = [wintypes.DWORD]
     kernel32.SetDefaultDllDirectories.restype = wintypes.BOOL
 except Exception:
     pass
+
+if wtsapi32 is not None:
+    try:
+        wtsapi32.WTSRegisterSessionNotification.argtypes = [wintypes.HWND, wintypes.DWORD]
+        wtsapi32.WTSRegisterSessionNotification.restype = wintypes.BOOL
+        wtsapi32.WTSUnRegisterSessionNotification.argtypes = [wintypes.HWND]
+        wtsapi32.WTSUnRegisterSessionNotification.restype = wintypes.BOOL
+    except Exception:
+        wtsapi32 = None
 
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
@@ -659,6 +721,34 @@ def create_single_instance_mutex(profile_id: str) -> tuple[int, bool]:
 def close_handle(handle: int) -> None:
     if handle:
         kernel32.CloseHandle(handle)
+
+
+def get_boot_tick_ms() -> int:
+    """Return monotonic milliseconds elapsed since system boot (64-bit, never wraps)."""
+    try:
+        return int(kernel32.GetTickCount64())
+    except Exception:
+        return 0
+
+
+def register_session_notification(hwnd: int) -> bool:
+    """Register hwnd to receive WM_WTSSESSION_CHANGE notifications for the current session."""
+    if not hwnd or wtsapi32 is None:
+        return False
+    try:
+        return bool(wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION))
+    except Exception:
+        return False
+
+
+def unregister_session_notification(hwnd: int) -> bool:
+    """Unregister hwnd from WM_WTSSESSION_CHANGE notifications."""
+    if not hwnd or wtsapi32 is None:
+        return False
+    try:
+        return bool(wtsapi32.WTSUnRegisterSessionNotification(hwnd))
+    except Exception:
+        return False
 
 
 def harden_dll_search_order() -> bool:
@@ -982,39 +1072,107 @@ def set_click_through_overlay(hwnd: int, click_through: bool = True) -> None:
     )
 
 
-def set_window_opacity(hwnd: int, alpha_0_to_255: int) -> bool:
-    """User-facing opacity setter (safe floor = 20 so users never accidentally vanish a window)."""
-    alpha = max(20, min(255, int(alpha_0_to_255)))
+def get_window_layered_state(hwnd: int) -> tuple[bool, Optional[int]]:
+    """Inspect a window's WS_EX_LAYERED state and safe LWA_ALPHA opacity.
+
+    Returns ``(had_layered, alpha_or_none)``:
+      - ``(False, None)`` if ``hwnd`` is invalid.
+      - ``(False, 255)`` if ``WS_EX_LAYERED`` is not set.
+      - ``(True, None)`` if ``WS_EX_LAYERED`` uses per-pixel ``UpdateLayeredWindow``
+        (``GetLayeredWindowAttributes`` returns ``False``), ``LWA_COLORKEY``, or lacks
+        ``LWA_ALPHA`` — signaling PrismFX MUST NOT mutate this window's alpha or style.
+      - ``(True, alpha)`` if ``WS_EX_LAYERED`` uses safe ``LWA_ALPHA``-only mode.
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return (False, None)
     ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    had_layered = bool(ex & WS_EX_LAYERED)
+    if not had_layered:
+        return (False, 255)
+    cr = wintypes.COLORREF(0)
+    alpha = ctypes.c_ubyte(255)
+    flags = wintypes.DWORD(0)
+    ok = bool(
+        user32.GetLayeredWindowAttributes(
+            hwnd, ctypes.byref(cr), ctypes.byref(alpha), ctypes.byref(flags)
+        )
+    )
+    if (not ok) or (not (flags.value & LWA_ALPHA)) or (flags.value & LWA_COLORKEY):
+        return (True, None)
+    return (True, int(alpha.value))
+
+
+def _is_safe_lwa_alpha_only(hwnd: int) -> bool:
+    """Return True iff an existing WS_EX_LAYERED window uses safe LWA_ALPHA-only mode."""
+    cr = wintypes.COLORREF(0)
+    alpha = ctypes.c_ubyte(255)
+    flags = wintypes.DWORD(0)
+    ok = bool(
+        user32.GetLayeredWindowAttributes(
+            hwnd, ctypes.byref(cr), ctypes.byref(alpha), ctypes.byref(flags)
+        )
+    )
+    return ok and bool(flags.value & LWA_ALPHA) and not bool(flags.value & LWA_COLORKEY)
+
+
+def set_window_opacity(hwnd: int, alpha_0_to_255: int, had_layered: Optional[bool] = None) -> bool:
+    """User-facing opacity setter (safe floor = 20 so users never accidentally vanish a window).
+
+    Refuses to modify per-pixel ``UpdateLayeredWindow`` or ``LWA_COLORKEY`` windows, and only
+    strips ``WS_EX_LAYERED`` on restore to 255 when ``had_layered is False``.
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    if (ex & WS_EX_LAYERED) and not _is_safe_lwa_alpha_only(hwnd):
+        return False
+    alpha = max(20, min(255, int(alpha_0_to_255)))
     if alpha >= 255:
         if ex & WS_EX_LAYERED:
-            user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
-            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+            ok = bool(user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA))
+            if ok and had_layered is False:
+                user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+            return ok
         return True
     if not (ex & WS_EX_LAYERED):
         user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
     return bool(user32.SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA))
 
 
-def set_window_hidden_alpha(hwnd: int, hidden: bool, restore_alpha: int = 255) -> bool:
+def set_window_hidden_alpha(
+    hwnd: int,
+    hidden: bool,
+    restore_alpha: int = 255,
+    had_layered: Optional[bool] = None,
+) -> bool:
     """Temporarily hide a cross-process window at alpha=0 during Open/Restore GPU transitions.
 
     Works on all standard-privilege foreign processes where DWMWA_CLOAK returns E_ACCESSDENIED,
     and still allows PrintWindow(PW_RENDERFULLCONTENT) to capture crisp opaque contents!
+    Refuses to mutate per-pixel ``UpdateLayeredWindow`` or ``LWA_COLORKEY`` windows, and only
+    strips ``WS_EX_LAYERED`` on restore to 255 when ``had_layered is False``.
     """
-    if not user32.IsWindow(hwnd):
+    if not hwnd or not user32.IsWindow(hwnd):
         return False
     ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
     if hidden:
+        if (ex & WS_EX_LAYERED) and not _is_safe_lwa_alpha_only(hwnd):
+            return False
         if not (ex & WS_EX_LAYERED):
             user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
         return bool(user32.SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA))
     alpha = max(20, min(255, int(restore_alpha)))
     if alpha >= 255:
         if ex & WS_EX_LAYERED:
-            user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
-            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+            if not _is_safe_lwa_alpha_only(hwnd):
+                return False
+            ok = bool(user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA))
+            if ok and had_layered is False:
+                user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+            return ok
         return True
+    if (ex & WS_EX_LAYERED) and not _is_safe_lwa_alpha_only(hwnd):
+        return False
     if not (ex & WS_EX_LAYERED):
         user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
     return bool(user32.SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA))
@@ -1206,7 +1364,26 @@ def are_desktop_icons_visible() -> bool:
     return bool(user32.IsWindowVisible(target))
 
 
-def capture_window_bgra(hwnd: int) -> Optional[tuple[int, int, bytes]]:
+def _is_window_hidden_for_screen_blt(hwnd: int) -> bool:
+    """Return True if hwnd is invisible, cloaked, or alpha==0 so BitBlt(hdc_scr) would capture background."""
+    if not user32.IsWindowVisible(hwnd):
+        return True
+    if is_window_cloaked(hwnd):
+        return True
+    ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    if ex & WS_EX_LAYERED:
+        cr = wintypes.COLORREF(0)
+        alpha = ctypes.c_ubyte(255)
+        flags = wintypes.DWORD(0)
+        if user32.GetLayeredWindowAttributes(
+            hwnd, ctypes.byref(cr), ctypes.byref(alpha), ctypes.byref(flags)
+        ):
+            if (flags.value & LWA_ALPHA) and alpha.value == 0:
+                return True
+    return False
+
+
+def capture_window_bgra(hwnd: int, allow_screen_fallback: bool = True) -> Optional[tuple[int, int, bytes]]:
     """Capture a window's exact visible DWM frame contents as 1:1 cropped top-down BGRA bytes.
 
     Crops out Windows 11's invisible 7px left/right/bottom DWM drop-shadow borders so the
@@ -1255,6 +1432,8 @@ def capture_window_bgra(hwnd: int) -> Optional[tuple[int, int, bytes]]:
         hdc_full, ctypes.byref(bmi), DIB_RGB_COLORS, ctypes.byref(bits_ptr), None, 0
     )
     if not hbmp or not bits_ptr.value:
+        if hbmp:
+            gdi32.DeleteObject(hbmp)
         gdi32.DeleteDC(hdc_full)
         user32.ReleaseDC(0, hdc_scr)
         return None
@@ -1265,6 +1444,8 @@ def capture_window_bgra(hwnd: int) -> Optional[tuple[int, int, bytes]]:
         if not ok:
             ok = user32.PrintWindow(hwnd, hdc_full, 0)
         if not ok:
+            if (not allow_screen_fallback) or _is_window_hidden_for_screen_blt(hwnd):
+                return None
             gdi32.BitBlt(hdc_full, 0, 0, w, h, hdc_scr, r_win.left, r_win.top, SRCCOPY)
 
         # Fast C-level crop when DWM shadow margins exist
@@ -1273,6 +1454,8 @@ def capture_window_bgra(hwnd: int) -> Optional[tuple[int, int, bytes]]:
             return (w, h, raw)
 
         hdc_crop = gdi32.CreateCompatibleDC(hdc_scr)
+        if not hdc_crop:
+            return (w, h, ctypes.string_at(bits_ptr.value, w * h * 4))
         bmi_c = BITMAPINFO()
         bmi_c.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmi_c.bmiHeader.biWidth = crop_w
@@ -1285,8 +1468,9 @@ def capture_window_bgra(hwnd: int) -> Optional[tuple[int, int, bytes]]:
             hdc_crop, ctypes.byref(bmi_c), DIB_RGB_COLORS, ctypes.byref(crop_ptr), None, 0
         )
         if not hbmp_c or not crop_ptr.value:
-            if hdc_crop:
-                gdi32.DeleteDC(hdc_crop)
+            if hbmp_c:
+                gdi32.DeleteObject(hbmp_c)
+            gdi32.DeleteDC(hdc_crop)
             raw = ctypes.string_at(bits_ptr.value, w * h * 4)
             return (w, h, raw)
         old_c = gdi32.SelectObject(hdc_crop, hbmp_c)
@@ -1399,6 +1583,10 @@ class Win32LayeredSurface:
         self._blend_alpha = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
         self._blend_opaque = BLENDFUNCTION(AC_SRC_OVER, 0, 255, 0)
         self._pt_src = POINT(0, 0)
+
+    @property
+    def dib_byte_size(self) -> int:
+        return (self._dib_w * self._dib_h * 4) if (self._hbmp and self._bits_ptr.value) else 0
 
     def _ensure_park_dib(self) -> bool:
         if self._hbmp_park and self._hdc_park:
@@ -1604,6 +1792,7 @@ class Win32LayeredSurface:
         if self._hdc_scr:
             user32.ReleaseDC(0, self._hdc_scr)
             self._hdc_scr = 0
+        self._bits_ptr = ctypes.c_void_p()
         self._dib_w = 0
         self._dib_h = 0
 

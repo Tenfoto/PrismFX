@@ -8,6 +8,7 @@ and lock-free snapshot publishing.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import queue
 import random
@@ -21,7 +22,7 @@ from .backend import IWindowSystemBackend, WindowInfo
 from .catalog import classify_app, is_protected_window_class
 from .config import ConfigStore, PrismConfig
 from .effects import EffectRegistry
-from .journal import RecoveryJournal
+from .journal import RecoveryJournal, WindowMutation
 from .physics import (
     DragVelocityTracker,
     MomentumBody,
@@ -32,6 +33,9 @@ from .physics import (
 
 _WM_APP_SYNC_RAWINPUT = w32.WM_APP + 11
 _WM_APP_UNHOOK_DRAG = w32.WM_APP + 12
+
+_ACTIVE_NATIVE_CALLBACKS: set[object] = set()
+_ACTIVE_NATIVE_CALLBACKS_LOCK = threading.Lock()
 
 _INTERNAL_CREATE_CLASS_SUBSTRS = (
     "DummyWindow",
@@ -119,6 +123,7 @@ class _PendingOpen:
     trigger: str           # open | popup
     enqueued_at: float
     orig_alpha: int
+    had_layered: bool = False
     was_cloaked: bool = False
     first_uncloaked_at: float = 0.0
 
@@ -131,6 +136,7 @@ class _PendingMorph:
     from_cap: tuple[int, int, bytes]
     enqueued_at: float
     orig_alpha: int
+    had_layered: bool = False
     to_rect: Optional[tuple[int, int, int, int]] = None
     target_changed_at: float = 0.0
     already_changed: bool = False
@@ -224,6 +230,12 @@ class SpotlightState:
     cursor_pos: tuple[int, int] = (0, 0)
 
 
+@dataclass
+class TileRequest:
+    info: WindowInfo
+    capture: Optional[tuple[int, int, bytes]] = None
+
+
 @dataclass(frozen=True)
 class EngineFrame:
     """Immutable snapshot published atomically for lock-free UI reads."""
@@ -271,16 +283,21 @@ class PrismEngine:
 
         # Thread-safe queues for UI/renderer consumers
         self.animation_queue: queue.Queue[AnimationJob] = queue.Queue(maxsize=32)
-        self.tile_requests: queue.Queue[WindowInfo] = queue.Queue(maxsize=16)
+        self.tile_requests: queue.Queue[TileRequest] = queue.Queue(maxsize=16)
+        self.destroyed_tile_hwnds: queue.Queue[int] = queue.Queue(maxsize=64)
+
+        # Locks for cross-thread cache and state safety
+        self._cache_lock = threading.Lock()
+        self._state_lock = threading.RLock()
 
         # Tracked runtime state
         self._cached_captures: dict[int, tuple[int, int, bytes, tuple[int, int, int, int], float]] = {}
         self._last_trigger_info: dict[int, tuple[str, float]] = {}  # hwnd -> (trigger, ts)
-        self._hidden_for_anim: dict[int, tuple[int, float]] = {}    # hwnd -> (orig_alpha, hidden_at)
-        self._hidden_for_wobble: dict[int, tuple[int, float]] = {}  # hwnd -> (orig_alpha, heartbeat_ts)
-        self._prehidden_minimized: dict[int, int] = {}              # hwnd -> orig_alpha (0ms flash Restore!)
+        self._hidden_for_anim: dict[int, tuple[int, float, bool]] = {}    # hwnd -> (orig_alpha, hidden_at, had_layered)
+        self._hidden_for_wobble: dict[int, tuple[int, float, bool]] = {}  # hwnd -> (orig_alpha, heartbeat_ts, had_layered)
+        self._prehidden_minimized: dict[int, tuple[int, bool]] = {}       # hwnd -> (orig_alpha, had_layered)
         self._prehidden_uniconic_since: dict[int, float] = {}       # grace period before watchdog reveals
-        self._prehidden_creating: dict[int, tuple[float, float]] = {}  # hwnd -> (created_at, first_visible_at)
+        self._prehidden_creating: dict[int, tuple[float, float, bool]] = {}  # hwnd -> (created_at, first_visible_at, had_layered)
         self._pending_opens: dict[int, _PendingOpen] = {}           # async first-frame staging off hook thread!
         self._pending_morphs: dict[int, _PendingMorph] = {}         # async smooth maximize/snap morph staging!
         self._known_visible_hwnds: set[int] = set()                 # already-open windows (never fake-open on Alt+Tab)
@@ -298,7 +315,8 @@ class PrismEngine:
         self._cached_paused_reason: str = ""
         self._hidden_lock = threading.Lock()
         self._last_active_time: dict[int, float] = {}
-        self._faded_hwnds: set[int] = set()
+        self._faded_hwnds: dict[int, tuple[int, bool]] = {}
+        self._custom_opacity_orig: dict[int, tuple[int, bool]] = {}
         self._rolled_up: dict[int, int] = {}
         self._pinned: set[int] = set()
         self._tiled: set[int] = set()
@@ -307,6 +325,9 @@ class PrismEngine:
         self._drag_start_rect: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._drag_last_pos: tuple[int, int] = (0, 0)
         self._drag_orig_alpha: int = 255
+        self._drag_had_layered: bool = False
+        self._drag_alpha_mutated: bool = False
+        self._drag_unsafe_layered: bool = False
         self._drag_grab_uv: tuple[float, float] = (0.5, 0.08)
         self._drag_wobble_started: bool = False
         self._drag_is_resize: bool = False
@@ -361,7 +382,58 @@ class PrismEngine:
 
     def register_own_hwnd(self, hwnd: int) -> None:
         if hwnd:
-            self._own_hwnds.add(int(hwnd))
+            with self._state_lock:
+                self._own_hwnds.add(int(hwnd))
+
+    def _window_identity(self, hwnd: int, info: Optional[WindowInfo] = None) -> tuple[int, str, int]:
+        """Return (pid, class_name, boot_tick_ms) for crash-journal HWND identity verification."""
+        if not hwnd:
+            return (0, "", 0)
+        if self.backend.is_demo:
+            w_info = info or self.backend.get_window_info(hwnd)
+            if w_info is not None:
+                return (int(w_info.pid or 0), str(w_info.class_name or ""), 0)
+            return (0, "", 0)
+        pid_dw = w32.wintypes.DWORD(0)
+        try:
+            w32.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_dw))
+            pid = int(pid_dw.value)
+        except Exception:
+            pid = int(info.pid) if info is not None else 0
+        if not pid and info is not None and info.pid:
+            pid = int(info.pid)
+        try:
+            cls = w32.get_class_name(hwnd) or (info.class_name if info is not None else "")
+        except Exception:
+            cls = info.class_name if info is not None else ""
+        return (pid, str(cls or ""), w32.get_boot_tick_ms())
+
+    def _verify_journal_mutation(self, m: WindowMutation) -> bool:
+        """Verify that a journaled HWND still refers to the same OS window in the same boot session."""
+        if not self.backend.is_valid_window(m.hwnd):
+            return False
+        if m.boot_tick_ms > 0:
+            cur_boot = w32.get_boot_tick_ms()
+            if (not self.backend.is_demo or cur_boot > 0) and cur_boot < m.boot_tick_ms:
+                return False
+        if not m.pid and not m.class_name:
+            return True
+        if self.backend.is_demo:
+            info = self.backend.get_window_info(m.hwnd)
+            live_pid = int(info.pid) if info is not None else 0
+            live_cls = str(info.class_name) if info is not None else ""
+        else:
+            live_pid, live_cls, _ = self._window_identity(m.hwnd)
+            if not live_pid and not live_cls:
+                info = self.backend.get_window_info(m.hwnd)
+                if info is not None:
+                    live_pid = int(info.pid)
+                    live_cls = str(info.class_name)
+        if m.pid > 0 and live_pid != m.pid:
+            return False
+        if m.class_name and live_cls != m.class_name:
+            return False
+        return True
 
     def latest_frame(self) -> EngineFrame:
         return self._latest_frame
@@ -374,7 +446,8 @@ class PrismEngine:
             tuple(cfg.safety.excluded_exes) != old_ex
             or bool(cfg.safety.auto_exclude_games) != old_auto_games
         ):
-            self._cached_captures.clear()
+            with self._cache_lock:
+                self._cached_captures.clear()
         if persist:
             self.store.save(cfg)
         self._cached_paused_reason = self.paused_reason()
@@ -449,15 +522,19 @@ class PrismEngine:
         info = self.backend.get_window_info(hwnd)
         if not info or self.is_excluded(info) or not info.minimized:
             return False
-        orig_alpha = info.opacity if info.opacity >= 20 else 255
-        if info.opacity == 0:
-            return False  # Already hidden by another owner; do not touch!
+        had_layered, cur_alpha = self.backend.get_window_layered_state(hwnd)
+        if cur_alpha is None or cur_alpha == 0:
+            return False  # Per-pixel ULW/ColorKey or already hidden by another owner; do not touch!
+        orig_alpha = cur_alpha if cur_alpha >= 20 else 255
         if not self._running or self._stop_event.is_set():
             return False
-        self.journal.record_alpha(hwnd, orig_alpha)
+        pid, cls_name, boot_ms = self._window_identity(hwnd, info)
+        self.journal.record_alpha(
+            hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+        )
         if self.backend.set_window_hidden_alpha(hwnd, True):
             with self._hidden_lock:
-                self._prehidden_minimized[hwnd] = orig_alpha
+                self._prehidden_minimized[hwnd] = (orig_alpha, had_layered)
             return True
         self.journal.record_alpha(hwnd, None)
         return False
@@ -466,7 +543,9 @@ class PrismEngine:
         """Strictly filtered pre-hide on CREATE / early FOREGROUND so new windows open with 0 ms flash!"""
         if not hwnd or not self._can_prehide_open():
             return False
-        if hwnd in self._own_hwnds or hwnd in self._known_visible_hwnds or not w32.user32.IsWindow(hwnd):
+        with self._state_lock:
+            is_own_or_known = (hwnd in self._own_hwnds) or (hwnd in self._known_visible_hwnds)
+        if is_own_or_known or not w32.user32.IsWindow(hwnd):
             return False
         if w32.user32.IsIconic(hwnd):
             return False
@@ -503,12 +582,18 @@ class PrismEngine:
             return False
         if self.config.safety.auto_exclude_games and classify_app(exe, cls).recommended_exclude:
             return False
-        self.journal.record_alpha(hwnd, 255)
+        had_layered, cur_alpha = self.backend.get_window_layered_state(hwnd)
+        if cur_alpha is None or cur_alpha == 0 or had_layered:
+            return False
+        orig_alpha = cur_alpha if cur_alpha >= 20 else 255
+        self.journal.record_alpha(
+            hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls, boot_tick_ms=w32.get_boot_tick_ms()
+        )
         if self.backend.set_window_hidden_alpha(hwnd, True):
             now = time.perf_counter()
             vis_now = now if (w32.user32.IsWindowVisible(hwnd) and not w32.is_window_cloaked(hwnd)) else 0.0
             with self._hidden_lock:
-                self._prehidden_creating[hwnd] = (now, vis_now)
+                self._prehidden_creating[hwnd] = (now, vis_now, had_layered)
             return True
         self.journal.record_alpha(hwnd, None)
         return False
@@ -516,38 +601,40 @@ class PrismEngine:
     def _unhide_if_prehidden(self, hwnd: int) -> None:
         """Guarantee any pre-hidden window is immediately revealed if an animation is skipped/aborted."""
         orig_alpha: Optional[int] = None
+        had_layered: Optional[bool] = None
         with self._hidden_lock:
             if hwnd in self._hidden_for_anim:
                 return
             if hwnd in self._prehidden_minimized:
-                orig_alpha = self._prehidden_minimized.pop(hwnd)
+                orig_alpha, had_layered = self._prehidden_minimized.pop(hwnd)
             if hwnd in self._prehidden_creating:
-                self._prehidden_creating.pop(hwnd, None)
+                crt_entry = self._prehidden_creating.pop(hwnd, None)
                 if orig_alpha is None:
                     orig_alpha = 255
+                    had_layered = crt_entry[2] if crt_entry is not None else False
         if orig_alpha is not None:
             if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, orig_alpha)
+                self.backend.set_window_hidden_alpha(hwnd, False, orig_alpha, had_layered=had_layered)
             self.journal.record_alpha(hwnd, None)
 
     def _release_all_prehidden(self, minimized_only: bool = False, creating_only: bool = False) -> None:
-        to_restore: list[tuple[int, int]] = []
+        to_restore: list[tuple[int, int, bool]] = []
         with self._hidden_lock:
             if not creating_only:
                 self._pending_prehide.clear()
                 self._prehidden_uniconic_since.clear()
-                for h, a in list(self._prehidden_minimized.items()):
+                for h, (a, hl) in list(self._prehidden_minimized.items()):
                     self._prehidden_minimized.pop(h, None)
                     if h not in self._hidden_for_anim:
-                        to_restore.append((h, a))
+                        to_restore.append((h, a, hl))
             if not minimized_only:
-                for h in list(self._prehidden_creating.keys()):
+                for h, (_c, _v, hl) in list(self._prehidden_creating.items()):
                     self._prehidden_creating.pop(h, None)
                     if h not in self._hidden_for_anim:
-                        to_restore.append((h, 255))
-        for h, orig_a in to_restore:
+                        to_restore.append((h, 255, hl))
+        for h, orig_a, hl in to_restore:
             if self.backend.is_valid_window(h):
-                self.backend.set_window_hidden_alpha(h, False, orig_a)
+                self.backend.set_window_hidden_alpha(h, False, orig_a, had_layered=hl)
             self.journal.record_alpha(h, None)
 
     def _sync_native_min_anim(self, active: bool) -> None:
@@ -567,7 +654,9 @@ class PrismEngine:
             self._suppressed_min_anim = False
 
     def is_excluded(self, info: WindowInfo) -> bool:
-        if info.hwnd in self._own_hwnds or (self.own_pid and info.pid == self.own_pid):
+        with self._state_lock:
+            is_own = info.hwnd in self._own_hwnds
+        if is_own or (self.own_pid and info.pid == self.own_pid):
             return True
         if is_protected_window_class(info.class_name):
             return True
@@ -601,9 +690,11 @@ class PrismEngine:
         self._cached_paused_reason = self.paused_reason()
         self._sync_native_min_anim(active=True)
         # Seed known visible windows so focusing/Alt-Tabbing existing apps never false-triggers Open!
-        self._known_visible_hwnds = {
+        seed_vis = {
             w.hwnd for w in self.backend.list_windows(own_pid=self.own_pid) if not w.minimized
         }
+        with self._state_lock:
+            self._known_visible_hwnds = seed_vis
         self._poll_thread = threading.Thread(target=self._poll_loop, name="PrismFX-Core", daemon=True)
         self._poll_thread.start()
         if not self.backend.is_demo:
@@ -659,14 +750,131 @@ class PrismEngine:
             if self.journal.has_pending_recovery() or self._prehidden_minimized or self._hidden_for_anim:
                 self.restore_all_os_state()
 
+    def on_system_suspend(self) -> None:
+        """Immediately release all hidden/pre-hidden/wobble-hidden windows before system sleep or session lock."""
+        if self._drag_hwnd:
+            drag_h = self._drag_hwnd
+            was_wob = self._drag_wobble_started
+            was_mutated = self._drag_alpha_mutated
+            drag_orig_a = self._drag_orig_alpha
+            drag_had_l = self._drag_had_layered
+            self._drag_hwnd = 0
+            self._drag_wobble_started = False
+            self._drag_alpha_mutated = False
+            self._drag_unsafe_layered = False
+            self._drag_lbutton_up_since = 0.0
+            if self._hook_tid:
+                try:
+                    w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
+                except Exception:
+                    pass
+            if (not was_wob) and was_mutated:
+                if self.backend.is_valid_window(drag_h):
+                    self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
+                self.journal.record_alpha(drag_h, None)
+            if was_wob and self.on_wobbly_end:
+                try:
+                    self.on_wobbly_end(drag_h, 0, 0, True)
+                except Exception:
+                    pass
+        self._momentum = None
+        if self._momentum_wobble_hwnd:
+            mw_h = self._momentum_wobble_hwnd
+            self._momentum_wobble_hwnd = 0
+            if self.on_wobbly_end:
+                try:
+                    self.on_wobbly_end(mw_h, 0, 0, True)
+                except Exception:
+                    pass
+        self._wobble_live_pos = None
+        self._armed_precover = None
+        if self._active_precover_hwnd:
+            self._cancel_active_precover()
+
+        with self._hidden_lock:
+            hidden_items = list(self._hidden_for_anim.items())
+            self._hidden_for_anim.clear()
+            wobble_items = list(self._hidden_for_wobble.items())
+            self._hidden_for_wobble.clear()
+            pre_min_items = list(self._prehidden_minimized.items())
+            self._prehidden_minimized.clear()
+            pre_crt_items = list(self._prehidden_creating.items())
+            self._prehidden_creating.clear()
+            po_items = list(self._pending_opens.values())
+            self._pending_opens.clear()
+            pm_items = list(self._pending_morphs.values())
+            self._pending_morphs.clear()
+            self._pending_prehide.clear()
+            self._prehidden_uniconic_since.clear()
+
+        restored_set: set[int] = set()
+        for hwnd, (orig_a, _ts, had_layered) in hidden_items:
+            restored_set.add(hwnd)
+            if self.backend.is_valid_window(hwnd):
+                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            self.journal.record_alpha(hwnd, None)
+        for hwnd, (orig_a, _ts, had_layered) in wobble_items:
+            restored_set.add(hwnd)
+            if self.backend.is_valid_window(hwnd):
+                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            self.journal.record_alpha(hwnd, None)
+        for hwnd, (orig_a, had_layered) in pre_min_items:
+            restored_set.add(hwnd)
+            if self.backend.is_valid_window(hwnd):
+                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+            self.journal.record_alpha(hwnd, None)
+        for hwnd, (_created, _vis, had_layered) in pre_crt_items:
+            restored_set.add(hwnd)
+            if self.backend.is_valid_window(hwnd):
+                self.backend.set_window_hidden_alpha(hwnd, False, 255, had_layered=had_layered)
+            self.journal.record_alpha(hwnd, None)
+        for po in po_items:
+            if po.hwnd not in restored_set:
+                restored_set.add(po.hwnd)
+                if self.backend.is_valid_window(po.hwnd):
+                    self.backend.set_window_hidden_alpha(po.hwnd, False, po.orig_alpha, had_layered=po.had_layered)
+                self.journal.record_alpha(po.hwnd, None)
+        for pm in pm_items:
+            if pm.hwnd not in restored_set:
+                restored_set.add(pm.hwnd)
+                if self.backend.is_valid_window(pm.hwnd):
+                    self.backend.set_window_hidden_alpha(pm.hwnd, False, pm.orig_alpha, had_layered=pm.had_layered)
+                self.journal.record_alpha(pm.hwnd, None)
+
+        self._clear_inactive_fades()
+        self._update_spotlight_state(force_off=True)
+        self._publish_frame()
+
+    def on_system_resume_or_display_change(self) -> None:
+        """Reset stale timestamps, flush cached captures, and refresh monitor topology after wake/display change."""
+        now = time.perf_counter()
+        self._last_bg_scan = 0.0
+        self._last_cloak_ts = 0.0
+        self._recent_uncloak_times.clear()
+        self._armed_precover = None
+        with self._state_lock:
+            self._last_trigger_info.clear()
+            for h in list(self._last_active_time):
+                self._last_active_time[h] = now
+        with self._cache_lock:
+            self._cached_captures.clear()
+            self._pending_cache_hwnds.clear()
+        self._cached_paused_reason = self.paused_reason()
+        self.backend.list_monitors()
+        self._publish_frame()
+
     def restore_all_os_state(self) -> int:
         """Emergency & shutdown restoration via Crash Recovery Journal."""
-        self._faded_hwnds.clear()
-        self._rolled_up.clear()
-        self._pinned.clear()
+        with self._state_lock:
+            self._faded_hwnds.clear()
+            self._custom_opacity_orig.clear()
+            self._rolled_up.clear()
+            self._pinned.clear()
         self._suppressed_min_anim = False
         self._drag_hwnd = 0
         self._drag_wobble_started = False
+        self._drag_alpha_mutated = False
+        self._drag_unsafe_layered = False
         self._momentum_wobble_hwnd = 0
         self._wobble_live_pos = None
         with self._hidden_lock:
@@ -676,67 +884,134 @@ class PrismEngine:
             self._hidden_for_wobble.clear()
             pre_min_items = list(self._prehidden_minimized.items())
             self._prehidden_minimized.clear()
-            pre_crt_items = list(self._prehidden_creating.keys())
+            pre_crt_items = list(self._prehidden_creating.items())
             self._prehidden_creating.clear()
             self._pending_opens.clear()
             self._pending_morphs.clear()
             self._pending_prehide.clear()
-        for hwnd, (orig_a, _ts) in hidden_items:
+        for hwnd, (orig_a, _ts, had_layered) in hidden_items:
             if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, orig_a)
-        for hwnd, (orig_a, _ts) in wobble_items:
+                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+        for hwnd, (orig_a, _ts, had_layered) in wobble_items:
             if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, orig_a)
-        for hwnd, orig_a in pre_min_items:
+                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+        for hwnd, (orig_a, had_layered) in pre_min_items:
             if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, orig_a)
-        for hwnd in pre_crt_items:
+                self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
+        for hwnd, (_created, _vis, had_layered) in pre_crt_items:
             if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_hidden_alpha(hwnd, False, 255)
+                self.backend.set_window_hidden_alpha(hwnd, False, 255, had_layered=had_layered)
 
         count = self.journal.restore_all(
             uncloak_fn=lambda h: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_cloaked(h, False)),
             restore_alpha_fn=lambda h, a: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_hidden_alpha(h, False, a)),
+            restore_alpha_layered_fn=lambda h, a, hl: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_hidden_alpha(h, False, a, had_layered=hl)),
             unpin_fn=lambda h: True if not self.backend.is_valid_window(h) else bool(self.backend.set_window_topmost(h, False)),
             unroll_fn=self._restore_window_height,
             show_desktop_icons_fn=lambda: bool(self.backend.set_desktop_icons_visible(True)),
             restore_min_animate_fn=lambda orig: bool(self.backend.set_native_min_animate(orig)),
+            verify_window_fn=self._verify_journal_mutation,
         )
         self.last_restore_failed_count = self.journal.last_restore_failed_count
         self._publish_frame()
         return count
 
-    def finish_hidden_handoff(self, hwnd: int, restore_alpha: int = 255) -> None:
+    def finish_hidden_handoff(
+        self, hwnd: int, restore_alpha: int = 255, had_layered: Optional[bool] = None
+    ) -> None:
         """Called by overlay on the final opaque frame BEFORE hiding overlay -> zero flash!"""
         with self._hidden_lock:
             entry = self._hidden_for_anim.pop(hwnd, None)
-            self._pending_opens.pop(hwnd, None)
-            self._pending_morphs.pop(hwnd, None)
-            self._prehidden_minimized.pop(hwnd, None)
-            self._prehidden_creating.pop(hwnd, None)
+            po_entry = self._pending_opens.pop(hwnd, None)
+            pm_entry = self._pending_morphs.pop(hwnd, None)
+            pre_min = self._prehidden_minimized.pop(hwnd, None)
+            pre_crt = self._prehidden_creating.pop(hwnd, None)
         alpha = entry[0] if entry is not None else restore_alpha
+        hl = had_layered
+        if hl is None:
+            if entry is not None:
+                hl = entry[2]
+            elif po_entry is not None:
+                hl = po_entry.had_layered
+            elif pm_entry is not None:
+                hl = pm_entry.had_layered
+            elif pre_min is not None:
+                hl = pre_min[1]
+            elif pre_crt is not None:
+                hl = pre_crt[2]
+            else:
+                mut = self.journal.get_mutation(hwnd)
+                hl = mut.had_layered if mut is not None else None
         if self.backend.is_valid_window(hwnd):
-            self.backend.set_window_hidden_alpha(hwnd, False, alpha)
+            self.backend.set_window_hidden_alpha(hwnd, False, alpha, had_layered=hl)
         self.journal.record_alpha(hwnd, None)
         self.backend.dwm_flush()
         # Queue a background cache refresh now that the restored/opened window is visible & crisp
         if hwnd:
-            self._pending_cache_hwnds.add(hwnd)
+            with self._cache_lock:
+                self._pending_cache_hwnds.add(hwnd)
 
-    def hide_window_for_wobble(self, hwnd: int, orig_alpha: int = 255) -> bool:
+    def hide_window_for_wobble(
+        self, hwnd: int, orig_alpha: int = 255, had_layered: Optional[bool] = None
+    ) -> bool:
         """Hide real window at alpha=0 AFTER Frame-0 wobbly overlay is live -> 0 ms flash on drag start!"""
         if self.backend.is_demo or not hwnd or not self.backend.is_valid_window(hwnd):
             return False
-        alpha = max(20, min(255, int(orig_alpha))) if orig_alpha > 0 else 255
-        self.journal.record_alpha(hwnd, alpha)
+        with self._hidden_lock:
+            existing = self._hidden_for_wobble.get(hwnd)
+        if existing is not None:
+            with self._hidden_lock:
+                self._hidden_for_wobble[hwnd] = (existing[0], time.perf_counter(), existing[2])
+            return True
+        with self._state_lock:
+            faded_entry = self._faded_hwnds.pop(hwnd, None)
+        hl_state, cur_alpha = self.backend.get_window_layered_state(hwnd)
+        if cur_alpha is None:
+            if faded_entry is not None:
+                with self._state_lock:
+                    self._faded_hwnds[hwnd] = faded_entry
+            return False  # Per-pixel ULW / ColorKey window: do NOT mutate!
+        if had_layered is None:
+            if hwnd == self._drag_hwnd:
+                if self._drag_unsafe_layered:
+                    if faded_entry is not None:
+                        with self._state_lock:
+                            self._faded_hwnds[hwnd] = faded_entry
+                    return False
+                hl = self._drag_had_layered
+            elif faded_entry is not None:
+                hl = faded_entry[1]
+            else:
+                hl = hl_state
+        else:
+            hl = bool(had_layered)
+        if hwnd == self._drag_hwnd and self._drag_orig_alpha > 0:
+            alpha = max(20, min(255, int(self._drag_orig_alpha)))
+        elif faded_entry is not None:
+            if orig_alpha != 255 and orig_alpha > 0:
+                alpha = max(20, min(255, int(orig_alpha)))
+            else:
+                alpha = max(20, min(255, int(faded_entry[0])))
+        elif orig_alpha == 255 and cur_alpha >= 20:
+            alpha = max(20, min(255, int(cur_alpha)))
+        else:
+            alpha = max(20, min(255, int(orig_alpha))) if orig_alpha > 0 else 255
+        pid, cls_name, boot_ms = self._window_identity(hwnd)
+        self.journal.record_alpha(hwnd, alpha, had_layered=hl, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms)
         if self.backend.set_window_hidden_alpha(hwnd, True):
             with self._hidden_lock:
-                self._hidden_for_wobble[hwnd] = (alpha, time.perf_counter())
+                self._hidden_for_wobble[hwnd] = (alpha, time.perf_counter(), hl)
             return True
-        self.journal.record_alpha(hwnd, None)
+        if faded_entry is not None:
+            with self._state_lock:
+                self._faded_hwnds[hwnd] = faded_entry
+        else:
+            self.journal.record_alpha(hwnd, None)
         return False
 
-    def finish_wobble_handoff(self, hwnd: int, restore_alpha: int = 255) -> None:
+    def finish_wobble_handoff(
+        self, hwnd: int, restore_alpha: int = 255, had_layered: Optional[bool] = None
+    ) -> None:
         """Called by overlay after jelly settles & flat opaque Frame is presented -> 0 ms handoff!"""
         with self._hidden_lock:
             entry = self._hidden_for_wobble.pop(hwnd, None)
@@ -744,12 +1019,20 @@ class PrismEngine:
         if claimed_by_morph:
             return
         alpha = entry[0] if entry is not None else restore_alpha
+        hl = had_layered
+        if hl is None:
+            if entry is not None:
+                hl = entry[2]
+            else:
+                mut = self.journal.get_mutation(hwnd)
+                hl = mut.had_layered if mut is not None else None
         if self.backend.is_valid_window(hwnd):
-            self.backend.set_window_hidden_alpha(hwnd, False, alpha)
+            self.backend.set_window_hidden_alpha(hwnd, False, alpha, had_layered=hl)
         self.journal.record_alpha(hwnd, None)
         self.backend.dwm_flush()
         if hwnd:
-            self._pending_cache_hwnds.add(hwnd)
+            with self._cache_lock:
+                self._pending_cache_hwnds.add(hwnd)
 
     def _restore_window_height(self, hwnd: int, orig_h: int) -> bool:
         if not self.backend.is_valid_window(hwnd):
@@ -767,13 +1050,15 @@ class PrismEngine:
         if not info:
             return False
         new_state = not info.topmost
-        self.journal.record_pin(hwnd, new_state)
+        pid, cls_name, boot_ms = self._window_identity(hwnd, info)
+        self.journal.record_pin(hwnd, new_state, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms)
         ok = self.backend.set_window_topmost(hwnd, new_state)
         if ok:
-            if new_state:
-                self._pinned.add(hwnd)
-            else:
-                self._pinned.discard(hwnd)
+            with self._state_lock:
+                if new_state:
+                    self._pinned.add(hwnd)
+                else:
+                    self._pinned.discard(hwnd)
         self._publish_frame()
         return new_state
 
@@ -781,27 +1066,55 @@ class PrismEngine:
         info = self.backend.get_window_info(hwnd)
         if not info:
             return False
+        had_layered, cur_alpha = self.backend.get_window_layered_state(hwnd)
+        if cur_alpha is None:
+            return False
         alpha = max(35, min(255, int(round(opacity_pct * 2.55))))
-        if alpha < 255:
-            self.journal.record_alpha(hwnd, info.opacity)
+        with self._state_lock:
+            existing_orig = self._custom_opacity_orig.get(hwnd)
+        if existing_orig is not None:
+            orig_alpha, orig_had_layered = existing_orig
         else:
+            orig_alpha, orig_had_layered = cur_alpha, had_layered
+        if alpha < 255:
+            pid, cls_name, boot_ms = self._window_identity(hwnd, info)
+            self.journal.record_alpha(
+                hwnd, orig_alpha, had_layered=orig_had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+            )
+            ok = self.backend.set_window_opacity(hwnd, alpha, had_layered=orig_had_layered)
+            if ok:
+                with self._state_lock:
+                    self._custom_opacity_orig[hwnd] = (orig_alpha, orig_had_layered)
+            else:
+                with self._state_lock:
+                    has_orig = hwnd in self._custom_opacity_orig
+                if not has_orig:
+                    self.journal.record_alpha(hwnd, None)
+            return ok
+        ok = self.backend.set_window_opacity(hwnd, alpha, had_layered=orig_had_layered)
+        if ok:
+            with self._state_lock:
+                self._custom_opacity_orig.pop(hwnd, None)
             self.journal.record_alpha(hwnd, None)
-        return self.backend.set_window_opacity(hwnd, alpha)
+        return ok
 
     def toggle_rollup_window(self, hwnd: int) -> bool:
         info = self.backend.get_window_info(hwnd)
         if not info:
             return False
-        if hwnd in self._rolled_up:
-            orig_h = self._rolled_up.pop(hwnd)
+        with self._state_lock:
+            orig_h = self._rolled_up.pop(hwnd, None)
+        if orig_h is not None:
             self.journal.record_rollup(hwnd, False)
             self.backend.move_resize_window(hwnd, info.x, info.y, info.w, orig_h)
             self._publish_frame()
             return False
         if info.h <= 56:
             return False
-        self._rolled_up[hwnd] = info.h
-        self.journal.record_rollup(hwnd, True, info.h)
+        with self._state_lock:
+            self._rolled_up[hwnd] = info.h
+        pid, cls_name, boot_ms = self._window_identity(hwnd, info)
+        self.journal.record_rollup(hwnd, True, info.h, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms)
         self.backend.move_resize_window(hwnd, info.x, info.y, info.w, 38)
         self._publish_frame()
         return True
@@ -832,7 +1145,8 @@ class PrismEngine:
             f_rect = from_rect_override if (from_rect_override and from_rect_override[2] >= 40) else (info.x, info.y, info.w, info.h)
             f_cap = from_cap_override
             if f_cap is None:
-                cached = self._cached_captures.get(hwnd)
+                with self._cache_lock:
+                    cached = self._cached_captures.get(hwnd)
                 if cached and abs(cached[0] - f_rect[2]) <= 16 and abs(cached[1] - f_rect[3]) <= 16:
                     f_cap = (cached[0], cached[1], cached[2])
                 else:
@@ -861,9 +1175,25 @@ class PrismEngine:
         info = self.backend.get_window_info(hwnd)
         if not info:
             return False
-        self._tiled.add(hwnd)
+        cap: Optional[tuple[int, int, bytes]] = None
+        with self._cache_lock:
+            cached = self._cached_captures.get(hwnd)
+        if (
+            cached is not None
+            and abs(cached[0] - info.w) <= 16
+            and abs(cached[1] - info.h) <= 16
+        ):
+            cap = (cached[0], cached[1], cached[2])
+        else:
+            fresh = self.backend.capture_window_bgra(hwnd)
+            if fresh is not None:
+                cap = fresh
+            elif cached is not None:
+                cap = (cached[0], cached[1], cached[2])
+        with self._state_lock:
+            self._tiled.add(hwnd)
         try:
-            self.tile_requests.put_nowait(info)
+            self.tile_requests.put_nowait(TileRequest(info=info, capture=cap))
         except queue.Full:
             pass
         self.backend.minimize_window(hwnd)
@@ -871,7 +1201,8 @@ class PrismEngine:
         return True
 
     def restore_from_tile(self, hwnd: int) -> None:
-        self._tiled.discard(hwnd)
+        with self._state_lock:
+            self._tiled.discard(hwnd)
         self.backend.restore_window(hwnd)
         self._publish_frame()
 
@@ -901,7 +1232,8 @@ class PrismEngine:
         # MINIMIZESTART+OBJECT_HIDE duplicates, while allowing instant Minimize <-> Restore toggles!
         now = time.perf_counter()
         if trigger != "preview":
-            prev_trig, last_t = self._last_trigger_info.get(hwnd, ("", 0.0))
+            with self._state_lock:
+                prev_trig, last_t = self._last_trigger_info.get(hwnd, ("", 0.0))
             same_dir = (
                 (trigger in ("open", "restore") and prev_trig in ("open", "restore"))
                 or (trigger in ("minimize", "close") and prev_trig in ("minimize", "close"))
@@ -935,10 +1267,12 @@ class PrismEngine:
             return None
 
         reverse = reverse_override if reverse_override is not None else (trigger in ("open", "restore"))
-        cached = self._cached_captures.get(hwnd)
+        with self._cache_lock:
+            cached = self._cached_captures.get(hwnd)
         cap_data: Optional[tuple[int, int, bytes]] = None
         rect: Optional[tuple[int, int, int, int]] = None
         hidden_orig_alpha = 255
+        hidden_had_layered: Optional[bool] = None
         did_hide = False
 
         # ======================================================================
@@ -959,29 +1293,42 @@ class PrismEngine:
             # Claim pre-hidden window (0 ms pre-animation flash!) OR immediately hide at alpha=0
             if should_hide_real and self.backend.is_valid_window(hwnd):
                 pre_orig: Optional[int] = None
+                pre_hl: bool = False
                 with self._hidden_lock:
                     self._pending_prehide.pop(hwnd, None)
                     if hwnd in self._prehidden_minimized:
-                        pre_orig = self._prehidden_minimized.pop(hwnd)
+                        pre_orig, pre_hl = self._prehidden_minimized.pop(hwnd)
                         self._prehidden_creating.pop(hwnd, None)
                     elif hwnd in self._prehidden_creating:
-                        self._prehidden_creating.pop(hwnd, None)
+                        crt_entry = self._prehidden_creating.pop(hwnd, None)
                         pre_orig = 255
+                        pre_hl = crt_entry[2] if crt_entry is not None else False
                     if pre_orig is not None:
                         hidden_orig_alpha = pre_orig
+                        hidden_had_layered = pre_hl
                         did_hide = True
-                        self._hidden_for_anim[hwnd] = (hidden_orig_alpha, now)
+                        self._hidden_for_anim[hwnd] = (hidden_orig_alpha, now, pre_hl)
 
                 if not did_hide:
                     pre_info = self.backend.get_window_info(hwnd)
                     if not pre_info or self.is_excluded(pre_info):
                         return None
-                    hidden_orig_alpha = max(20, pre_info.opacity) if pre_info.opacity > 0 else 255
-                    self.journal.record_alpha(hwnd, hidden_orig_alpha)
+                    had_layered, cur_alpha = self.backend.get_window_layered_state(hwnd)
+                    if cur_alpha is None or cur_alpha == 0:
+                        return None
+                    hidden_orig_alpha = max(20, cur_alpha) if cur_alpha > 0 else 255
+                    hidden_had_layered = had_layered
+                    pid, cls_name, boot_ms = self._window_identity(hwnd, pre_info)
+                    self.journal.record_alpha(
+                        hwnd, hidden_orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+                    )
                     if self.backend.set_window_hidden_alpha(hwnd, True):
                         did_hide = True
                         with self._hidden_lock:
-                            self._hidden_for_anim[hwnd] = (hidden_orig_alpha, now)
+                            self._hidden_for_anim[hwnd] = (hidden_orig_alpha, now, had_layered)
+                    else:
+                        self.journal.record_alpha(hwnd, None)
+                        return None
 
                 # Only wait if window is STILL reporting minimized (-32000) coordinates (0 ms when ready!)
                 info = self.backend.get_window_info(hwnd)
@@ -997,7 +1344,7 @@ class PrismEngine:
             if info and info.w >= 40 and info.h >= 40 and info.x > -10000 and not info.minimized:
                 if trigger != "preview" and self.is_excluded(info):
                     if did_hide:
-                        self.finish_hidden_handoff(hwnd, hidden_orig_alpha)
+                        self.finish_hidden_handoff(hwnd, hidden_orig_alpha, had_layered=hidden_had_layered)
                     else:
                         self._unhide_if_prehidden(hwnd)
                     return None
@@ -1014,12 +1361,12 @@ class PrismEngine:
                 elif trigger in ("minimize", "close") and cached is not None:
                     cap_data = (cached[0], cached[1], cached[2])
                 else:
-                    fresh = self.backend.capture_window_bgra(hwnd)
+                    fresh = self.backend.capture_window_bgra(hwnd, allow_screen_fallback=not did_hide)
                     # Brand-new pre-hidden windows occasionally need 8-24ms to paint their very first frame
                     if trigger == "open" and did_hide and (not fresh or _is_mostly_blank_bgra(fresh[2])):
                         for _ in range(3):
                             time.sleep(0.008)
-                            fresh = self.backend.capture_window_bgra(hwnd)
+                            fresh = self.backend.capture_window_bgra(hwnd, allow_screen_fallback=False)
                             if fresh and not _is_mostly_blank_bgra(fresh[2]):
                                 break
                     if fresh and not _is_mostly_blank_bgra(fresh[2]):
@@ -1037,12 +1384,13 @@ class PrismEngine:
 
         if cap_data is None or rect is None or rect[2] < 40 or rect[3] < 40:
             if did_hide:
-                self.finish_hidden_handoff(hwnd, hidden_orig_alpha)
+                self.finish_hidden_handoff(hwnd, hidden_orig_alpha, had_layered=hidden_had_layered)
             else:
                 self._unhide_if_prehidden(hwnd)
             return None
 
-        self._last_trigger_info[hwnd] = (trigger, now)
+        with self._state_lock:
+            self._last_trigger_info[hwnd] = (trigger, now)
         img_w, img_h, raw_bytes = cap_data
         # Refresh cache with clean capture for future close/minimize/restore (skip preview on excluded)
         if trigger != "preview" and not _is_mostly_blank_bgra(raw_bytes):
@@ -1100,7 +1448,7 @@ class PrismEngine:
                 self.animation_queue.put_nowait(job)
             except Exception:
                 if did_hide:
-                    self.finish_hidden_handoff(hwnd, hidden_orig_alpha)
+                    self.finish_hidden_handoff(hwnd, hidden_orig_alpha, had_layered=hidden_had_layered)
 
         if self._active_precover_hwnd == hwnd and trigger in ("minimize", "close"):
             self._active_precover_hwnd = 0
@@ -1119,7 +1467,9 @@ class PrismEngine:
         PrismFX-OpenStager so slow WinUI 3 / XAML / Explorer / UWP / Chromium apps NEVER flash
         full-screen before animating and NEVER get dropped after 24 ms!
         """
-        if self.backend.is_demo or not hwnd or not self._trigger_enabled(trigger):
+        with self._state_lock:
+            is_own = hwnd in self._own_hwnds
+        if self.backend.is_demo or not hwnd or is_own or not self._trigger_enabled(trigger):
             return False
         if not self.config.enabled or self._cached_paused_reason:
             return False
@@ -1127,7 +1477,8 @@ class PrismEngine:
             return False
 
         now = time.perf_counter()
-        prev_trig, last_t = self._last_trigger_info.get(hwnd, ("", 0.0))
+        with self._state_lock:
+            prev_trig, last_t = self._last_trigger_info.get(hwnd, ("", 0.0))
         if prev_trig in ("open", "restore", "popup") and (now - last_t) < 0.45:
             self._unhide_if_prehidden(hwnd)
             return False
@@ -1147,43 +1498,55 @@ class PrismEngine:
             pre_entry = self._prehidden_creating.pop(hwnd, None)
             if pre_entry is not None:
                 orig_alpha = 255
-                self._hidden_for_anim[hwnd] = (orig_alpha, now)
+                had_layered = pre_entry[2]
+                self._hidden_for_anim[hwnd] = (orig_alpha, now, had_layered)
                 self._pending_opens[hwnd] = _PendingOpen(
                     hwnd=hwnd,
                     trigger=trigger,
                     enqueued_at=now,
                     orig_alpha=orig_alpha,
+                    had_layered=had_layered,
                     was_cloaked=is_cloaked,
                     first_uncloaked_at=(0.0 if is_cloaked else now),
                 )
                 self._open_wake.set()
                 return True
 
-        # Not pre-hidden yet -> verify exclusion BEFORE touching WS_EX_LAYERED on games/OBS/overlays!
+        # Not pre-hidden yet -> verify exclusion BEFORE touching WS_EX_LAYERED on protected/overlay/game windows!
         pid, exe, _ = w32.get_process_info(hwnd)
         if self.own_pid and pid == self.own_pid:
             return False
         cls_chk = w32.get_class_name(hwnd)
+        if is_protected_window_class(cls_chk):
+            return False
+        if self.backend.is_overlay_window(hwnd):
+            return False
         low_exe = exe.lower()
         if low_exe and any(e.lower() == low_exe for e in self.config.safety.excluded_exes):
             return False
         if self.config.safety.auto_exclude_games and classify_app(exe, cls_chk).recommended_exclude:
             return False
 
+        had_layered, cur_alpha = self.backend.get_window_layered_state(hwnd)
+        if cur_alpha is None or cur_alpha == 0:
+            return False
+
         # Hide IMMEDIATELY before DWM composites its next frame!
-        cur_alpha = w32.get_window_opacity(hwnd)
         orig_alpha = max(20, cur_alpha) if cur_alpha > 0 else 255
-        self.journal.record_alpha(hwnd, orig_alpha)
+        self.journal.record_alpha(
+            hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_chk, boot_tick_ms=w32.get_boot_tick_ms()
+        )
         if not self.backend.set_window_hidden_alpha(hwnd, True):
             self.journal.record_alpha(hwnd, None)
             return False
         with self._hidden_lock:
-            self._hidden_for_anim[hwnd] = (orig_alpha, now)
+            self._hidden_for_anim[hwnd] = (orig_alpha, now, had_layered)
             self._pending_opens[hwnd] = _PendingOpen(
                 hwnd=hwnd,
                 trigger=trigger,
                 enqueued_at=now,
                 orig_alpha=orig_alpha,
+                had_layered=had_layered,
                 was_cloaked=is_cloaked,
                 first_uncloaked_at=(0.0 if is_cloaked else now),
             )
@@ -1195,7 +1558,7 @@ class PrismEngine:
     ) -> Optional[AnimationJob]:
         tc = self.config.triggers.get(po.trigger) or self.config.triggers["open"]
         if not tc.enabled or tc.effect_id == "none":
-            self.finish_hidden_handoff(po.hwnd, po.orig_alpha)
+            self.finish_hidden_handoff(po.hwnd, po.orig_alpha, had_layered=po.had_layered)
             return None
         eid = tc.effect_id
         if eid == "random":
@@ -1203,13 +1566,14 @@ class PrismEngine:
             eid = self._rng.choice(pool) if pool else "prism_glide"
         spec = self.registry.get(eid)
         if spec.shader_id <= 0:
-            self.finish_hidden_handoff(po.hwnd, po.orig_alpha)
+            self.finish_hidden_handoff(po.hwnd, po.orig_alpha, had_layered=po.had_layered)
             return None
 
         rect = (info.x, info.y, info.w, info.h)
         img_w, img_h, raw_bytes = cap_data
-        self._last_trigger_info[po.hwnd] = (po.trigger, now)
-        self._known_visible_hwnds.add(po.hwnd)
+        with self._state_lock:
+            self._last_trigger_info[po.hwnd] = (po.trigger, now)
+            self._known_visible_hwnds.add(po.hwnd)
         if not _is_mostly_blank_bgra(raw_bytes):
             self._store_cached_capture(po.hwnd, img_w, img_h, raw_bytes, rect, now)
 
@@ -1253,7 +1617,7 @@ class PrismEngine:
                     self.finish_hidden_handoff(dropped.restore_hidden_hwnd, dropped.restore_alpha)
                 self.animation_queue.put_nowait(job)
             except Exception:
-                self.finish_hidden_handoff(po.hwnd, po.orig_alpha)
+                self.finish_hidden_handoff(po.hwnd, po.orig_alpha, had_layered=po.had_layered)
                 return None
 
         if self.on_animation_queued:
@@ -1285,6 +1649,24 @@ class PrismEngine:
             return False
 
         now = time.perf_counter()
+        with self._hidden_lock:
+            wob_entry = self._hidden_for_wobble.get(hwnd)
+            anim_entry = self._hidden_for_anim.get(hwnd)
+        if wob_entry is not None:
+            orig_alpha = wob_entry[0]
+            had_layered = wob_entry[2]
+            already_hidden = True
+        elif anim_entry is not None:
+            orig_alpha = anim_entry[0]
+            had_layered = anim_entry[2]
+            already_hidden = True
+        else:
+            had_layered, cur_a = self.backend.get_window_layered_state(hwnd)
+            if cur_a is None or cur_a == 0:
+                return False
+            orig_alpha = max(20, cur_a) if cur_a > 0 else 255
+            already_hidden = False
+
         if stamp_precover and self.on_precover_show:
             pjob = PreCoverJob(
                 hwnd=hwnd,
@@ -1304,22 +1686,11 @@ class PrismEngine:
             except Exception:
                 self._active_precover_hwnd = 0
 
-        with self._hidden_lock:
-            wob_entry = self._hidden_for_wobble.get(hwnd)
-            anim_entry = self._hidden_for_anim.get(hwnd)
-        if wob_entry is not None:
-            orig_alpha = wob_entry[0]
-            already_hidden = True
-        elif anim_entry is not None:
-            orig_alpha = anim_entry[0]
-            already_hidden = True
-        else:
-            cur_a = w32.get_window_opacity(hwnd)
-            orig_alpha = max(20, cur_a) if cur_a > 0 else 255
-            already_hidden = False
-
         if not already_hidden:
-            self.journal.record_alpha(hwnd, orig_alpha)
+            pid, cls_name, boot_ms = self._window_identity(hwnd)
+            self.journal.record_alpha(
+                hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+            )
             if not self.backend.set_window_hidden_alpha(hwnd, True):
                 self.journal.record_alpha(hwnd, None)
                 if self._active_precover_hwnd == hwnd:
@@ -1327,13 +1698,14 @@ class PrismEngine:
                 return False
 
         with self._hidden_lock:
-            self._hidden_for_anim[hwnd] = (orig_alpha, now)
+            self._hidden_for_anim[hwnd] = (orig_alpha, now, had_layered)
             self._pending_morphs[hwnd] = _PendingMorph(
                 hwnd=hwnd,
                 from_rect=from_rect,
                 from_cap=from_cap,
                 enqueued_at=now,
                 orig_alpha=orig_alpha,
+                had_layered=had_layered,
                 to_rect=already_changed_to,
                 target_changed_at=(now if already_changed_to is not None else 0.0),
                 already_changed=(already_changed_to is not None),
@@ -1347,7 +1719,7 @@ class PrismEngine:
         if self._active_precover_hwnd == hwnd:
             self._cancel_active_precover()
         if pm is not None:
-            self.finish_hidden_handoff(hwnd, pm.orig_alpha)
+            self.finish_hidden_handoff(hwnd, pm.orig_alpha, had_layered=pm.had_layered)
 
     def _emit_morph_job(
         self,
@@ -1385,158 +1757,169 @@ class PrismEngine:
                 return mjob
             except Exception:
                 pass
-        self.finish_hidden_handoff(pm.hwnd, pm.orig_alpha)
+        self.finish_hidden_handoff(pm.hwnd, pm.orig_alpha, had_layered=pm.had_layered)
         return None
 
     def _open_stager_loop(self) -> None:
         """0%-idle background worker staging newly opened windows AND smooth maximize/snap morphs."""
         while not self._stop_event.is_set():
-            with self._hidden_lock:
-                pending_list = list(self._pending_opens.values())
-                morph_list = list(self._pending_morphs.values())
-            if not pending_list and not morph_list:
-                self._open_wake.wait(timeout=0.4)
+            try:
                 self._open_wake.clear()
-                continue
-
-            now = time.perf_counter()
-            for pm in morph_list:
-                hwnd = pm.hwnd
-                if (
-                    not self.config.enabled
-                    or self._cached_paused_reason
-                    or not self.backend.is_valid_window(hwnd)
-                    or w32.user32.IsIconic(hwnd)
-                ):
-                    self._cancel_morph_for_hwnd(hwnd)
+                with self._hidden_lock:
+                    pending_list = list(self._pending_opens.values())
+                    morph_list = list(self._pending_morphs.values())
+                if not pending_list and not morph_list:
+                    self._open_wake.wait(timeout=0.4)
                     continue
 
-                cur = w32.get_extended_frame_bounds(hwnd)
-                if cur[2] < 40 or cur[3] < 40 or cur[0] <= -10000:
-                    if (now - pm.enqueued_at) >= 0.14:
+                now = time.perf_counter()
+                for pm in morph_list:
+                    hwnd = pm.hwnd
+                    if (
+                        not self.config.enabled
+                        or self._cached_paused_reason
+                        or not self.backend.is_valid_window(hwnd)
+                        or w32.user32.IsIconic(hwnd)
+                    ):
                         self._cancel_morph_for_hwnd(hwnd)
-                    continue
+                        continue
 
-                if pm.to_rect is None:
-                    fx, fy, fw, fh = pm.from_rect
-                    changed = (
-                        abs(cur[2] - fw) >= 24
-                        or abs(cur[3] - fh) >= 24
-                        or abs(cur[0] - fx) >= 40
-                        or abs(cur[1] - fy) >= 40
-                    )
-                    if not changed:
-                        # If the click didn't actually resize/maximize within 130 ms, cancel cleanly!
-                        if (now - pm.enqueued_at) >= 0.13:
+                    cur = w32.get_extended_frame_bounds(hwnd)
+                    if cur[2] < 40 or cur[3] < 40 or cur[0] <= -10000:
+                        if (now - pm.enqueued_at) >= 0.14:
                             self._cancel_morph_for_hwnd(hwnd)
                         continue
-                    pm.to_rect = cur
-                    pm.target_changed_at = now
-                    continue
 
-                # If geometry stepped once more (e.g. restore + move), adopt latest rect
-                if cur != pm.to_rect:
-                    pm.to_rect = cur
-                    pm.target_changed_at = now
-                    continue
-
-                since_change = now - pm.target_changed_at
-                # Capture crisp destination layout (give UWP/XAML ~20-90 ms to reflow!)
-                fresh = self.backend.capture_window_bgra(hwnd) if since_change >= 0.015 else None
-                is_blank, is_uniform = _analyze_bgra_readiness(fresh[2]) if fresh else (True, True)
-                dest_ready = (fresh is not None) and (
-                    (not is_blank and not is_uniform)
-                    or (not is_blank and is_uniform and since_change >= 0.08)
-                )
-                if dest_ready or since_change >= 0.12:
-                    with self._hidden_lock:
-                        if hwnd not in self._pending_morphs:
+                    if pm.to_rect is None:
+                        fx, fy, fw, fh = pm.from_rect
+                        changed = (
+                            abs(cur[2] - fw) >= 24
+                            or abs(cur[3] - fh) >= 24
+                            or abs(cur[0] - fx) >= 40
+                            or abs(cur[1] - fy) >= 40
+                        )
+                        if not changed:
+                            # If the click didn't actually resize/maximize within 130 ms, cancel cleanly!
+                            if (now - pm.enqueued_at) >= 0.13:
+                                self._cancel_morph_for_hwnd(hwnd)
                             continue
-                        self._pending_morphs.pop(hwnd, None)
-                        self._hidden_for_anim[hwnd] = (pm.orig_alpha, now)
-                    to_cap = fresh if (fresh is not None and not is_blank) else None
-                    self._emit_morph_job(pm, pm.to_rect, to_cap, now)
-
-            for po in pending_list:
-                hwnd = po.hwnd
-                if (
-                    not self.config.enabled
-                    or self._cached_paused_reason
-                    or not self.backend.is_valid_window(hwnd)
-                    or w32.user32.IsIconic(hwnd)
-                ):
-                    self.finish_hidden_handoff(hwnd, po.orig_alpha)
-                    continue
-
-                if w32.is_window_cloaked(hwnd):
-                    if (now - po.enqueued_at) >= 0.75:
-                        self.finish_hidden_handoff(hwnd, po.orig_alpha)
-                    continue
-
-                if po.first_uncloaked_at <= 0.0:
-                    po.first_uncloaked_at = now
-                age = now - po.first_uncloaked_at
-
-                if not w32.user32.IsWindowVisible(hwnd):
-                    if (now - po.enqueued_at) >= 0.75:
-                        self.finish_hidden_handoff(hwnd, po.orig_alpha)
-                    continue
-
-                x, y, w, h = w32.get_extended_frame_bounds(hwnd)
-                if w < 200 or h < 120 or x <= -10000:
-                    if age >= 0.28:
-                        self.finish_hidden_handoff(hwnd, po.orig_alpha)
-                    continue
-
-                info = self.backend.get_window_info(hwnd)
-                if not info or self.is_excluded(info):
-                    self.finish_hidden_handoff(hwnd, po.orig_alpha)
-                    continue
-
-                # Give apps a brief window to call SetWindowTextW right after ShowWindow
-                if po.trigger == "open" and not info.title:
-                    if age < 0.14:
-                        continue
-                    style = w32.user32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE)
-                    if not (style & (w32.WS_SYSMENU | w32.WS_THICKFRAME)):
-                        self.finish_hidden_handoff(hwnd, po.orig_alpha)
+                        pm.to_rect = cur
+                        pm.target_changed_at = now
                         continue
 
-                fresh = self.backend.capture_window_bgra(hwnd)
-                is_blank, is_uniform = _analyze_bgra_readiness(fresh[2]) if fresh else (True, True)
+                    # If geometry stepped once more (e.g. restore + move), adopt latest rect
+                    if cur != pm.to_rect:
+                        pm.to_rect = cur
+                        pm.target_changed_at = now
+                        continue
 
-                # Ready immediately once real UI pixels appear (>= 4% distinct from canvas);
-                # for plain solid-canvas apps (e.g. empty CMD/PowerShell), accept after 260 ms!
-                frame_ready = (fresh is not None) and (
-                    (not is_blank and not is_uniform)
-                    or (not is_blank and is_uniform and age >= 0.26)
-                )
-                if frame_ready and fresh is not None:
-                    with self._hidden_lock:
-                        if hwnd not in self._pending_opens:
+                    since_change = now - pm.target_changed_at
+                    # Capture crisp destination layout (give UWP/XAML ~20-90 ms to reflow!)
+                    fresh = (
+                        self.backend.capture_window_bgra(hwnd, allow_screen_fallback=False)
+                        if since_change >= 0.015
+                        else None
+                    )
+                    is_blank, is_uniform = _analyze_bgra_readiness(fresh[2]) if fresh else (True, True)
+                    dest_ready = (fresh is not None) and (
+                        (not is_blank and not is_uniform)
+                        or (not is_blank and is_uniform and since_change >= 0.08)
+                    )
+                    if dest_ready or since_change >= 0.12:
+                        with self._hidden_lock:
+                            if hwnd not in self._pending_morphs:
+                                continue
+                            self._pending_morphs.pop(hwnd, None)
+                            self._hidden_for_anim[hwnd] = (pm.orig_alpha, now, pm.had_layered)
+                        to_cap = fresh if (fresh is not None and not is_blank) else None
+                        self._emit_morph_job(pm, pm.to_rect, to_cap, now)
+
+                for po in pending_list:
+                    hwnd = po.hwnd
+                    if (
+                        not self.config.enabled
+                        or self._cached_paused_reason
+                        or not self.backend.is_valid_window(hwnd)
+                        or w32.user32.IsIconic(hwnd)
+                    ):
+                        self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
+                        continue
+
+                    if w32.is_window_cloaked(hwnd):
+                        if (now - po.enqueued_at) >= 0.75:
+                            self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
+                        continue
+
+                    if po.first_uncloaked_at <= 0.0:
+                        po.first_uncloaked_at = now
+                    age = now - po.first_uncloaked_at
+
+                    if not w32.user32.IsWindowVisible(hwnd):
+                        if (now - po.enqueued_at) >= 0.75:
+                            self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
+                        continue
+
+                    x, y, w, h = w32.get_extended_frame_bounds(hwnd)
+                    if w < 200 or h < 120 or x <= -10000:
+                        if age >= 0.28:
+                            self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
+                        continue
+
+                    info = self.backend.get_window_info(hwnd)
+                    if not info or self.is_excluded(info):
+                        self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
+                        continue
+
+                    # Give apps a brief window to call SetWindowTextW right after ShowWindow
+                    if po.trigger == "open" and not info.title:
+                        if age < 0.14:
                             continue
-                        self._pending_opens.pop(hwnd, None)
-                        # Refresh _hidden_for_anim timestamp so animation gets full 1.8s budget
-                        self._hidden_for_anim[hwnd] = (po.orig_alpha, now)
-                    self._emit_staged_open_job(po, info, fresh, now)
-                elif age >= 0.55:
-                    # Hard fail-safe cap: reveal window cleanly if it never painted a capturable frame
-                    self._known_visible_hwnds.add(hwnd)
-                    self.finish_hidden_handoff(hwnd, po.orig_alpha)
+                        style = w32.user32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE)
+                        if not (style & (w32.WS_SYSMENU | w32.WS_THICKFRAME)):
+                            self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
+                            continue
+
+                    fresh = self.backend.capture_window_bgra(hwnd, allow_screen_fallback=False)
+                    is_blank, is_uniform = _analyze_bgra_readiness(fresh[2]) if fresh else (True, True)
+
+                    # Ready immediately once real UI pixels appear (>= 4% distinct from canvas);
+                    # for plain solid-canvas apps (e.g. empty CMD/PowerShell), accept after 260 ms!
+                    frame_ready = (fresh is not None) and (
+                        (not is_blank and not is_uniform)
+                        or (not is_blank and is_uniform and age >= 0.26)
+                    )
+                    if frame_ready and fresh is not None:
+                        with self._hidden_lock:
+                            if hwnd not in self._pending_opens:
+                                continue
+                            self._pending_opens.pop(hwnd, None)
+                            # Refresh _hidden_for_anim timestamp so animation gets full 1.8s budget
+                            self._hidden_for_anim[hwnd] = (po.orig_alpha, now, po.had_layered)
+                        self._emit_staged_open_job(po, info, fresh, now)
+                    elif age >= 0.55:
+                        # Hard fail-safe cap: reveal window cleanly if it never painted a capturable frame
+                        with self._state_lock:
+                            self._known_visible_hwnds.add(hwnd)
+                        self.finish_hidden_handoff(hwnd, po.orig_alpha, had_layered=po.had_layered)
+            except Exception:
+                logging.getLogger(__name__).exception("Unhandled exception in PrismFX-OpenStager _open_stager_loop")
 
             self._stop_event.wait(0.010)
 
     def _store_cached_capture(
         self, hwnd: int, img_w: int, img_h: int, raw: bytes, rect: tuple[int, int, int, int], ts: float
     ) -> None:
-        self._cached_captures[hwnd] = (img_w, img_h, raw, rect, ts)
-        if len(self._cached_captures) > 20:
-            oldest = min(self._cached_captures, key=lambda k: self._cached_captures[k][4])
-            self._cached_captures.pop(oldest, None)
+        with self._cache_lock:
+            self._cached_captures[hwnd] = (img_w, img_h, raw, rect, ts)
+            if len(self._cached_captures) > 20:
+                oldest = min(self._cached_captures, key=lambda k: self._cached_captures[k][4])
+                self._cached_captures.pop(oldest, None)
 
     def _refresh_cache_for_hwnd(self, hwnd: int, now: float) -> None:
         """Non-blocking background window capture refresh (called on Core thread, never hook thread)."""
-        if not hwnd or hwnd in self._own_hwnds or not self.backend.is_valid_window(hwnd):
+        with self._state_lock:
+            is_own = hwnd in self._own_hwnds
+        if not hwnd or is_own or not self.backend.is_valid_window(hwnd):
             return
         with self._hidden_lock:
             if (
@@ -1557,8 +1940,6 @@ class PrismEngine:
 
     def _watchdog_tick(self, now: float) -> None:
         """High-frequency safety watchdog (~40 ms): guarantees ZERO windows ever stay stuck invisible!"""
-        if self.backend.is_demo:
-            return
         # 1. Process pending minimized pre-hides once IsIconic(hwnd) has settled
         due_prehide: list[int] = []
         with self._hidden_lock:
@@ -1570,57 +1951,72 @@ class PrismEngine:
             self._prehide_minimized_hwnd(h)
 
         # 2. Enforce strict timeouts & state invariants on all hidden tracking maps
-        to_unhide: list[tuple[int, int]] = []
+        to_unhide: list[tuple[int, int, bool]] = []
+        stale_journal_clear: list[int] = []
+        is_demo = self.backend.is_demo
         with self._hidden_lock:
-            for h, (orig_a, ts) in list(self._hidden_for_anim.items()):
+            for h, (orig_a, ts, hl) in list(self._hidden_for_anim.items()):
                 if (now - ts) > 1.8:
                     self._hidden_for_anim.pop(h, None)
-                    to_unhide.append((h, orig_a))
+                    to_unhide.append((h, orig_a, hl))
 
-            for h, (created_at, vis_at) in list(self._prehidden_creating.items()):
+            for h, (created_at, vis_at, hl) in list(self._prehidden_creating.items()):
                 if not self.backend.is_valid_window(h):
                     self._prehidden_creating.pop(h, None)
-                    self.journal.record_alpha(h, None)
+                    stale_journal_clear.append(h)
                 elif h in self._hidden_for_anim or h in self._pending_opens:
                     self._prehidden_creating.pop(h, None)
                 else:
-                    vis_uncloaked = bool(w32.user32.IsWindowVisible(h)) and not w32.is_window_cloaked(h)
+                    vis_uncloaked = (
+                        True
+                        if is_demo
+                        else (bool(w32.user32.IsWindowVisible(h)) and not w32.is_window_cloaked(h))
+                    )
                     if vis_uncloaked:
                         if vis_at <= 0.0:
                             vis_at = now
-                            self._prehidden_creating[h] = (created_at, vis_at)
+                            self._prehidden_creating[h] = (created_at, vis_at, hl)
                         # Once visible & uncloaked, reveal quickly (0.35s) if SHOW/UNCLOAKED didn't claim it
                         if (now - vis_at) > 0.35:
                             self._prehidden_creating.pop(h, None)
-                            to_unhide.append((h, 255))
+                            to_unhide.append((h, 255, hl))
                     elif (now - created_at) > 3.5:
                         # Still invisible/cloaked (slow XAML/Electron startup): generous 3.5s safety cap
                         self._prehidden_creating.pop(h, None)
-                        to_unhide.append((h, 255))
+                        to_unhide.append((h, 255, hl))
 
-            for h, orig_a in list(self._prehidden_minimized.items()):
+            for h, (orig_a, hl) in list(self._prehidden_minimized.items()):
                 if not self.backend.is_valid_window(h):
                     self._prehidden_minimized.pop(h, None)
                     self._prehidden_uniconic_since.pop(h, None)
-                    self.journal.record_alpha(h, None)
-                elif not w32.user32.IsIconic(h):
-                    # Give EVENT_SYSTEM_MINIMIZEEND a 250ms grace window to claim the window cleanly
-                    # before assuming it was restored outside our hook!
-                    if h in self._hidden_for_anim:
-                        self._prehidden_minimized.pop(h, None)
-                        self._prehidden_uniconic_since.pop(h, None)
+                    stale_journal_clear.append(h)
+                else:
+                    if is_demo:
+                        w_info = self.backend.get_window_info(h)
+                        still_iconic = bool(w_info and w_info.minimized)
                     else:
-                        first_seen = self._prehidden_uniconic_since.setdefault(h, now)
-                        if (now - first_seen) >= 0.25:
+                        still_iconic = bool(w32.user32.IsIconic(h))
+                    if not still_iconic:
+                        # Give EVENT_SYSTEM_MINIMIZEEND a 250ms grace window to claim the window cleanly
+                        # before assuming it was restored outside our hook!
+                        if h in self._hidden_for_anim:
                             self._prehidden_minimized.pop(h, None)
                             self._prehidden_uniconic_since.pop(h, None)
-                            to_unhide.append((h, orig_a))
-                else:
-                    self._prehidden_uniconic_since.pop(h, None)
+                        else:
+                            first_seen = self._prehidden_uniconic_since.setdefault(h, now)
+                            if (now - first_seen) >= 0.25:
+                                self._prehidden_minimized.pop(h, None)
+                                self._prehidden_uniconic_since.pop(h, None)
+                                to_unhide.append((h, orig_a, hl))
+                    else:
+                        self._prehidden_uniconic_since.pop(h, None)
 
-        for h, orig_a in to_unhide:
+        for h in stale_journal_clear:
+            self.journal.record_alpha(h, None)
+
+        for h, orig_a, hl in to_unhide:
             if self.backend.is_valid_window(h):
-                self.backend.set_window_hidden_alpha(h, False, orig_a)
+                self.backend.set_window_hidden_alpha(h, False, orig_a, had_layered=hl)
             self.journal.record_alpha(h, None)
 
         # 3. Fail-safe drag & wobble watchdog: catch crashed app OR missed MOVESIZEEND (e.g. UAC/Alt+Tab)
@@ -1629,7 +2025,11 @@ class PrismEngine:
             if not self.backend.is_valid_window(drag_h):
                 self._drag_hwnd = 0
                 self._drag_wobble_started = False
+                self._drag_alpha_mutated = False
+                self._drag_unsafe_layered = False
                 self._drag_lbutton_up_since = 0.0
+                if self.journal.get_mutation(drag_h) is not None:
+                    self.journal.prune_hwnd(drag_h)
                 if self._hook_tid:
                     try:
                         w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
@@ -1646,15 +2046,28 @@ class PrismEngine:
                 elif (now - self._drag_lbutton_up_since) > 0.45 and (now - self._drag_last_move_ts) > 0.45:
                     self._drag_hwnd = 0
                     was_wob = self._drag_wobble_started
+                    was_mutated = self._drag_alpha_mutated
+                    drag_orig_a = self._drag_orig_alpha
+                    drag_had_l = self._drag_had_layered
                     self._drag_wobble_started = False
+                    self._drag_alpha_mutated = False
+                    self._drag_unsafe_layered = False
                     self._drag_lbutton_up_since = 0.0
                     if self._hook_tid:
                         try:
                             w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
                         except Exception:
                             pass
+                    if (not was_wob) and was_mutated:
+                        if self.backend.is_valid_window(drag_h):
+                            self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
+                        self.journal.record_alpha(drag_h, None)
                     if was_wob and self.on_wobbly_end:
-                        x, y, _, _ = w32.get_extended_frame_bounds(drag_h)
+                        if is_demo:
+                            d_info = self.backend.get_window_info(drag_h)
+                            x, y = (d_info.x, d_info.y) if d_info else (0, 0)
+                        else:
+                            x, y, _, _ = w32.get_extended_frame_bounds(drag_h)
                         try:
                             self.on_wobbly_end(drag_h, x, y, True)
                         except Exception:
@@ -1662,18 +2075,18 @@ class PrismEngine:
             else:
                 self._drag_lbutton_up_since = 0.0
 
-        stale_wobble: list[tuple[int, int]] = []
+        stale_wobble: list[tuple[int, int, bool]] = []
         active_wob_hwnd = self._drag_hwnd or self._momentum_wobble_hwnd
         with self._hidden_lock:
-            for h, (orig_a, ts) in list(self._hidden_for_wobble.items()):
+            for h, (orig_a, ts, hl) in list(self._hidden_for_wobble.items()):
                 if h == active_wob_hwnd:
-                    self._hidden_for_wobble[h] = (orig_a, now)  # refresh heartbeat while dragging/gliding
+                    self._hidden_for_wobble[h] = (orig_a, now, hl)  # refresh heartbeat while dragging/gliding
                 elif (now - ts) > 1.2:
                     self._hidden_for_wobble.pop(h, None)
-                    stale_wobble.append((h, orig_a))
-        for h, orig_a in stale_wobble:
+                    stale_wobble.append((h, orig_a, hl))
+        for h, orig_a, hl in stale_wobble:
             if self.backend.is_valid_window(h):
-                self.backend.set_window_hidden_alpha(h, False, orig_a)
+                self.backend.set_window_hidden_alpha(h, False, orig_a, had_layered=hl)
             self.journal.record_alpha(h, None)
 
     # ------------------------------------------------------------------
@@ -1685,45 +2098,48 @@ class PrismEngine:
         last_tick = time.perf_counter()
 
         while not self._stop_event.is_set():
-            now = time.perf_counter()
-            dt = min(0.05, now - last_tick)
-            last_tick = now
+            try:
+                now = time.perf_counter()
+                dt = min(0.05, now - last_tick)
+                last_tick = now
 
-            if self._momentum is not None:
-                mh = self._momentum.hwnd
-                mw = self._momentum.w
-                mh_px = self._momentum.h
-                nx, ny, moving = self._momentum.step(dt)
-                if self.backend.is_valid_window(mh):
-                    self.backend.move_window_only(mh, nx, ny)
-                    if self._momentum_wobble_hwnd == mh:
-                        self._wobble_live_pos = (mh, nx, ny, mw, mh_px)
-                if not moving:
-                    self._momentum = None
-                    if self._momentum_wobble_hwnd == mh:
-                        self._momentum_wobble_hwnd = 0
-                        if self.on_wobbly_end:
-                            try:
-                                self.on_wobbly_end(mh, nx, ny, False)
-                            except Exception:
-                                pass
+                mom = self._momentum
+                if mom is not None:
+                    mh = mom.hwnd
+                    mw = mom.w
+                    mh_px = mom.h
+                    nx, ny, moving = mom.step(dt)
+                    if self.backend.is_valid_window(mh):
+                        self.backend.move_window_only(mh, nx, ny)
+                        if self._momentum_wobble_hwnd == mh:
+                            self._wobble_live_pos = (mh, nx, ny, mw, mh_px)
+                    if not moving:
+                        if self._momentum is mom:
+                            self._momentum = None
+                        if self._momentum_wobble_hwnd == mh:
+                            self._momentum_wobble_hwnd = 0
+                            if self.on_wobbly_end:
+                                try:
+                                    self.on_wobbly_end(mh, nx, ny, False)
+                                except Exception:
+                                    pass
 
-            if now - last_fast >= 0.04:
-                last_fast = now
-                self._watchdog_tick(now)
-                if self._pending_cache_hwnds and not self._cached_paused_reason:
-                    for _ in range(2):
-                        if not self._pending_cache_hwnds:
-                            break
-                        try:
-                            ch = self._pending_cache_hwnds.pop()
-                        except KeyError:
-                            break
-                        self._refresh_cache_for_hwnd(ch, now)
+                if now - last_fast >= 0.04:
+                    last_fast = now
+                    self._watchdog_tick(now)
+                    if not self._cached_paused_reason:
+                        for _ in range(2):
+                            with self._cache_lock:
+                                if not self._pending_cache_hwnds:
+                                    break
+                                ch = self._pending_cache_hwnds.pop()
+                            self._refresh_cache_for_hwnd(ch, now)
 
-            if now - last_slow >= 0.35:
-                last_slow = now
-                self._housekeeping_tick(now)
+                if now - last_slow >= 0.35:
+                    last_slow = now
+                    self._housekeeping_tick(now)
+            except Exception:
+                logging.getLogger(__name__).exception("Unhandled exception in PrismFX-Core _poll_loop")
 
             sleep_sec = 0.006 if self._momentum is not None else 0.04
             self._stop_event.wait(sleep_sec)
@@ -1746,7 +2162,9 @@ class PrismEngine:
             for iconic_hwnd in w32.list_iconic_top_windows(own_pid=self.own_pid):
                 if self._stop_event.is_set():
                     return
-                if iconic_hwnd not in self._own_hwnds:
+                with self._state_lock:
+                    is_own = iconic_hwnd in self._own_hwnds
+                if not is_own:
                     self._prehide_minimized_hwnd(iconic_hwnd)
 
         if self._stop_event.is_set():
@@ -1767,11 +2185,13 @@ class PrismEngine:
             and fg_info.x > -10000
         ):
             self._last_real_fg_hwnd = fg
-            self._last_active_time[fg] = now
-            prev = self._cached_captures.get(fg)
+            with self._state_lock:
+                self._last_active_time[fg] = now
             cur_rect = (fg_info.x, fg_info.y, fg_info.w, fg_info.h)
-            if prev and prev[0] == fg_info.w and prev[1] == fg_info.h and prev[3] != cur_rect:
-                self._cached_captures[fg] = (prev[0], prev[1], prev[2], cur_rect, prev[4])
+            with self._cache_lock:
+                prev = self._cached_captures.get(fg)
+                if prev and prev[0] == fg_info.w and prev[1] == fg_info.h and prev[3] != cur_rect:
+                    self._cached_captures[fg] = (prev[0], prev[1], prev[2], cur_rect, prev[4])
             if not prev or (now - prev[4]) > 1.5 or prev[0] != fg_info.w or prev[1] != fg_info.h:
                 cap = self.backend.capture_window_bgra(fg)
                 if cap and not _is_mostly_blank_bgra(cap[2]):
@@ -1797,7 +2217,8 @@ class PrismEngine:
             if eligible:
                 w_bg = eligible[self._bg_cache_cursor % len(eligible)]
                 self._bg_cache_cursor += 1
-                prev_bg = self._cached_captures.get(w_bg.hwnd)
+                with self._cache_lock:
+                    prev_bg = self._cached_captures.get(w_bg.hwnd)
                 if not prev_bg or (now - prev_bg[4]) > 8.0:
                     self._refresh_cache_for_hwnd(w_bg.hwnd, now)
 
@@ -1808,31 +2229,96 @@ class PrismEngine:
 
         if not paused and self.config.focus.inactive_fade_enabled and not self.backend.is_demo and vis_wins is not None:
             target_alpha = max(60, min(255, int(round(self.config.focus.inactive_opacity_pct * 2.55))))
+            if fg:
+                with self._state_lock:
+                    fg_faded = self._faded_hwnds.pop(fg, None)
+                if fg_faded is not None:
+                    with self._hidden_lock:
+                        fg_is_hidden = (
+                            fg in self._hidden_for_wobble
+                            or fg in self._hidden_for_anim
+                            or fg in self._prehidden_minimized
+                            or fg in self._prehidden_creating
+                            or fg in self._pending_opens
+                            or fg in self._pending_morphs
+                        )
+                    if not fg_is_hidden:
+                        orig_a, had_layered = fg_faded
+                        if self.backend.is_valid_window(fg):
+                            self.backend.set_window_opacity(fg, orig_a, had_layered=had_layered)
+                        self.journal.record_alpha(fg, None)
             for win in vis_wins:
                 if self.is_excluded(win) or win.minimized:
                     continue
                 if win.hwnd == fg:
-                    if win.hwnd in self._faded_hwnds:
-                        self.backend.set_window_opacity(win.hwnd, 255)
-                        self.journal.record_alpha(win.hwnd, None)
-                        self._faded_hwnds.discard(win.hwnd)
+                    with self._state_lock:
+                        win_faded = self._faded_hwnds.pop(win.hwnd, None)
+                    if win_faded is not None:
+                        with self._hidden_lock:
+                            win_is_hidden = (
+                                win.hwnd in self._hidden_for_wobble
+                                or win.hwnd in self._hidden_for_anim
+                                or win.hwnd in self._prehidden_minimized
+                                or win.hwnd in self._prehidden_creating
+                                or win.hwnd in self._pending_opens
+                                or win.hwnd in self._pending_morphs
+                            )
+                        if not win_is_hidden:
+                            orig_a, had_layered = win_faded
+                            self.backend.set_window_opacity(win.hwnd, orig_a, had_layered=had_layered)
+                            self.journal.record_alpha(win.hwnd, None)
                 else:
-                    if win.hwnd not in self._faded_hwnds:
-                        self.journal.record_alpha(win.hwnd, win.opacity)
-                        self.backend.set_window_opacity(win.hwnd, target_alpha)
-                        self._faded_hwnds.add(win.hwnd)
-        elif self._faded_hwnds:
-            self._clear_inactive_fades()
+                    with self._state_lock:
+                        already_faded = win.hwnd in self._faded_hwnds
+                    if not already_faded:
+                        with self._hidden_lock:
+                            is_hidden_now = (
+                                win.hwnd in self._hidden_for_anim
+                                or win.hwnd in self._hidden_for_wobble
+                                or win.hwnd in self._prehidden_minimized
+                                or win.hwnd in self._prehidden_creating
+                                or win.hwnd in self._pending_opens
+                                or win.hwnd in self._pending_morphs
+                            )
+                        if is_hidden_now or win.hwnd == self._drag_hwnd:
+                            continue
+                        had_layered, cur_alpha = self.backend.get_window_layered_state(win.hwnd)
+                        if cur_alpha is None or cur_alpha == 0:
+                            continue
+                        orig_a = max(20, cur_alpha) if cur_alpha > 0 else 255
+                        pid, cls_name, boot_ms = self._window_identity(win.hwnd, win)
+                        self.journal.record_alpha(
+                            win.hwnd, orig_a, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+                        )
+                        if self.backend.set_window_opacity(win.hwnd, target_alpha):
+                            with self._state_lock:
+                                self._faded_hwnds[win.hwnd] = (orig_a, had_layered)
+                        else:
+                            self.journal.record_alpha(win.hwnd, None)
+            with self._state_lock:
+                faded_keys = list(self._faded_hwnds)
+            for h in faded_keys:
+                if not self.backend.is_valid_window(h):
+                    with self._state_lock:
+                        self._faded_hwnds.pop(h, None)
+                    self.journal.record_alpha(h, None)
+        else:
+            with self._state_lock:
+                has_faded = bool(self._faded_hwnds)
+            if has_faded:
+                self._clear_inactive_fades()
 
         if not paused and self.config.focus.auto_minimize_enabled and not self.backend.is_demo and vis_wins is not None:
             idle_limit = max(60.0, self.config.focus.auto_minimize_minutes * 60.0)
             for win in vis_wins:
                 if win.hwnd == fg or win.minimized or self.is_excluded(win):
                     continue
-                last_t = self._last_active_time.setdefault(win.hwnd, now)
+                with self._state_lock:
+                    last_t = self._last_active_time.setdefault(win.hwnd, now)
                 if (now - last_t) >= idle_limit:
                     self.backend.minimize_window(win.hwnd)
-                    self._last_active_time[win.hwnd] = now
+                    with self._state_lock:
+                        self._last_active_time[win.hwnd] = now
 
         if not paused and self.config.focus.desktop_icons_autohide and not self.backend.is_demo:
             fg_cls = fg_info.class_name if fg_info else ""
@@ -1848,11 +2334,24 @@ class PrismEngine:
         self._publish_frame(fg_info=fg_info)
 
     def _clear_inactive_fades(self) -> None:
-        for hwnd in list(self._faded_hwnds):
+        with self._state_lock:
+            faded_items = list(self._faded_hwnds.items())
+            self._faded_hwnds.clear()
+        for hwnd, (orig_a, had_layered) in faded_items:
+            with self._hidden_lock:
+                is_hidden_now = (
+                    hwnd in self._hidden_for_wobble
+                    or hwnd in self._hidden_for_anim
+                    or hwnd in self._prehidden_minimized
+                    or hwnd in self._prehidden_creating
+                    or hwnd in self._pending_opens
+                    or hwnd in self._pending_morphs
+                )
+            if is_hidden_now:
+                continue
             if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_opacity(hwnd, 255)
+                self.backend.set_window_opacity(hwnd, orig_a, had_layered=had_layered)
             self.journal.record_alpha(hwnd, None)
-        self._faded_hwnds.clear()
 
     def _update_spotlight_state(self, fg_info: Optional[WindowInfo] = None, force_off: bool = False) -> None:
         if force_off or not fg_info:
@@ -1900,10 +2399,12 @@ class PrismEngine:
         )
         self._drag_loc_hook = int(h or 0)
 
-    def _detach_drag_location_hook(self) -> None:
+    def _detach_drag_location_hook(self) -> bool:
         if self._drag_loc_hook:
-            w32.user32.UnhookWinEvent(self._drag_loc_hook)
+            h = self._drag_loc_hook
             self._drag_loc_hook = 0
+            return bool(w32.user32.UnhookWinEvent(h))
+        return True
 
     def _hook_pump_loop(self) -> None:
         self._hook_tid = int(w32.kernel32.GetCurrentThreadId())
@@ -1914,12 +2415,16 @@ class PrismEngine:
                 if self._stop_event.is_set() or id_object != w32.OBJID_WINDOW or id_child != w32.CHILDID_SELF or not hwnd:
                     return
                 ihwnd = int(hwnd)
-                if ihwnd in self._own_hwnds:
+                with self._state_lock:
+                    is_own = ihwnd in self._own_hwnds
+                if is_own:
                     return
                 ev = int(event)
                 # Read cached pause state (0 syscalls! NEVER call SHQueryUserNotificationState here!)
                 if not self.config.enabled or self._cached_paused_reason:
-                    if ev in (w32.EVENT_SYSTEM_MINIMIZEEND, w32.EVENT_OBJECT_SHOW, w32.EVENT_OBJECT_UNCLOAKED):
+                    if ev == w32.EVENT_OBJECT_DESTROY:
+                        self._handle_win_event(ev, ihwnd)
+                    elif ev in (w32.EVENT_SYSTEM_MINIMIZEEND, w32.EVENT_OBJECT_SHOW, w32.EVENT_OBJECT_UNCLOAKED):
                         self._unhide_if_prehidden(ihwnd)
                     return
                 self._handle_win_event(ev, ihwnd)
@@ -1927,6 +2432,8 @@ class PrismEngine:
                 pass
 
         self._win_event_cb_ref = _on_win_event
+        with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+            _ACTIVE_NATIVE_CALLBACKS.add(_on_win_event)
         flags = w32.WINEVENT_OUTOFCONTEXT | w32.WINEVENT_SKIPOWNPROCESS
         # Note: EVENT_OBJECT_LOCATIONCHANGE is intentionally NOT hooked globally (zero taskbar/cursor flood!)
         ranges = [
@@ -1955,10 +2462,14 @@ class PrismEngine:
             w32.user32.DispatchMessageW(ctypes.byref(msg))
 
         self._hook_tid = 0
-        self._detach_drag_location_hook()
+        all_unhooked = self._detach_drag_location_hook()
         for h in self._win_event_hooks:
-            w32.user32.UnhookWinEvent(h)
+            if not w32.user32.UnhookWinEvent(h):
+                all_unhooked = False
         self._win_event_hooks.clear()
+        if all_unhooked:
+            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                _ACTIVE_NATIVE_CALLBACKS.discard(_on_win_event)
 
     def _raw_input_loop(self) -> None:
         """100% asynchronous Win32 Raw Input mouse click sink (RIDEV_INPUTSINK on HWND_MESSAGE).
@@ -2027,6 +2538,8 @@ class PrismEngine:
             return w32.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         self._raw_wndproc_ref = _raw_wndproc
+        with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+            _ACTIVE_NATIVE_CALLBACKS.add(_raw_wndproc)
         wc = w32.WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(w32.WNDCLASSEXW)
         wc.lpfnWndProc = self._raw_wndproc_ref
@@ -2035,6 +2548,8 @@ class PrismEngine:
         atom = w32.user32.RegisterClassExW(ctypes.byref(wc))
         if not atom and ctypes.get_last_error() != 1410:
             self._raw_input_tid = 0
+            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                _ACTIVE_NATIVE_CALLBACKS.discard(_raw_wndproc)
             return
 
         sink_hwnd = int(
@@ -2044,6 +2559,7 @@ class PrismEngine:
             or 0
         )
         self._raw_input_hwnd = sink_hwnd
+        destroyed_ok = True
         if sink_hwnd:
             _sync_reg(sink_hwnd)
             msg = w32.wintypes.MSG()
@@ -2058,11 +2574,14 @@ class PrismEngine:
                 rid = w32.RAWINPUTDEVICE(0x01, 0x02, w32.RIDEV_REMOVE, 0)
                 w32.user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(w32.RAWINPUTDEVICE))
                 self._raw_input_registered = False
-            w32.user32.DestroyWindow(sink_hwnd)
+            destroyed_ok = bool(w32.user32.DestroyWindow(sink_hwnd))
 
         self._raw_input_hwnd = 0
         self._raw_input_tid = 0
-        w32.user32.UnregisterClassW(cls_name, hinst)
+        unreg_ok = bool(w32.user32.UnregisterClassW(cls_name, hinst))
+        if destroyed_ok and unreg_ok:
+            with _ACTIVE_NATIVE_CALLBACKS_LOCK:
+                _ACTIVE_NATIVE_CALLBACKS.discard(_raw_wndproc)
 
     def _cancel_active_precover(self) -> None:
         h = self._active_precover_hwnd
@@ -2134,10 +2653,14 @@ class PrismEngine:
             cur_fg = int(w32.user32.GetForegroundWindow() or 0)
             cur_cls = w32.get_class_name(cur_fg) if cur_fg else ""
             cand = self._last_real_fg_hwnd or (cur_fg if cur_cls not in _TASKBAR_CLICK_CLASSES else 0)
+            with self._state_lock:
+                cand_is_own = cand in self._own_hwnds
+            with self._cache_lock:
+                cached = self._cached_captures.get(cand) if cand else None
             if (
                 cand
-                and cand not in self._own_hwnds
-                and cand in self._cached_captures
+                and not cand_is_own
+                and cached is not None
                 and w32.user32.IsWindow(cand)
                 and w32.user32.IsWindowVisible(cand)
                 and not w32.user32.IsIconic(cand)
@@ -2145,9 +2668,9 @@ class PrismEngine:
                 # Only arm if the window itself (or the taskbar/XAML bar that received the click) is foreground
                 if cur_fg == cand or cur_cls in _TASKBAR_CLICK_CLASSES:
                     self._armed_precover = (cand, "minimize", "taskbar", None, now)
-                    cached = self._cached_captures.get(cand)
-                    if cached and (now - cached[4]) > 0.25:
-                        self._pending_cache_hwnds.add(cand)
+                    if (now - cached[4]) > 0.25:
+                        with self._cache_lock:
+                            self._pending_cache_hwnds.add(cand)
             return
 
         # Case B: Window titlebar Minimize (-), Maximize (□/❐), Close (X), or Titlebar Double-Click!
@@ -2155,19 +2678,23 @@ class PrismEngine:
         if not raw_h:
             return
         root = int(w32.user32.GetAncestor(raw_h, w32.GA_ROOT) or raw_h)
+        with self._state_lock:
+            root_is_own = root in self._own_hwnds
+        with self._cache_lock:
+            cached = self._cached_captures.get(root) if root else None
         if (
             not root
-            or root in self._own_hwnds
-            or root not in self._cached_captures
+            or root_is_own
+            or cached is None
             or w32.user32.IsIconic(root)
         ):
             return
         action = self._classify_caption_min_close(root, cx, cy)
         if action and self._trigger_enabled(action):
             self._armed_precover = (root, action, "caption", w32.get_extended_frame_bounds(root), now)
-            cached = self._cached_captures.get(root)
-            if cached and (now - cached[4]) > 0.25:
-                self._pending_cache_hwnds.add(root)
+            if (now - cached[4]) > 0.25:
+                with self._cache_lock:
+                    self._pending_cache_hwnds.add(root)
             return
 
         # Case C: Double-clicking a window's titlebar strip to Maximize / Restore-Down!
@@ -2218,7 +2745,8 @@ class PrismEngine:
                     f_rect = w32.get_extended_frame_bounds(drag_h)
                 cap_use = self._drag_last_normal_cap or self._drag_wobble_cap
                 if cap_use is None:
-                    cc = self._cached_captures.get(drag_h)
+                    with self._cache_lock:
+                        cc = self._cached_captures.get(drag_h)
                     if cc and abs(cc[0] - f_rect[2]) <= 16 and abs(cc[1] - f_rect[3]) <= 16:
                         cap_use = (cc[0], cc[1], cc[2])
                 if cap_use is not None and f_rect[2] >= 40 and f_rect[3] >= 40 and f_rect[0] > -10000:
@@ -2248,7 +2776,8 @@ class PrismEngine:
                 return
         if not (w32.user32.IsWindow(hwnd) and w32.user32.IsWindowVisible(hwnd) and not w32.user32.IsIconic(hwnd)):
             return
-        cached = self._cached_captures.get(hwnd)
+        with self._cache_lock:
+            cached = self._cached_captures.get(hwnd)
         if not cached:
             return
         img_w, img_h, raw, cached_rect, _ts = cached
@@ -2285,32 +2814,42 @@ class PrismEngine:
             if cls in ("Progman", "WorkerW"):
                 self._last_real_fg_hwnd = 0
             elif cls not in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd") and not is_protected_window_class(cls):
-                if hwnd not in self._own_hwnds:
+                with self._state_lock:
+                    is_own = hwnd in self._own_hwnds
+                if not is_own:
                     self._last_real_fg_hwnd = hwnd
                     if not w32.user32.IsIconic(hwnd):
                         if (not w32.user32.IsWindowVisible(hwnd)) or w32.is_window_cloaked(hwnd):
                             # Early pre-hide for pre-created/pooled apps (e.g. Win11 File Explorer fires
                             # FOREGROUND ~200ms BEFORE SHOW while still invisible -> 0ms pre-flash!)
                             self._try_prehide_on_create(hwnd)
-                        elif hwnd not in self._known_visible_hwnds and hwnd not in self._cached_captures:
-                            # Fallback catch for reused UWP/XAML windows that focus without firing SHOW
-                            style = w32.user32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE)
-                            rw, rh = w32.get_window_rect_size(hwnd)
-                            staged = False
-                            if (
-                                not (style & w32.WS_CHILD)
-                                and (style & w32.WS_CAPTION)
-                                and not w32.is_overlay_exstyle(hwnd)
-                                and not any(sub in cls for sub in _INTERNAL_CREATE_CLASS_SUBSTRS)
-                                and rw >= 200
-                                and rh >= 120
-                            ):
-                                staged = self._stage_open_window(hwnd, "open")
-                            if not staged:
-                                self._known_visible_hwnds.add(hwnd)
-                                self._pending_cache_hwnds.add(hwnd)
                         else:
-                            self._pending_cache_hwnds.add(hwnd)
+                            with self._state_lock:
+                                is_known_vis = hwnd in self._known_visible_hwnds
+                            with self._cache_lock:
+                                is_cached = hwnd in self._cached_captures
+                            if not is_known_vis and not is_cached:
+                                # Fallback catch for reused UWP/XAML windows that focus without firing SHOW
+                                style = w32.user32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE)
+                                rw, rh = w32.get_window_rect_size(hwnd)
+                                staged = False
+                                if (
+                                    not (style & w32.WS_CHILD)
+                                    and (style & w32.WS_CAPTION)
+                                    and not w32.is_overlay_exstyle(hwnd)
+                                    and not any(sub in cls for sub in _INTERNAL_CREATE_CLASS_SUBSTRS)
+                                    and rw >= 200
+                                    and rh >= 120
+                                ):
+                                    staged = self._stage_open_window(hwnd, "open")
+                                if not staged:
+                                    with self._state_lock:
+                                        self._known_visible_hwnds.add(hwnd)
+                                    with self._cache_lock:
+                                        self._pending_cache_hwnds.add(hwnd)
+                            else:
+                                with self._cache_lock:
+                                    self._pending_cache_hwnds.add(hwnd)
                 if self._active_precover_hwnd and hwnd != self._active_precover_hwnd:
                     self._cancel_active_precover()
             return
@@ -2324,6 +2863,8 @@ class PrismEngine:
                 was_wob = self._drag_wobble_started
                 self._drag_hwnd = 0
                 self._drag_wobble_started = False
+                self._drag_alpha_mutated = False
+                self._drag_unsafe_layered = False
                 self._drag_wobble_cap = None
                 self._detach_drag_location_hook()
                 if was_wob and self.on_wobbly_end:
@@ -2339,9 +2880,28 @@ class PrismEngine:
                         self.on_wobbly_end(hwnd, 0, 0, True)
                     except Exception:
                         pass
-            self._cached_captures.pop(hwnd, None)
-            self._last_trigger_info.pop(hwnd, None)
-            self._known_visible_hwnds.discard(hwnd)
+            if self._active_precover_hwnd == hwnd:
+                self._cancel_active_precover()
+            with self._cache_lock:
+                self._cached_captures.pop(hwnd, None)
+                self._pending_cache_hwnds.discard(hwnd)
+            was_tiled = False
+            with self._state_lock:
+                self._rolled_up.pop(hwnd, None)
+                self._pinned.discard(hwnd)
+                if hwnd in self._tiled:
+                    self._tiled.discard(hwnd)
+                    was_tiled = True
+                self._faded_hwnds.pop(hwnd, None)
+                self._custom_opacity_orig.pop(hwnd, None)
+                self._last_active_time.pop(hwnd, None)
+                self._last_trigger_info.pop(hwnd, None)
+                self._known_visible_hwnds.discard(hwnd)
+            if was_tiled:
+                try:
+                    self.destroyed_tile_hwnds.put_nowait(hwnd)
+                except queue.Full:
+                    pass
             with self._hidden_lock:
                 self._prehidden_minimized.pop(hwnd, None)
                 self._prehidden_uniconic_since.pop(hwnd, None)
@@ -2351,6 +2911,8 @@ class PrismEngine:
                 self._pending_prehide.pop(hwnd, None)
                 self._hidden_for_anim.pop(hwnd, None)
                 self._hidden_for_wobble.pop(hwnd, None)
+            if self.journal.get_mutation(hwnd) is not None:
+                self.journal.prune_hwnd(hwnd)
             return
 
         if event == w32.EVENT_SYSTEM_MOVESIZESTART:
@@ -2376,7 +2938,21 @@ class PrismEngine:
             self._drag_last_normal_cap = None
             self._drag_morph_handled = False
             self._drag_was_zoomed_start = bool(info.maximized)
-            self._drag_orig_alpha = info.opacity if info.opacity >= 20 else 255
+            with self._hidden_lock:
+                wob_existing = self._hidden_for_wobble.get(hwnd)
+            with self._state_lock:
+                faded_existing = self._faded_hwnds.get(hwnd)
+            if wob_existing is not None:
+                had_layered = wob_existing[2]
+                cur_alpha: Optional[int] = wob_existing[0]
+            elif faded_existing is not None:
+                cur_alpha, had_layered = faded_existing
+            else:
+                had_layered, cur_alpha = self.backend.get_window_layered_state(hwnd)
+            self._drag_unsafe_layered = (cur_alpha is None) or (cur_alpha == 0)
+            self._drag_had_layered = had_layered
+            self._drag_orig_alpha = cur_alpha if (cur_alpha is not None and cur_alpha >= 20) else 255
+            self._drag_alpha_mutated = False
             self._drag_wobble_started = False
             self._drag_size_changed = False
             self._drag_size_changed_at = 0.0
@@ -2398,16 +2974,18 @@ class PrismEngine:
             self._drag_tracker.reset(now, info.x, info.y)
             self._attach_drag_location_hook(hwnd)
 
-            # Prepare 1:1 DWM capture for live Wobbly Windows (skip throwaway capture if border-resize
-            # or currently maximized — maximized windows capture fresh immediately after Aero un-maximize!)
+            # Prepare 1:1 DWM capture for live Wobbly Windows (skip throwaway capture if border-resize,
+            # per-pixel layered/ColorKey, or currently maximized — maximized windows capture fresh immediately after Aero un-maximize!)
             if (
                 self.config.physics.wobbly_enabled
                 and self.on_wobbly_start
                 and not self.backend.is_demo
                 and not self._drag_is_resize
+                and not self._drag_unsafe_layered
                 and not info.maximized
             ):
-                cached = self._cached_captures.get(hwnd)
+                with self._cache_lock:
+                    cached = self._cached_captures.get(hwnd)
                 cache_dim_ok = (
                     cached is not None
                     and abs(cached[0] - info.w) <= 16
@@ -2426,12 +3004,29 @@ class PrismEngine:
                         self._drag_wobble_cap = (cached[0], cached[1], cached[2])
             elif (
                 not self._drag_is_resize
+                and not self._drag_unsafe_layered
                 and not self.config.physics.wobbly_enabled
                 and self.config.physics.drag_transparency_enabled
             ):
                 alpha = max(60, min(255, int(round(self.config.physics.drag_opacity_pct * 2.55))))
-                self.journal.record_alpha(hwnd, info.opacity)
-                self.backend.set_window_opacity(hwnd, alpha)
+                pid, cls_name, boot_ms = self._window_identity(hwnd, info)
+                self.journal.record_alpha(
+                    hwnd,
+                    self._drag_orig_alpha,
+                    had_layered=self._drag_had_layered,
+                    pid=pid,
+                    class_name=cls_name,
+                    boot_tick_ms=boot_ms,
+                )
+                if self.backend.set_window_opacity(hwnd, alpha):
+                    self._drag_alpha_mutated = True
+                    with self._state_lock:
+                        self._faded_hwnds.pop(hwnd, None)
+                else:
+                    with self._state_lock:
+                        is_faded = hwnd in self._faded_hwnds
+                    if not is_faded:
+                        self.journal.record_alpha(hwnd, None)
             return
 
         if event == w32.EVENT_OBJECT_LOCATIONCHANGE:
@@ -2473,7 +3068,8 @@ class PrismEngine:
                 ):
                     cap_use = self._drag_last_normal_cap or self._drag_wobble_cap
                     if cap_use is None:
-                        cc = self._cached_captures.get(hwnd)
+                        with self._cache_lock:
+                            cc = self._cached_captures.get(hwnd)
                         if cc and abs(cc[0] - self._drag_last_normal_rect[2]) <= 16 and abs(cc[1] - self._drag_last_normal_rect[3]) <= 16:
                             cap_use = (cc[0], cc[1], cc[2])
                     if cap_use is not None:
@@ -2533,7 +3129,7 @@ class PrismEngine:
                 else:
                     return
 
-            if self.config.physics.wobbly_enabled:
+            if self.config.physics.wobbly_enabled and not self._drag_unsafe_layered:
                 # Wait until maximized window actually un-maximizes before starting Wobbly!
                 if not self._drag_wobble_started and not self.backend.is_demo and w32.user32.IsZoomed(hwnd):
                     return
@@ -2601,28 +3197,36 @@ class PrismEngine:
         if event == w32.EVENT_SYSTEM_MOVESIZEEND and hwnd == self._drag_hwnd:
             was_wobbling = self._drag_wobble_started
             morph_handled = self._drag_morph_handled
+            drag_alpha_mutated = self._drag_alpha_mutated
+            drag_orig_alpha = self._drag_orig_alpha
+            drag_had_layered = self._drag_had_layered
             last_norm_rect = self._drag_last_normal_rect
             last_norm_cap = self._drag_last_normal_cap or self._drag_wobble_cap
             self._drag_hwnd = 0
             self._drag_wobble_started = False
             self._drag_morph_handled = False
+            self._drag_alpha_mutated = False
+            self._drag_unsafe_layered = False
             self._drag_wobble_cap = None
             self._drag_last_normal_rect = (0, 0, 0, 0)
             self._drag_last_normal_cap = None
             self._drag_lbutton_up_since = 0.0
             self._drag_last_move_ts = time.perf_counter()
             self._detach_drag_location_hook()
-            self._pending_cache_hwnds.add(hwnd)
+            with self._cache_lock:
+                self._pending_cache_hwnds.add(hwnd)
             info = self.backend.get_window_info(hwnd)
             if info:
-                cached = self._cached_captures.get(hwnd)
-                if cached and cached[0] == info.w and cached[1] == info.h and info.x > -10000:
-                    self._cached_captures[hwnd] = (
-                        cached[0], cached[1], cached[2], (info.x, info.y, info.w, info.h), cached[4]
-                    )
-            # Only restore opacity directly if neither Wobbly nor Morph owns the window's alpha!
-            if (not was_wobbling) and (not morph_handled) and self.config.physics.drag_transparency_enabled and self.backend.is_valid_window(hwnd):
-                self.backend.set_window_opacity(hwnd, 255)
+                with self._cache_lock:
+                    cached = self._cached_captures.get(hwnd)
+                    if cached and cached[0] == info.w and cached[1] == info.h and info.x > -10000:
+                        self._cached_captures[hwnd] = (
+                            cached[0], cached[1], cached[2], (info.x, info.y, info.w, info.h), cached[4]
+                        )
+            # Only restore opacity directly if drag transparency mutated it and neither Wobbly nor Morph owns it!
+            if (not was_wobbling) and (not morph_handled) and drag_alpha_mutated:
+                if self.backend.is_valid_window(hwnd):
+                    self.backend.set_window_opacity(hwnd, drag_orig_alpha, had_layered=drag_had_layered)
                 self.journal.record_alpha(hwnd, None)
             if self.on_wobbly_drag and info:
                 self.on_wobbly_drag(hwnd, info.x, info.y, info.w, info.h, 0.0, 0.0, False)
@@ -2693,7 +3297,8 @@ class PrismEngine:
             ):
                 cap_use = last_norm_cap
                 if cap_use is None:
-                    cc = self._cached_captures.get(hwnd)
+                    with self._cache_lock:
+                        cc = self._cached_captures.get(hwnd)
                     if cc and abs(cc[0] - last_norm_rect[2]) <= 16 and abs(cc[1] - last_norm_rect[3]) <= 16:
                         cap_use = (cc[0], cc[1], cc[2])
                 if cap_use is not None:
@@ -2773,7 +3378,8 @@ class PrismEngine:
         if event == w32.EVENT_SYSTEM_MINIMIZEEND:
             if self._active_precover_hwnd:
                 self._cancel_active_precover()
-            self._known_visible_hwnds.add(hwnd)
+            with self._state_lock:
+                self._known_visible_hwnds.add(hwnd)
             if self.trigger_effect_for_window(hwnd, "restore") is None:
                 self._unhide_if_prehidden(hwnd)
             return
@@ -2830,11 +3436,13 @@ class PrismEngine:
             if not staged:
                 self._unhide_if_prehidden(hwnd)
                 if not w32.is_window_cloaked(hwnd):
-                    self._known_visible_hwnds.add(hwnd)
+                    with self._state_lock:
+                        self._known_visible_hwnds.add(hwnd)
             return
         if event == w32.EVENT_OBJECT_CLOAKED:
             self._last_cloak_ts = time.perf_counter()
-            self._known_visible_hwnds.discard(hwnd)
+            with self._state_lock:
+                self._known_visible_hwnds.discard(hwnd)
             return
         if event == w32.EVENT_OBJECT_UNCLOAKED:
             now = time.perf_counter()
@@ -2842,10 +3450,13 @@ class PrismEngine:
             self._recent_uncloak_times.append(now)
             # Virtual Desktop switch guard: switching desktops cloaks/uncloaks multiple windows in < 80 ms
             if (now - self._last_cloak_ts) < 0.08 or len(self._recent_uncloak_times) >= 3:
-                self._known_visible_hwnds.add(hwnd)
+                with self._state_lock:
+                    self._known_visible_hwnds.add(hwnd)
                 self._unhide_if_prehidden(hwnd)
                 return
-            if hwnd in self._known_visible_hwnds or hwnd in self._prehidden_minimized or w32.user32.IsIconic(hwnd):
+            with self._state_lock:
+                is_known_vis = hwnd in self._known_visible_hwnds
+            if is_known_vis or hwnd in self._prehidden_minimized or w32.user32.IsIconic(hwnd):
                 return
             style = w32.user32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE)
             if (style & w32.WS_CHILD) or not (style & w32.WS_CAPTION) or w32.is_overlay_exstyle(hwnd):
@@ -2857,24 +3468,31 @@ class PrismEngine:
                 return
             if not self._stage_open_window(hwnd, "open"):
                 self._unhide_if_prehidden(hwnd)
-                self._known_visible_hwnds.add(hwnd)
+                with self._state_lock:
+                    self._known_visible_hwnds.add(hwnd)
             return
         if event == w32.EVENT_OBJECT_HIDE:
             # Ignore HIDE fired as a side effect of minimizing (preserves cache for 0 ms Restore!)
             if w32.user32.IsIconic(hwnd):
                 return
-            self._known_visible_hwnds.discard(hwnd)
+            with self._state_lock:
+                self._known_visible_hwnds.discard(hwnd)
             if hwnd in self._pending_opens:
                 self.finish_hidden_handoff(hwnd, 255)
-            if hwnd in self._cached_captures:
+            with self._cache_lock:
+                has_cached = hwnd in self._cached_captures
+            if has_cached:
                 self.trigger_effect_for_window(hwnd, "close")
-                self._cached_captures.pop(hwnd, None)
+                with self._cache_lock:
+                    self._cached_captures.pop(hwnd, None)
 
     def _handle_mouse_event(self, w_param: int, x: int, y: int) -> None:
         if w_param == w32.WM_MBUTTONDOWN and self.config.physics.middle_click_titlebar != "none":
             raw_hwnd = w32.window_from_point(x, y)
             root = int(w32.user32.GetAncestor(raw_hwnd, 2) or raw_hwnd)
-            if root and root not in self._own_hwnds and w32.hit_test_caption(root, x, y):
+            with self._state_lock:
+                root_is_own = root in self._own_hwnds
+            if root and not root_is_own and w32.hit_test_caption(root, x, y):
                 action = self.config.physics.middle_click_titlebar
                 if action == "rollup":
                     self.toggle_rollup_window(root)
@@ -2903,6 +3521,10 @@ class PrismEngine:
         return mons[0]
 
     def _build_frame(self, active_anims: int, paused: str, fg_info: Optional[WindowInfo] = None) -> EngineFrame:
+        with self._state_lock:
+            rolled_up_count = len(self._rolled_up)
+            pinned_count = len(self._pinned)
+            tiled_count = len(self._tiled)
         return EngineFrame(
             timestamp=time.perf_counter(),
             enabled=self.config.enabled,
@@ -2913,9 +3535,9 @@ class PrismEngine:
             active_window_title=(fg_info.title if fg_info else ""),
             active_window_exe=(fg_info.exe_name if fg_info else ""),
             active_window_hwnd=(fg_info.hwnd if fg_info else 0),
-            rolled_up_count=len(self._rolled_up),
-            pinned_count=len(self._pinned),
-            tiled_count=len(self._tiled),
+            rolled_up_count=rolled_up_count,
+            pinned_count=pinned_count,
+            tiled_count=tiled_count,
             journal_pending=self.journal.pending_count(),
             desktop_icons_visible=self.backend.are_desktop_icons_visible(),
             on_battery=self.backend.is_on_battery(),

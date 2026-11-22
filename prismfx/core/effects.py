@@ -243,6 +243,7 @@ class EffectRegistry:
     def __init__(self, custom_dirs: Optional[list[pathlib.Path]] = None) -> None:
         self._effects: dict[str, EffectSpec] = {e.id: e for e in BUILTIN_EFFECTS}
         self._order: list[str] = [e.id for e in BUILTIN_EFFECTS]
+        self._next_custom_shader_id: int = 1000
         if custom_dirs:
             for d in custom_dirs:
                 self.scan_custom_dir(d)
@@ -257,7 +258,6 @@ class EffectRegistry:
         except OSError:
             return 0
         loaded = 0
-        next_shader_id = 1000
         for meta_path in meta_paths:
             try:
                 if meta_path.is_symlink():
@@ -340,9 +340,17 @@ class EffectRegistry:
                     else "เชดเดอร์ GLSL กำหนดเองโดยผู้ใช้"
                 )
 
+                full_id = f"custom_{eid}"
+                existing = self._effects.get(full_id)
+                if existing is not None and existing.is_custom:
+                    shader_id = existing.shader_id
+                else:
+                    shader_id = self._next_custom_shader_id
+                    self._next_custom_shader_id += 1
+
                 spec = EffectSpec(
-                    id=f"custom_{eid}",
-                    shader_id=next_shader_id,
+                    id=full_id,
+                    shader_id=shader_id,
                     name_en=name_en_s,
                     name_th=name_th_s,
                     category="custom",
@@ -355,7 +363,6 @@ class EffectRegistry:
                     custom_frag_path=str(frag_path),
                     badge="USER",
                 )
-                next_shader_id += 1
                 self._effects[spec.id] = spec
                 if spec.id not in self._order:
                     self._order.append(spec.id)

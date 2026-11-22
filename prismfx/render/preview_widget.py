@@ -16,7 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.effects import EffectSpec
 from ..core.physics import WobblyMesh, eval_easing
-from .gl_renderer import OffscreenGpuEngine
+from .gl_renderer import OffscreenGpuEngine, generate_mock_window_image
 
 
 @dataclass
@@ -48,6 +48,7 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
 
         self._gpu = OffscreenGpuEngine.shared()
         self._frame_img: Optional[QtGui.QImage] = None
+        self._fallback_mock_img: Optional[QtGui.QImage] = None
 
         # Playback state
         self._effect_id: int = 1
@@ -159,6 +160,9 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         return self._gpu.gpu_renderer
 
     def _render_current_frame(self) -> None:
+        if not self._gpu.ensure_ready():
+            self._frame_img = None
+            return
         w = max(64, self.width())
         h = max(64, self.height())
         # Cap internal offscreen preview buffer neatly for ultra-fast <0.6 ms GPU render
@@ -196,14 +200,103 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         if len(self._work_times) > 120:
             self._work_times.pop(0)
 
+    def _paint_status_banner(
+        self, p: QtGui.QPainter, title: str, detail: str, at_top: bool = True
+    ) -> None:
+        margin = 10
+        banner_h = 40
+        w = max(80, self.width() - margin * 2)
+        y = margin if at_top else max(margin, self.height() - banner_h - margin)
+        rect = QtCore.QRectF(float(margin), float(y), float(w), float(banner_h))
+
+        p.save()
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setPen(QtGui.QPen(QtGui.QColor("#D97706"), 1.2))
+        p.setBrush(QtGui.QColor(38, 24, 10, 232))
+        p.drawRoundedRect(rect, 6.0, 6.0)
+
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#F59E0B"))
+        p.drawRoundedRect(
+            QtCore.QRectF(rect.left() + 4.0, rect.top() + 5.0, 3.0, rect.height() - 10.0), 1.5, 1.5
+        )
+
+        text_x = int(rect.left() + 14.0)
+        text_w = max(20, int(rect.width() - 22.0))
+
+        title_font = QtGui.QFont("Segoe UI", 8, QtGui.QFont.Bold)
+        p.setFont(title_font)
+        p.setPen(QtGui.QColor("#FBBF24"))
+        p.drawText(
+            QtCore.QRect(text_x, int(rect.top() + 4.0), text_w, 15),
+            QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+            title,
+        )
+
+        detail_font = QtGui.QFont("Consolas", 8)
+        p.setFont(detail_font)
+        p.setPen(QtGui.QColor("#FDE68A"))
+        single_line = " ".join((detail or "").split())
+        fm = QtGui.QFontMetrics(detail_font)
+        elided = fm.elidedText(single_line, QtCore.Qt.ElideRight, text_w)
+        p.drawText(
+            QtCore.QRect(text_x, int(rect.top() + 19.0), text_w, 16),
+            QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+            elided,
+        )
+        p.restore()
+
+    def _paint_software_fallback(self, p: QtGui.QPainter) -> None:
+        if self._fallback_mock_img is None:
+            self._fallback_mock_img = generate_mock_window_image(560, 340)
+
+        w = float(max(64, self.width()))
+        h = float(max(64, self.height()))
+        prog = 0.0 if self._wobble_sandbox else max(0.0, min(1.0, float(self._progress)))
+        scale = max(0.72, 1.0 - 0.16 * prog * max(0.2, float(self._intensity)))
+        opacity = max(0.0, min(1.0, 1.0 - prog))
+
+        base_w = min(w * 0.72, h * 1.18)
+        base_h = base_w * (340.0 / 560.0)
+        card_w = base_w * scale
+        card_h = base_h * scale
+        cx = (w - card_w) * 0.5 + (self._win_offset.x() if self._wobble_sandbox else 0.0)
+        cy = (h - card_h) * 0.5 + (self._win_offset.y() if self._wobble_sandbox else -14.0 * prog)
+
+        p.save()
+        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+        p.setOpacity(opacity)
+        p.drawImage(QtCore.QRectF(cx, cy, card_w, card_h), self._fallback_mock_img)
+        p.restore()
+
+        err_detail = self._gpu.init_error or "OpenGL 3.3 Core unavailable — using 2D software preview"
+        self._paint_status_banner(
+            p,
+            title="OPENGL 3.3 UNAVAILABLE — 2D FALLBACK",
+            detail=err_detail,
+            at_top=True,
+        )
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        if self._frame_img is None:
+        if self._frame_img is None and self._gpu.ensure_ready():
             self._render_current_frame()
         p = QtGui.QPainter(self)
         p.fillRect(self.rect(), QtGui.QColor("#0B0C0E"))
         if self._frame_img is not None:
             p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
             p.drawImage(self.rect(), self._frame_img)
+        elif not self._gpu.ensure_ready():
+            self._paint_software_fallback(p)
+
+        if self._custom_frag and not self._wobble_sandbox:
+            custom_err = self._gpu.get_custom_shader_error(self._custom_frag)
+            if custom_err:
+                self._paint_status_banner(
+                    p,
+                    title="CUSTOM GLSL ERROR — BUILT-IN FALLBACK",
+                    detail=custom_err,
+                    at_top=False,
+                )
         p.end()
 
     def benchmark_frames(self, duration_sec: float = 1.0) -> FramePerfSummary:

@@ -9,19 +9,25 @@ from __future__ import annotations
 
 import array
 import ctypes
+import os
+import pathlib
+import time
 from dataclasses import dataclass
 from typing import Optional
 
+import shiboken6
 from PySide6 import QtCore, QtGui, QtOpenGL
 
 from .shaders import (
     FRAGMENT_SHADER_330,
     VERTEX_SHADER_330,
+    _has_unc_symlink,
     build_grid_mesh,
     hex_to_rgb_f,
-    load_custom_fragment_shader,
+    load_custom_fragment_shader_checked,
 )
 
+GL_NO_ERROR = 0
 GL_TRIANGLES = 0x0004
 GL_FLOAT = 0x1406
 GL_UNSIGNED_BYTE = 0x1401
@@ -31,18 +37,83 @@ GL_ONE = 0x0001
 GL_SRC_ALPHA = 0x0302
 GL_ONE_MINUS_SRC_ALPHA = 0x0303
 GL_COLOR_BUFFER_BIT = 0x4000
+GL_PACK_ROW_LENGTH = 0x0D02
+GL_PACK_ALIGNMENT = 0x0D05
+GL_VIEWPORT = 0x0BA2
+GL_TEXTURE_2D = 0x0DE1
+GL_TEXTURE0 = 0x84C0
+GL_ACTIVE_TEXTURE = 0x84E0
+GL_TEXTURE_BINDING_2D = 0x8069
+GL_VERTEX_ARRAY_BINDING = 0x85B5
+GL_CURRENT_PROGRAM = 0x8B8D
+GL_BLEND_SRC_RGB = 0x80C9
+GL_BLEND_DST_RGB = 0x80C8
+GL_BLEND_SRC_ALPHA = 0x80CB
+GL_BLEND_DST_ALPHA = 0x80CA
+GL_FRAMEBUFFER_BINDING = 0x8CA6
+GL_FRAMEBUFFER = 0x8D40
 
-_gl_read_pixels_fn = None
-try:
-    _opengl32 = ctypes.WinDLL("opengl32", winmode=0x00000800)
-    _opengl32.glReadPixels.argtypes = [
-        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
-    ]
-    _opengl32.glReadPixels.restype = None
-    _gl_read_pixels_fn = _opengl32.glReadPixels
-except Exception:
-    _gl_read_pixels_fn = None
+_GL_READ_PIXELS_FUNC = ctypes.WINFUNCTYPE(
+    None,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_uint,
+    ctypes.c_uint,
+    ctypes.c_void_p,
+)
+_GL_GET_RESET_STATUS_FUNC = ctypes.WINFUNCTYPE(ctypes.c_uint)
+_GL_GET_INTEGERV_FUNC = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
+_GL_BIND_VERTEX_ARRAY_FUNC = ctypes.WINFUNCTYPE(None, ctypes.c_uint)
+
+
+def _destroy_fbo(fbo: Optional[QtOpenGL.QOpenGLFramebufferObject]) -> None:
+    """Unbind (if valid) and delete a QOpenGLFramebufferObject under the current GL context."""
+    if fbo is None or not shiboken6.isValid(fbo):
+        return
+    try:
+        if fbo.isValid():
+            fbo.release()
+    except Exception:
+        pass
+    try:
+        shiboken6.delete(fbo)
+    except Exception:
+        pass
+
+
+def _destroy_program(prog: Optional[QtOpenGL.QOpenGLShaderProgram]) -> None:
+    """Safely release, detach shaders, and delete a QOpenGLShaderProgram under the current GL context."""
+    if prog is None or not shiboken6.isValid(prog):
+        return
+    try:
+        if prog.isLinked():
+            prog.release()
+    except Exception:
+        pass
+    try:
+        prog.removeAllShaders()
+    except Exception:
+        pass
+    try:
+        shiboken6.delete(prog)
+    except Exception:
+        pass
+
+
+def _destroy_texture_obj(tex: Optional[QtOpenGL.QOpenGLTexture]) -> None:
+    """Destroy and delete a QOpenGLTexture under the current GL context."""
+    if tex is None or not shiboken6.isValid(tex):
+        return
+    try:
+        tex.destroy()
+    except Exception:
+        pass
+    try:
+        shiboken6.delete(tex)
+    except Exception:
+        pass
 
 
 def make_gl_format() -> QtGui.QSurfaceFormat:
@@ -73,8 +144,20 @@ class UniformLocations:
     u_wobble: list[int] = None  # type: ignore[assignment]
 
 
+@dataclass
+class _CachedCustomProgram:
+    mtime_ns: int
+    size: int
+    program: Optional[QtOpenGL.QOpenGLShaderProgram]
+    locs: Optional[UniformLocations]
+    error_log: str = ""
+    quarantined: bool = False
+
+
 class ShaderPipeline:
     """Manages static GPU 32×32 triangle mesh VAO/VBO, built-in & custom GLSL programs."""
+
+    _CUSTOM_SMOKE_TIMEOUT_SEC = 0.100
 
     def __init__(self, subdiv: int = 32) -> None:
         self.subdiv = subdiv
@@ -82,7 +165,8 @@ class ShaderPipeline:
         self.error_log = ""
         self._program: Optional[QtOpenGL.QOpenGLShaderProgram] = None
         self._locs: Optional[UniformLocations] = None
-        self._custom_programs: dict[str, tuple[QtOpenGL.QOpenGLShaderProgram, UniformLocations]] = {}
+        self._custom_programs: dict[str, _CachedCustomProgram] = {}
+        self._custom_compile_counts: dict[str, int] = {}
         self._vao: Optional[QtOpenGL.QOpenGLVertexArrayObject] = None
         self._vbo: Optional[QtOpenGL.QOpenGLBuffer] = None
         self._vertex_count = 0
@@ -93,20 +177,29 @@ class ShaderPipeline:
         prog = QtOpenGL.QOpenGLShaderProgram()
         if not prog.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Vertex, VERTEX_SHADER_330):
             self.error_log = f"Vertex shader error: {prog.log()}"
+            _destroy_program(prog)
+            self._program = None
+            self._locs = None
             return False
         if not prog.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Fragment, FRAGMENT_SHADER_330):
             self.error_log = f"Fragment shader error: {prog.log()}"
+            _destroy_program(prog)
+            self._program = None
+            self._locs = None
             return False
         if not prog.link():
             self.error_log = f"Program link error: {prog.log()}"
+            _destroy_program(prog)
+            self._program = None
+            self._locs = None
             return False
-
-        self._program = prog
-        self._locs = self._resolve_uniforms(prog)
 
         vao = QtOpenGL.QOpenGLVertexArrayObject()
         if not vao.create():
             self.error_log = "Failed to create VAO"
+            _destroy_program(prog)
+            self._program = None
+            self._locs = None
             return False
         vao.bind()
 
@@ -118,7 +211,14 @@ class ShaderPipeline:
         self._vertex_count = len(idxs)
 
         vbo = QtOpenGL.QOpenGLBuffer(QtOpenGL.QOpenGLBuffer.VertexBuffer)
-        vbo.create()
+        if not vbo.create():
+            self.error_log = "Failed to create VBO"
+            vao.release()
+            vao.destroy()
+            _destroy_program(prog)
+            self._program = None
+            self._locs = None
+            return False
         vbo.bind()
         raw = array.array("f", tri_verts).tobytes()
         vbo.allocate(raw, len(raw))
@@ -129,6 +229,8 @@ class ShaderPipeline:
         prog.release()
         vao.release()
 
+        self._program = prog
+        self._locs = self._resolve_uniforms(prog)
         self._vao = vao
         self._vbo = vbo
         self.ready = True
@@ -151,24 +253,333 @@ class ShaderPipeline:
             u_wobble=[prog.uniformLocation(f"u_wobble[{i}]") for i in range(16)],
         )
 
+    def get_custom_shader_error(self, path: Optional[str]) -> str:
+        if not path:
+            return ""
+        entry = self._custom_programs.get(path)
+        return entry.error_log if entry is not None else ""
+
+    def custom_compile_count(self, path: Optional[str]) -> int:
+        if not path:
+            return 0
+        return int(self._custom_compile_counts.get(path, 0))
+
+    def _smoke_test_custom_program(
+        self,
+        cp: QtOpenGL.QOpenGLShaderProgram,
+        locs: UniformLocations,
+        gl_funcs,
+    ) -> tuple[bool, str]:
+        """Run a 1-frame 16×16 offscreen smoke test & quarantine shaders exceeding 100 ms or raising GL errors."""
+        if self._vao is None or gl_funcs is None:
+            return (False, "Smoke test unavailable: missing GL funcs or VAO")
+
+        cur_ctx = QtGui.QOpenGLContext.currentContext()
+        if cur_ctx is None:
+            return (False, "Smoke test unavailable: no active OpenGL context")
+
+        try:
+            gi_addr = cur_ctx.getProcAddress(b"glGetIntegerv")
+            if not gi_addr:
+                return (False, "Smoke test unavailable: glGetIntegerv proc unresolved")
+            gl_get_integerv = _GL_GET_INTEGERV_FUNC(int(gi_addr))
+            bva_addr = cur_ctx.getProcAddress(b"glBindVertexArray")
+            gl_bind_vao = _GL_BIND_VERTEX_ARRAY_FUNC(int(bva_addr)) if bva_addr else None
+        except Exception as exc:
+            return (False, f"Smoke test unavailable: GL state probe setup failed ({exc})")
+
+        def _get_int(pname: int) -> int:
+            val = ctypes.c_int(0)
+            gl_get_integerv(pname, ctypes.byref(val))
+            return int(val.value)
+
+        # Snapshot ALL caller GL state before allocating smoke_fbo / smoke_tex
+        try:
+            prev_fbo = _get_int(GL_FRAMEBUFFER_BINDING)
+            vp_arr = (ctypes.c_int * 4)(0, 0, 16, 16)
+            gl_get_integerv(GL_VIEWPORT, vp_arr)
+            prev_vp = (int(vp_arr[0]), int(vp_arr[1]), int(vp_arr[2]), int(vp_arr[3]))
+            prev_vao = _get_int(GL_VERTEX_ARRAY_BINDING)
+            prev_prog = _get_int(GL_CURRENT_PROGRAM)
+            prev_blend_enabled = bool(gl_funcs.glIsEnabled(GL_BLEND))
+            prev_blend_src_rgb = _get_int(GL_BLEND_SRC_RGB)
+            prev_blend_dst_rgb = _get_int(GL_BLEND_DST_RGB)
+            prev_blend_src_alpha = _get_int(GL_BLEND_SRC_ALPHA)
+            prev_blend_dst_alpha = _get_int(GL_BLEND_DST_ALPHA)
+            prev_active_tex = _get_int(GL_ACTIVE_TEXTURE)
+            prev_tex_active = _get_int(GL_TEXTURE_BINDING_2D)
+            if prev_active_tex != GL_TEXTURE0:
+                gl_funcs.glActiveTexture(GL_TEXTURE0)
+                prev_tex0 = _get_int(GL_TEXTURE_BINDING_2D)
+            else:
+                prev_tex0 = prev_tex_active
+        except Exception as exc:
+            return (False, f"Smoke test unavailable: failed to snapshot GL state ({exc})")
+
+        smoke_fbo: Optional[QtOpenGL.QOpenGLFramebufferObject] = None
+        smoke_tex: Optional[QtOpenGL.QOpenGLTexture] = None
+        vao_bound = False
+        prog_bound = False
+        elapsed = 0.0
+        gl_err = GL_NO_ERROR
+        try:
+            # Ensure unit 0 is active BEFORE constructing smoke_tex so non-zero units are untouched
+            gl_funcs.glActiveTexture(GL_TEXTURE0)
+
+            smoke_fbo = QtOpenGL.QOpenGLFramebufferObject(16, 16)
+            if not smoke_fbo.isValid():
+                return (False, "Custom shader quarantined: failed to allocate 16x16 smoke-test FBO")
+
+            smoke_img = QtGui.QImage(1, 1, QtGui.QImage.Format_RGBA8888)
+            smoke_img.fill(QtGui.QColor(255, 255, 255, 255))
+            smoke_tex = QtOpenGL.QOpenGLTexture(smoke_img, QtOpenGL.QOpenGLTexture.DontGenerateMipMaps)
+            smoke_tex.setMinificationFilter(QtOpenGL.QOpenGLTexture.Linear)
+            smoke_tex.setMagnificationFilter(QtOpenGL.QOpenGLTexture.Linear)
+            smoke_tex.setWrapMode(QtOpenGL.QOpenGLTexture.ClampToEdge)
+
+            smoke_fbo.bind()
+            gl_funcs.glViewport(0, 0, 16, 16)
+            for _ in range(16):
+                if gl_funcs.glGetError() == GL_NO_ERROR:
+                    break
+
+            cp.bind()
+            prog_bound = True
+            self._vao.bind()
+            vao_bound = True
+            smoke_tex.bind(0)
+
+            if locs.u_tex >= 0:
+                cp.setUniformValue1i(locs.u_tex, 0)
+            if locs.u_effect >= 0:
+                cp.setUniformValue1i(locs.u_effect, 1000)
+            if locs.u_progress >= 0:
+                cp.setUniformValue1f(locs.u_progress, 0.5)
+            if locs.u_raw_t >= 0:
+                cp.setUniformValue1f(locs.u_raw_t, 0.5)
+            if locs.u_time >= 0:
+                cp.setUniformValue1f(locs.u_time, 0.5)
+            if locs.u_intensity >= 0:
+                cp.setUniformValue1f(locs.u_intensity, 1.0)
+            if locs.u_accent >= 0:
+                cp.setUniformValue(locs.u_accent, QtGui.QVector3D(0.176, 0.506, 1.0))
+            if locs.u_anchor >= 0:
+                cp.setUniformValue(locs.u_anchor, QtGui.QVector2D(0.5, 0.5))
+            if locs.u_rect >= 0:
+                cp.setUniformValue(locs.u_rect, QtGui.QVector4D(0.0, 0.0, 16.0, 16.0))
+            if locs.u_viewport >= 0:
+                cp.setUniformValue(locs.u_viewport, QtGui.QVector2D(16.0, 16.0))
+            if locs.u_win_size >= 0:
+                cp.setUniformValue(locs.u_win_size, QtGui.QVector2D(16.0, 16.0))
+            if locs.u_wobble_active >= 0:
+                cp.setUniformValue1i(locs.u_wobble_active, 0)
+
+            gl_funcs.glEnable(GL_BLEND)
+            gl_funcs.glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+
+            t0 = time.perf_counter()
+            gl_funcs.glDrawArrays(GL_TRIANGLES, 0, self._vertex_count)
+            gl_funcs.glFinish()
+            elapsed = time.perf_counter() - t0
+            gl_err = int(gl_funcs.glGetError())
+        except Exception as exc:
+            return (False, f"Custom shader quarantined: smoke test exception ({exc})")
+        finally:
+            if vao_bound:
+                try:
+                    self._vao.release()
+                except Exception:
+                    pass
+            if prog_bound:
+                try:
+                    cp.release()
+                except Exception:
+                    pass
+            try:
+                gl_funcs.glActiveTexture(GL_TEXTURE0)
+            except Exception:
+                pass
+            _destroy_texture_obj(smoke_tex)
+            _destroy_fbo(smoke_fbo)
+
+            # Unconditionally restore EVERY snapshotted GL state key
+            try:
+                gl_funcs.glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+            except Exception:
+                pass
+            try:
+                gl_funcs.glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3])
+            except Exception:
+                pass
+            if gl_bind_vao is not None:
+                try:
+                    gl_bind_vao(prev_vao)
+                except Exception:
+                    pass
+            try:
+                gl_funcs.glUseProgram(prev_prog)
+            except Exception:
+                pass
+            try:
+                if prev_blend_enabled:
+                    gl_funcs.glEnable(GL_BLEND)
+                else:
+                    gl_funcs.glDisable(GL_BLEND)
+                gl_funcs.glBlendFuncSeparate(
+                    prev_blend_src_rgb,
+                    prev_blend_dst_rgb,
+                    prev_blend_src_alpha,
+                    prev_blend_dst_alpha,
+                )
+            except Exception:
+                pass
+            try:
+                gl_funcs.glActiveTexture(GL_TEXTURE0)
+                gl_funcs.glBindTexture(GL_TEXTURE_2D, prev_tex0)
+                if prev_active_tex != GL_TEXTURE0:
+                    gl_funcs.glActiveTexture(prev_active_tex)
+                    gl_funcs.glBindTexture(GL_TEXTURE_2D, prev_tex_active)
+            except Exception:
+                pass
+
+        if gl_err != GL_NO_ERROR or elapsed > self._CUSTOM_SMOKE_TIMEOUT_SEC:
+            return (
+                False,
+                "Custom shader quarantined: smoke test exceeded 100 ms or raised GL error "
+                f"(elapsed={elapsed * 1000.0:.1f} ms, glError=0x{gl_err:X})",
+            )
+        return (True, "")
+
     def _get_program_for(
-        self, custom_frag_path: Optional[str] = None
+        self, custom_frag_path: Optional[str] = None, gl_funcs=None
     ) -> tuple[QtOpenGL.QOpenGLShaderProgram, UniformLocations]:
         if custom_frag_path:
             cached = self._custom_programs.get(custom_frag_path)
-            if cached:
-                return cached
-            src = load_custom_fragment_shader(custom_frag_path)
-            if src:
-                cp = QtOpenGL.QOpenGLShaderProgram()
-                if (
-                    cp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Vertex, VERTEX_SHADER_330)
-                    and cp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Fragment, src)
-                    and cp.link()
-                ):
-                    locs = self._resolve_uniforms(cp)
-                    self._custom_programs[custom_frag_path] = (cp, locs)
-                    return cp, locs
+            raw_path = custom_frag_path.strip() if isinstance(custom_frag_path, str) else ""
+            # Reject unsafe/UNC/non-.glsl/UNC-symlink paths BEFORE os.stat so Windows never triggers SMB auth
+            if (
+                not raw_path
+                or "\x00" in raw_path
+                or raw_path.replace("/", "\\").startswith(("\\\\", "\\?"))
+                or pathlib.Path(raw_path).suffix.lower() != ".glsl"
+                or _has_unc_symlink(raw_path)
+            ):
+                if cached is not None and cached.mtime_ns == -1 and cached.size == -1:
+                    assert self._program is not None and self._locs is not None
+                    return self._program, self._locs
+                if cached is not None and cached.program is not None:
+                    _destroy_program(cached.program)
+                self._custom_compile_counts[custom_frag_path] = (
+                    self._custom_compile_counts.get(custom_frag_path, 0) + 1
+                )
+                _, err = load_custom_fragment_shader_checked(custom_frag_path)
+                self._custom_programs[custom_frag_path] = _CachedCustomProgram(
+                    mtime_ns=-1,
+                    size=-1,
+                    program=None,
+                    locs=None,
+                    error_log=err or "Invalid custom shader path",
+                )
+                assert self._program is not None and self._locs is not None
+                return self._program, self._locs
+
+            try:
+                st = os.stat(raw_path)
+                mtime_ns = int(st.st_mtime_ns)
+                size = int(st.st_size)
+            except OSError as exc:
+                if cached is not None and cached.mtime_ns == -1 and cached.size == -1:
+                    assert self._program is not None and self._locs is not None
+                    return self._program, self._locs
+                if cached is not None and cached.program is not None:
+                    _destroy_program(cached.program)
+                self._custom_compile_counts[custom_frag_path] = (
+                    self._custom_compile_counts.get(custom_frag_path, 0) + 1
+                )
+                self._custom_programs[custom_frag_path] = _CachedCustomProgram(
+                    mtime_ns=-1,
+                    size=-1,
+                    program=None,
+                    locs=None,
+                    error_log=f"Custom shader unavailable: {exc}",
+                )
+                assert self._program is not None and self._locs is not None
+                return self._program, self._locs
+
+            if cached is not None and cached.mtime_ns == mtime_ns and cached.size == size:
+                if cached.program is not None and not cached.quarantined:
+                    assert cached.locs is not None
+                    return cached.program, cached.locs
+                assert self._program is not None and self._locs is not None
+                return self._program, self._locs
+
+            # Cache miss or mtime/size changed (hot-reload): destroy stale program before recompiling
+            if cached is not None and cached.program is not None:
+                _destroy_program(cached.program)
+
+            self._custom_compile_counts[custom_frag_path] = (
+                self._custom_compile_counts.get(custom_frag_path, 0) + 1
+            )
+            src, err = load_custom_fragment_shader_checked(custom_frag_path)
+            if not src:
+                self._custom_programs[custom_frag_path] = _CachedCustomProgram(
+                    mtime_ns=mtime_ns,
+                    size=size,
+                    program=None,
+                    locs=None,
+                    error_log=err or "Failed to load custom shader",
+                )
+                assert self._program is not None and self._locs is not None
+                return self._program, self._locs
+
+            cp = QtOpenGL.QOpenGLShaderProgram()
+            compiled = (
+                cp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Vertex, VERTEX_SHADER_330)
+                and cp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Fragment, src)
+                and cp.link()
+            )
+            if not compiled:
+                log = (cp.log() or "Custom GLSL shader compile/link failed").strip()
+                _destroy_program(cp)
+                self._custom_programs[custom_frag_path] = _CachedCustomProgram(
+                    mtime_ns=mtime_ns,
+                    size=size,
+                    program=None,
+                    locs=None,
+                    error_log=log,
+                )
+                assert self._program is not None and self._locs is not None
+                return self._program, self._locs
+
+            locs = self._resolve_uniforms(cp)
+            if gl_funcs is None:
+                cur_ctx = QtGui.QOpenGLContext.currentContext()
+                if cur_ctx is not None:
+                    gl_funcs = cur_ctx.functions()
+            smoke_ok, smoke_err = self._smoke_test_custom_program(cp, locs, gl_funcs)
+            if not smoke_ok:
+                _destroy_program(cp)
+                self._custom_programs[custom_frag_path] = _CachedCustomProgram(
+                    mtime_ns=mtime_ns,
+                    size=size,
+                    program=None,
+                    locs=None,
+                    error_log=smoke_err,
+                    quarantined=True,
+                )
+                assert self._program is not None and self._locs is not None
+                return self._program, self._locs
+
+            self._custom_programs[custom_frag_path] = _CachedCustomProgram(
+                mtime_ns=mtime_ns,
+                size=size,
+                program=cp,
+                locs=locs,
+                error_log="",
+                quarantined=False,
+            )
+            return cp, locs
+
         assert self._program is not None and self._locs is not None
         return self._program, self._locs
 
@@ -190,7 +601,7 @@ class ShaderPipeline:
     ) -> None:
         if not self.ready or self._vao is None:
             return
-        prog, locs = self._get_program_for(custom_frag_path)
+        prog, locs = self._get_program_for(custom_frag_path, gl_funcs=gl_funcs)
         prog.bind()
         self._vao.bind()
         texture.bind(0)
@@ -240,14 +651,31 @@ class ShaderPipeline:
         prog.release()
 
     def cleanup(self) -> None:
-        if self._vbo:
-            self._vbo.destroy()
+        if self._vbo is not None:
+            if shiboken6.isValid(self._vbo):
+                self._vbo.destroy()
             self._vbo = None
-        if self._vao:
-            self._vao.destroy()
+        if self._vao is not None:
+            if shiboken6.isValid(self._vao):
+                self._vao.destroy()
             self._vao = None
+        for entry in list(self._custom_programs.values()):
+            _destroy_program(entry.program)
         self._custom_programs.clear()
+        self._custom_compile_counts.clear()
+        _destroy_program(self._program)
         self._program = None
+        self._locs = None
+        self.ready = False
+
+    def reset_lost(self) -> None:
+        """Clear all GL object references after context loss without issuing GL calls."""
+        self._vbo = None
+        self._vao = None
+        self._custom_programs.clear()
+        self._custom_compile_counts.clear()
+        self._program = None
+        self._locs = None
         self.ready = False
 
 
@@ -268,50 +696,169 @@ class OffscreenGpuEngine:
     def __init__(self) -> None:
         self.ready = False
         self.gpu_renderer = "Software Fallback"
+        self._init_attempted: bool = False
+        self._init_error: str = ""
         self._ctx: Optional[QtGui.QOpenGLContext] = None
         self._surf: Optional[QtGui.QOffscreenSurface] = None
+        self._gl_read_pixels_fn = None
+        self._gl_reset_status_fn = None
+        self._is_gles: bool = False
         self._pipeline = ShaderPipeline(subdiv=32)
         self._fbo_cache: dict[tuple[int, int], QtOpenGL.QOpenGLFramebufferObject] = {}
         self._mock_tex: Optional[QtOpenGL.QOpenGLTexture] = None
 
+    @property
+    def init_error(self) -> str:
+        return self._init_error
+
+    def reset_init_attempt(self) -> None:
+        self._init_attempted = False
+        self._init_error = ""
+
+    def get_custom_shader_error(self, path: Optional[str]) -> str:
+        return self._pipeline.get_custom_shader_error(path)
+
+    def custom_compile_count(self, path: Optional[str]) -> int:
+        return self._pipeline.custom_compile_count(path)
+
     def ensure_ready(self) -> bool:
         if self.ready:
             return True
+        if self._init_attempted:
+            return False
+        self._init_attempted = True
+        self._init_error = ""
+
         fmt = make_gl_format()
         ctx = QtGui.QOpenGLContext()
         ctx.setFormat(fmt)
         if not ctx.create():
+            self._init_error = "OpenGL 3.3 Core context creation failed"
             return False
+
+        ver = ctx.format().version()
+        if ver < (3, 3):
+            self._init_error = f"OpenGL 3.3+ required (driver reported {ver[0]}.{ver[1]})"
+            return False
+
         surf = QtGui.QOffscreenSurface()
-        surf.setFormat(fmt)
+        surf.setFormat(ctx.format())
         surf.create()
-        if not surf.isValid() or not ctx.makeCurrent(surf):
+        if not surf.isValid():
+            self._init_error = "Failed to create QOffscreenSurface"
+            surf.destroy()
+            return False
+        if not ctx.makeCurrent(surf):
+            self._init_error = "Failed to make OpenGL 3.3 context current"
+            surf.destroy()
             return False
 
-        funcs = ctx.functions()
+        mock_tex: Optional[QtOpenGL.QOpenGLTexture] = None
+        detected_renderer = "OpenGL 3.3 Core"
         try:
-            raw_r = funcs.glGetString(0x1F01)
-            self.gpu_renderer = str(raw_r) if raw_r else "OpenGL 3.3 Core"
-        except Exception:
-            self.gpu_renderer = "OpenGL 3.3 Core"
+            funcs = ctx.functions()
+            try:
+                raw_r = funcs.glGetString(0x1F01)
+                if isinstance(raw_r, (bytes, bytearray)):
+                    detected_renderer = raw_r.decode("utf-8", errors="replace") or "OpenGL 3.3 Core"
+                elif raw_r:
+                    detected_renderer = str(raw_r)
+                else:
+                    detected_renderer = "OpenGL 3.3 Core"
+            except Exception:
+                detected_renderer = "OpenGL 3.3 Core"
 
-        if not self._pipeline.initialize():
+            if not self._pipeline.initialize():
+                self._init_error = self._pipeline.error_log or "ShaderPipeline initialization failed"
+                ctx.doneCurrent()
+                surf.destroy()
+                return False
+
+            is_gles = bool(ctx.isOpenGLES())
+            read_pixels_fn = None
+            if not is_gles:
+                try:
+                    rp_addr = ctx.getProcAddress(b"glReadPixels")
+                    if rp_addr:
+                        read_pixels_fn = _GL_READ_PIXELS_FUNC(int(rp_addr))
+                except Exception:
+                    read_pixels_fn = None
+
+            reset_status_fn = None
+            try:
+                rs_addr = ctx.getProcAddress(b"glGetGraphicsResetStatus") or ctx.getProcAddress(
+                    b"glGetGraphicsResetStatusARB"
+                )
+                if rs_addr:
+                    reset_status_fn = _GL_GET_RESET_STATUS_FUNC(int(rs_addr))
+            except Exception:
+                reset_status_fn = None
+
+            mock_img = generate_mock_window_image(560, 340)
+            mock_tex = QtOpenGL.QOpenGLTexture(mock_img, QtOpenGL.QOpenGLTexture.DontGenerateMipMaps)
+            mock_tex.setMinificationFilter(QtOpenGL.QOpenGLTexture.Linear)
+            mock_tex.setMagnificationFilter(QtOpenGL.QOpenGLTexture.Linear)
+            mock_tex.setWrapMode(QtOpenGL.QOpenGLTexture.ClampToEdge)
+
             ctx.doneCurrent()
+        except Exception as exc:
+            self._init_error = f"OpenGL initialization error: {exc}"
+            _destroy_texture_obj(mock_tex)
+            self._pipeline.cleanup()
+            try:
+                ctx.doneCurrent()
+            except Exception:
+                pass
+            surf.destroy()
             return False
 
-        mock_img = generate_mock_window_image(560, 340)
-        self._mock_tex = QtOpenGL.QOpenGLTexture(mock_img)
-        self._mock_tex.setMinificationFilter(QtOpenGL.QOpenGLTexture.Linear)
-        self._mock_tex.setMagnificationFilter(QtOpenGL.QOpenGLTexture.Linear)
-        self._mock_tex.setWrapMode(QtOpenGL.QOpenGLTexture.ClampToEdge)
-
-        ctx.doneCurrent()
         self._ctx = ctx
         self._surf = surf
+        self._mock_tex = mock_tex
+        self._gl_read_pixels_fn = read_pixels_fn
+        self._gl_reset_status_fn = reset_status_fn
+        self._is_gles = is_gles
+        self.gpu_renderer = detected_renderer
         self.ready = True
         return True
 
+    def validate_context(self) -> bool:
+        """Check active OpenGL context health (e.g. after sleep/wake or display change); rebuild if lost."""
+        if (
+            self.ready
+            and self._ctx is not None
+            and self._surf is not None
+            and shiboken6.isValid(self._ctx)
+            and shiboken6.isValid(self._surf)
+            and self._ctx.isValid()
+            and self._surf.isValid()
+            and self._ctx.makeCurrent(self._surf)
+        ):
+            healthy = True
+            try:
+                if self._gl_reset_status_fn is not None:
+                    if int(self._gl_reset_status_fn()) != 0:
+                        healthy = False
+            except Exception:
+                healthy = False
+            finally:
+                self._ctx.doneCurrent()
+            if healthy:
+                return True
+
+        self.shutdown()
+        self._init_attempted = False
+        self._init_error = ""
+        return self.ensure_ready()
+
     def create_texture_from_bgra(self, img_w: int, img_h: int, bgra: bytes) -> Optional[QtOpenGL.QOpenGLTexture]:
+        if img_w <= 0 or img_h <= 0 or bgra is None:
+            return None
+        try:
+            if len(bgra) < int(img_w) * int(img_h) * 4:
+                return None
+        except TypeError:
+            return None
         if not self.ensure_ready() or self._ctx is None or self._surf is None:
             return None
         if not self._ctx.makeCurrent(self._surf):
@@ -324,22 +871,31 @@ class OffscreenGpuEngine:
     def destroy_texture(self, tex: Optional[QtOpenGL.QOpenGLTexture]) -> None:
         if tex is None or not self.ready or self._ctx is None or self._surf is None:
             return
+        if not shiboken6.isValid(tex):
+            return
         if self._ctx.makeCurrent(self._surf):
             try:
-                tex.destroy()
+                _destroy_texture_obj(tex)
             finally:
                 self._ctx.doneCurrent()
 
-    def _get_fbo(self, w: int, h: int) -> QtOpenGL.QOpenGLFramebufferObject:
+    def _get_fbo(self, w: int, h: int) -> Optional[QtOpenGL.QOpenGLFramebufferObject]:
         key = (w, h)
         fbo = self._fbo_cache.get(key)
         if fbo is not None:
-            return fbo
-        # Keep bounded FBO cache (max 4 sizes to avoid VRAM bloat)
-        if len(self._fbo_cache) >= 4:
+            if shiboken6.isValid(fbo) and fbo.isValid():
+                return fbo
+            self._fbo_cache.pop(key, None)
+            _destroy_fbo(fbo)
+        # Keep bounded FBO cache (max 4 sizes to avoid VRAM bloat); destroy evicted FBO under current GL context
+        while len(self._fbo_cache) >= 4:
             old_key = next(iter(self._fbo_cache))
-            self._fbo_cache.pop(old_key)
+            old_fbo = self._fbo_cache.pop(old_key)
+            _destroy_fbo(old_fbo)
         fbo = QtOpenGL.QOpenGLFramebufferObject(w, h)
+        if not fbo.isValid():
+            _destroy_fbo(fbo)
+            return None
         self._fbo_cache[key] = fbo
         return fbo
 
@@ -372,6 +928,8 @@ class OffscreenGpuEngine:
             return None
         try:
             fbo = self._get_fbo(vw, vh)
+            if fbo is None:
+                return None
             fbo.bind()
             funcs = self._ctx.functions()
             funcs.glViewport(0, 0, vw, vh)
@@ -415,6 +973,7 @@ class OffscreenGpuEngine:
         clear_rgba: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
         wobble_offsets: Optional[list[float]] = None,
         custom_frag_path: Optional[str] = None,
+        dib_byte_size: Optional[int] = None,
     ) -> bool:
         """Zero-copy GPU->DIB render: glReadPixels(GL_BGRA) straight into a bottom-up Win32 DIB.
 
@@ -423,12 +982,18 @@ class OffscreenGpuEngine:
         the FBO pixels are ALREADY premultiplied and bottom-up — matching a positive-biHeight
         Win32 UpdateLayeredWindow DIB with zero CPU copies, zero swizzling, and zero Y-flip!
         """
-        if not dib_ptr or _gl_read_pixels_fn is None:
+        if not dib_ptr:
+            return False
+        vw = int(viewport_w)
+        vh = int(viewport_h)
+        if vw < 16 or vh < 16:
+            return False
+        if dib_byte_size is not None and (int(dib_byte_size) <= 0 or vw * vh * 4 > int(dib_byte_size)):
             return False
         if not self.ensure_ready() or self._ctx is None or self._surf is None:
             return False
-        vw = max(16, int(viewport_w))
-        vh = max(16, int(viewport_h))
+        if self._gl_read_pixels_fn is None or self._is_gles:
+            return False
         tex = texture or self._mock_tex
         if tex is None:
             return False
@@ -436,6 +1001,8 @@ class OffscreenGpuEngine:
             return False
         try:
             fbo = self._get_fbo(vw, vh)
+            if fbo is None:
+                return False
             fbo.bind()
             funcs = self._ctx.functions()
             funcs.glViewport(0, 0, vw, vh)
@@ -456,7 +1023,10 @@ class OffscreenGpuEngine:
                 wobble_offsets=wobble_offsets,
                 custom_frag_path=custom_frag_path,
             )
-            _gl_read_pixels_fn(0, 0, vw, vh, GL_BGRA, GL_UNSIGNED_BYTE, ctypes.c_void_p(dib_ptr))
+            funcs.glPixelStorei(GL_PACK_ALIGNMENT, 4)
+            if not self._is_gles:
+                funcs.glPixelStorei(GL_PACK_ROW_LENGTH, 0)
+            self._gl_read_pixels_fn(0, 0, vw, vh, GL_BGRA, GL_UNSIGNED_BYTE, ctypes.c_void_p(dib_ptr))
             fbo.release()
             return True
         finally:
@@ -471,22 +1041,31 @@ class OffscreenGpuEngine:
         to_tex: Optional[QtOpenGL.QOpenGLTexture],
         blend_t: float,
         dib_ptr: int,
+        dib_byte_size: Optional[int] = None,
     ) -> bool:
         """Zero-copy 165 Hz Dual-Texture Cross-Morph straight into a bottom-up Win32 DIB.
 
         Draws from_tex 100% opaque at `rect`, then blends to_tex over it with alpha=blend_t so
         RGB = lerp(from, to, blend_t) while maintaining solid 1.0 alpha (zero mid-fade transparency).
         """
-        if not dib_ptr or _gl_read_pixels_fn is None:
+        if not dib_ptr:
+            return False
+        vw = int(viewport_w)
+        vh = int(viewport_h)
+        if vw < 16 or vh < 16:
+            return False
+        if dib_byte_size is not None and (int(dib_byte_size) <= 0 or vw * vh * 4 > int(dib_byte_size)):
             return False
         if not self.ensure_ready() or self._ctx is None or self._surf is None:
             return False
-        vw = max(16, int(viewport_w))
-        vh = max(16, int(viewport_h))
+        if self._gl_read_pixels_fn is None or self._is_gles:
+            return False
         if not self._ctx.makeCurrent(self._surf):
             return False
         try:
             fbo = self._get_fbo(vw, vh)
+            if fbo is None:
+                return False
             fbo.bind()
             funcs = self._ctx.functions()
             funcs.glViewport(0, 0, vw, vh)
@@ -516,7 +1095,10 @@ class OffscreenGpuEngine:
                     elapsed_time=0.0, intensity=1.0, accent_hex="#2D81FF",
                     rect=rect, viewport=(float(vw), float(vh)), anchor=(0.5, 0.5),
                 )
-            _gl_read_pixels_fn(0, 0, vw, vh, GL_BGRA, GL_UNSIGNED_BYTE, ctypes.c_void_p(dib_ptr))
+            funcs.glPixelStorei(GL_PACK_ALIGNMENT, 4)
+            if not self._is_gles:
+                funcs.glPixelStorei(GL_PACK_ROW_LENGTH, 0)
+            self._gl_read_pixels_fn(0, 0, vw, vh, GL_BGRA, GL_UNSIGNED_BYTE, ctypes.c_void_p(dib_ptr))
             fbo.release()
             return True
         finally:
@@ -539,6 +1121,8 @@ class OffscreenGpuEngine:
             return None
         try:
             fbo = self._get_fbo(vw, vh)
+            if fbo is None:
+                return None
             fbo.bind()
             funcs = self._ctx.functions()
             funcs.glViewport(0, 0, vw, vh)
@@ -575,24 +1159,60 @@ class OffscreenGpuEngine:
             self._ctx.doneCurrent()
 
     def shutdown(self) -> None:
-        if not self.ready or self._ctx is None or self._surf is None:
-            return
-        if self._ctx.makeCurrent(self._surf):
+        ctx = self._ctx
+        surf = self._surf
+        if (
+            ctx is not None
+            and surf is not None
+            and shiboken6.isValid(ctx)
+            and shiboken6.isValid(surf)
+            and ctx.isValid()
+            and surf.isValid()
+            and ctx.makeCurrent(surf)
+        ):
             try:
-                if self._mock_tex:
-                    self._mock_tex.destroy()
+                if self._mock_tex is not None:
+                    _destroy_texture_obj(self._mock_tex)
                     self._mock_tex = None
+                for fbo in list(self._fbo_cache.values()):
+                    _destroy_fbo(fbo)
                 self._fbo_cache.clear()
                 self._pipeline.cleanup()
             finally:
-                self._ctx.doneCurrent()
+                ctx.doneCurrent()
+        else:
+            self._mock_tex = None
+            self._fbo_cache.clear()
+            self._pipeline.reset_lost()
+
+        if surf is not None and shiboken6.isValid(surf):
+            try:
+                surf.destroy()
+            except Exception:
+                pass
+        self._ctx = None
+        self._surf = None
+        self._gl_read_pixels_fn = None
+        self._gl_reset_status_fn = None
+        self._is_gles = False
         self.ready = False
 
 
-def texture_from_bgra(img_w: int, img_h: int, bgra: bytes) -> QtOpenGL.QOpenGLTexture:
+def texture_from_bgra(img_w: int, img_h: int, bgra: bytes) -> Optional[QtOpenGL.QOpenGLTexture]:
+    if img_w <= 0 or img_h <= 0 or bgra is None:
+        return None
+    w = int(img_w)
+    h = int(img_h)
+    try:
+        if len(bgra) < w * h * 4:
+            return None
+    except TypeError:
+        return None
     # Format_RGB32 forces alpha=255 so GDI PrintWindow's occasional 0x00 alpha bytes never render black!
-    qimg = QtGui.QImage(bgra, img_w, img_h, img_w * 4, QtGui.QImage.Format_RGB32)
-    tex = QtOpenGL.QOpenGLTexture(qimg)
+    qimg = QtGui.QImage(bgra, w, h, w * 4, QtGui.QImage.Format_RGB32)
+    if qimg.isNull():
+        return None
+    tex = QtOpenGL.QOpenGLTexture(qimg, QtOpenGL.QOpenGLTexture.DontGenerateMipMaps)
     tex.setMinificationFilter(QtOpenGL.QOpenGLTexture.Linear)
     tex.setMagnificationFilter(QtOpenGL.QOpenGLTexture.Linear)
     tex.setWrapMode(QtOpenGL.QOpenGLTexture.ClampToEdge)

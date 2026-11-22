@@ -52,13 +52,22 @@ class IWindowSystemBackend(abc.ABC):
     def get_foreground_hwnd(self) -> int: ...
 
     @abc.abstractmethod
-    def capture_window_bgra(self, hwnd: int) -> Optional[tuple[int, int, bytes]]: ...
+    def capture_window_bgra(
+        self, hwnd: int, allow_screen_fallback: bool = True
+    ) -> Optional[tuple[int, int, bytes]]: ...
 
     @abc.abstractmethod
-    def set_window_opacity(self, hwnd: int, alpha: int) -> bool: ...
+    def get_window_layered_state(self, hwnd: int) -> tuple[bool, Optional[int]]: ...
 
     @abc.abstractmethod
-    def set_window_hidden_alpha(self, hwnd: int, hidden: bool, restore_alpha: int = 255) -> bool: ...
+    def set_window_opacity(
+        self, hwnd: int, alpha: int, had_layered: Optional[bool] = None
+    ) -> bool: ...
+
+    @abc.abstractmethod
+    def set_window_hidden_alpha(
+        self, hwnd: int, hidden: bool, restore_alpha: int = 255, had_layered: Optional[bool] = None
+    ) -> bool: ...
 
     @abc.abstractmethod
     def is_overlay_window(self, hwnd: int) -> bool: ...
@@ -202,14 +211,23 @@ class Win32WindowBackend(IWindowSystemBackend):
         w32.user32.EnumWindows(w32.ENUMWINDOWSPROC(_cb), 0)
         return found
 
-    def capture_window_bgra(self, hwnd: int) -> Optional[tuple[int, int, bytes]]:
-        return w32.capture_window_bgra(hwnd)
+    def capture_window_bgra(
+        self, hwnd: int, allow_screen_fallback: bool = True
+    ) -> Optional[tuple[int, int, bytes]]:
+        return w32.capture_window_bgra(hwnd, allow_screen_fallback=allow_screen_fallback)
 
-    def set_window_opacity(self, hwnd: int, alpha: int) -> bool:
-        return w32.set_window_opacity(hwnd, alpha)
+    def get_window_layered_state(self, hwnd: int) -> tuple[bool, Optional[int]]:
+        return w32.get_window_layered_state(hwnd)
 
-    def set_window_hidden_alpha(self, hwnd: int, hidden: bool, restore_alpha: int = 255) -> bool:
-        return w32.set_window_hidden_alpha(hwnd, hidden, restore_alpha)
+    def set_window_opacity(
+        self, hwnd: int, alpha: int, had_layered: Optional[bool] = None
+    ) -> bool:
+        return w32.set_window_opacity(hwnd, alpha, had_layered=had_layered)
+
+    def set_window_hidden_alpha(
+        self, hwnd: int, hidden: bool, restore_alpha: int = 255, had_layered: Optional[bool] = None
+    ) -> bool:
+        return w32.set_window_hidden_alpha(hwnd, hidden, restore_alpha, had_layered=had_layered)
 
     def is_overlay_window(self, hwnd: int) -> bool:
         return w32.is_overlay_exstyle(hwnd)
@@ -281,6 +299,8 @@ class DemoWindowBackend(IWindowSystemBackend):
             (1008, "Notepad — Architecture Notes.md", "Notepad", 9812, "Notepad.exe", 640, 220, 720, 520),
         ]
         self._windows: dict[int, WindowInfo] = {}
+        self._layered_hwnds: set[int] = set()
+        self._per_pixel_layered_hwnds: set[int] = set()
         for hwnd, title, cls, pid, exe, x, y, w, h in specs:
             self._windows[hwnd] = WindowInfo(
                 hwnd=hwnd,
@@ -320,7 +340,9 @@ class DemoWindowBackend(IWindowSystemBackend):
     def is_valid_window(self, hwnd: int) -> bool:
         return hwnd in self._windows
 
-    def capture_window_bgra(self, hwnd: int) -> Optional[tuple[int, int, bytes]]:
+    def capture_window_bgra(
+        self, hwnd: int, allow_screen_fallback: bool = True
+    ) -> Optional[tuple[int, int, bytes]]:
         info = self._windows.get(hwnd)
         if not info:
             return None
@@ -341,17 +363,43 @@ class DemoWindowBackend(IWindowSystemBackend):
                     buf[idx + 3] = 255
         return (w, h, bytes(buf))
 
-    def set_window_opacity(self, hwnd: int, alpha: int) -> bool:
-        if hwnd in self._windows:
-            self._windows[hwnd].opacity = max(20, min(255, alpha))
-            return True
-        return False
+    def get_window_layered_state(self, hwnd: int) -> tuple[bool, Optional[int]]:
+        w = self._windows.get(hwnd)
+        if not w:
+            return (False, None)
+        if hwnd in self._per_pixel_layered_hwnds:
+            return (True, None)
+        return (hwnd in self._layered_hwnds, w.opacity)
 
-    def set_window_hidden_alpha(self, hwnd: int, hidden: bool, restore_alpha: int = 255) -> bool:
-        if hwnd in self._windows:
-            self._windows[hwnd].opacity = 0 if hidden else max(20, min(255, restore_alpha))
+    def set_window_opacity(
+        self, hwnd: int, alpha: int, had_layered: Optional[bool] = None
+    ) -> bool:
+        if hwnd not in self._windows or hwnd in self._per_pixel_layered_hwnds:
+            return False
+        clamped = max(20, min(255, int(alpha)))
+        self._windows[hwnd].opacity = clamped
+        if clamped < 255:
+            self._layered_hwnds.add(hwnd)
+        elif had_layered is False:
+            self._layered_hwnds.discard(hwnd)
+        return True
+
+    def set_window_hidden_alpha(
+        self, hwnd: int, hidden: bool, restore_alpha: int = 255, had_layered: Optional[bool] = None
+    ) -> bool:
+        if hwnd not in self._windows or hwnd in self._per_pixel_layered_hwnds:
+            return False
+        if hidden:
+            self._windows[hwnd].opacity = 0
+            self._layered_hwnds.add(hwnd)
             return True
-        return False
+        clamped = max(20, min(255, int(restore_alpha)))
+        self._windows[hwnd].opacity = clamped
+        if clamped < 255:
+            self._layered_hwnds.add(hwnd)
+        elif had_layered is False:
+            self._layered_hwnds.discard(hwnd)
+        return True
 
     def is_overlay_window(self, hwnd: int) -> bool:
         return False

@@ -487,7 +487,7 @@ def run_selftest() -> dict:
             fbo = QtOpenGL.QOpenGLFramebufferObject(160, 100)
             fbo.bind()
             img = generate_mock_window_image(160, 100)
-            tex = QtOpenGL.QOpenGLTexture(img)
+            tex = QtOpenGL.QOpenGLTexture(img, QtOpenGL.QOpenGLTexture.DontGenerateMipMaps)
             tex.setMinificationFilter(QtOpenGL.QOpenGLTexture.Linear)
             tex.setMagnificationFilter(QtOpenGL.QOpenGLTexture.Linear)
             funcs = ctx.functions()
@@ -516,12 +516,300 @@ def run_selftest() -> dict:
             total_shaders = reg.shader_effect_count()
             check("gl33_render_all_42_shaders", rendered_ok == total_shaders and gl_errors == 0,
                   f"rendered={rendered_ok}/{total_shaders} gl_errors={gl_errors}")
+
+            # 8b. Sprint 1 Regression: GLSL 330 Strictness (PFX-C04) across 42/42 shaders at p=0.0, 0.45, 1.0
+            import re as _re
+            from .render.shaders import FRAGMENT_SHADER_330, VERTEX_SHADER_330
+
+            strict_gl_errors = 0
+            strict_p0_ok = 0
+            strict_p45_ok = 0
+            strict_p1_ok = 0
+            p0_images: dict[str, QtGui.QImage] = {}
+            p45_images: dict[str, QtGui.QImage] = {}
+            for spec in reg.all_effects(include_special=False):
+                anchor = (0.5, 0.5) if spec.id == "black_hole" else (0.5, 0.9)
+                for p_val in (0.0, 0.45, 1.0):
+                    funcs.glViewport(0, 0, 160, 100)
+                    funcs.glClearColor(0.0, 0.0, 0.0, 0.0)
+                    funcs.glClear(GL_COLOR_BUFFER_BIT)
+                    pipe.draw_window(
+                        funcs, tex, spec.shader_id, p_val, p_val, 1.2, 1.0,
+                        spec.accent_hex, (12.0, 8.0, 136.0, 84.0), (160.0, 100.0),
+                        anchor=anchor,
+                    )
+                    if funcs.glGetError() != 0:
+                        strict_gl_errors += 1
+                    frame = fbo.toImage()
+                    opaque_cnt = sum(
+                        1
+                        for y in range(16, 86, 10)
+                        for x in range(20, 140, 15)
+                        if frame.pixelColor(x, y).alpha() > 10
+                    )
+                    if p_val == 0.0:
+                        if opaque_cnt > 0:
+                            strict_p0_ok += 1
+                        if spec.id in ("clean_fade", "pixelate_mosaic"):
+                            p0_images[spec.id] = frame
+                    elif p_val == 0.45:
+                        if opaque_cnt > 0:
+                            strict_p45_ok += 1
+                        if spec.id in ("ember_burn", "black_hole"):
+                            p45_images[spec.id] = frame
+                    else:
+                        strict_p1_ok += 1
+
+            # Verify pixelate_mosaic at p=0.0 matches clean_fade cleanly (no coarse block garbage)
+            mosaic_p0_clean = False
+            if "clean_fade" in p0_images and "pixelate_mosaic" in p0_images:
+                img_cf = p0_images["clean_fade"]
+                img_pm = p0_images["pixelate_mosaic"]
+                max_diff = 0
+                for y in range(14, 88, 6):
+                    for x in range(18, 142, 8):
+                        c1 = img_cf.pixelColor(x, y)
+                        c2 = img_pm.pixelColor(x, y)
+                        max_diff = max(
+                            max_diff,
+                            abs(c1.red() - c2.red()),
+                            abs(c1.green() - c2.green()),
+                            abs(c1.blue() - c2.blue()),
+                            abs(c1.alpha() - c2.alpha()),
+                        )
+                mosaic_p0_clean = max_diff <= 2
+
+            # Verify ember_burn & black_hole at p=0.45 have non-black, non-zero-alpha visible interior pixels
+            def _has_rich_pixels(qim: QtGui.QImage) -> bool:
+                lit = 0
+                for y in range(14, 88, 6):
+                    for x in range(18, 142, 8):
+                        c = qim.pixelColor(x, y)
+                        if c.alpha() > 20 and (c.red() + c.green() + c.blue()) > 30:
+                            lit += 1
+                return lit >= 8
+
+            ember_ok = "ember_burn" in p45_images and _has_rich_pixels(p45_images["ember_burn"])
+            bh_ok = "black_hole" in p45_images and _has_rich_pixels(p45_images["black_hole"])
+
+            # Static GLSL 330 strictness guard: zero inverted numeric smoothstep(hi, lo, x)
+            inverted_smoothsteps = 0
+            for src_blob in (VERTEX_SHADER_330, FRAGMENT_SHADER_330):
+                for m_ss in _re.finditer(r"smoothstep\s*\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,", src_blob):
+                    if float(m_ss.group(1)) >= float(m_ss.group(2)):
+                        inverted_smoothsteps += 1
+
+            check(
+                "sprint1_glsl330_strictness",
+                strict_gl_errors == 0
+                and strict_p0_ok == total_shaders
+                and strict_p45_ok == total_shaders
+                and strict_p1_ok == total_shaders
+                and mosaic_p0_clean
+                and ember_ok
+                and bh_ok
+                and inverted_smoothsteps == 0,
+                f"p0={strict_p0_ok}/{total_shaders} p45={strict_p45_ok}/{total_shaders} gl_err={strict_gl_errors} "
+                f"mosaic_p0_clean={mosaic_p0_clean} ember={ember_ok} black_hole={bh_ok} inv_ss={inverted_smoothsteps}",
+            )
+
             tex.destroy()
             fbo.release()
             pipe.cleanup()
         ctx.doneCurrent()
+        surf.destroy()
     else:
+        if surf.isValid():
+            surf.destroy()
         check("gl33_context", False, "Failed to create OpenGL 3.3 Core context")
+
+    # 9. Sprint 1 Regression Tests (PFX-C03, PFX-H03, PFX-H05, PFX-H01, PFX-H02)
+    import ctypes as _ct
+    import shiboken6 as _shiboken
+    from .render.gl_renderer import OffscreenGpuEngine
+    from .render.shaders import load_custom_fragment_shader, validate_custom_glsl_source
+
+    # (9a) ABI Check (PFX-C03): all 14 gdi32/user32 functions + c_ubyte structs
+    abi_targets = [
+        (w32.gdi32, "CreateCompatibleDC"),
+        (w32.gdi32, "CreateDIBSection"),
+        (w32.gdi32, "SelectObject"),
+        (w32.gdi32, "BitBlt"),
+        (w32.gdi32, "DeleteObject"),
+        (w32.gdi32, "DeleteDC"),
+        (w32.user32, "GetDC"),
+        (w32.user32, "ReleaseDC"),
+        (w32.user32, "EnumWindows"),
+        (w32.user32, "EnumDisplayMonitors"),
+        (w32.user32, "GetMonitorInfoW"),
+        (w32.user32, "TranslateMessage"),
+        (w32.user32, "DispatchMessageW"),
+        (w32.user32, "SetForegroundWindow"),
+    ]
+    missing_abi = [
+        name for dll, name in abi_targets
+        if getattr(dll, name).argtypes is None or getattr(dll, name).restype is None
+    ]
+    blend_fields_ok = all(t is _ct.c_ubyte for _, t in w32.BLENDFUNCTION._fields_)
+    blend_val_ok = w32.BLENDFUNCTION(0, 0, 255, 1).SourceConstantAlpha == 255
+    sps_fields_ok = all(t is _ct.c_ubyte for _, t in w32.SYSTEM_POWER_STATUS._fields_[:4])
+    check(
+        "sprint1_abi_check",
+        not missing_abi and blend_fields_ok and blend_val_ok and sps_fields_ok,
+        f"missing={missing_abi} blend_ubyte={blend_fields_ok} alpha255={blend_val_ok} sps_ubyte={sps_fields_ok}",
+    )
+
+    # (9b) FBO Leak Probe (PFX-H03): >12 distinct sizes -> evicted FBOs destroyed, 0 leaked handles
+    fbo_gpu = OffscreenGpuEngine()
+    fbo_probe_ok = False
+    fbo_detail = ""
+    try:
+        if fbo_gpu.ensure_ready():
+            seen_fbos: list[tuple[tuple[int, int], QtOpenGL.QOpenGLFramebufferObject]] = []
+            for idx in range(14):
+                sz_w = 64 + idx * 8
+                sz_h = 64 + idx * 6
+                out = fbo_gpu.render_to_image(
+                    sz_w, sz_h, (4.0, 4.0, float(sz_w - 8), float(sz_h - 8)),
+                    37, 0.2, 0.2, 0.5,
+                )
+                if out is not None and (sz_w, sz_h) in fbo_gpu._fbo_cache:
+                    seen_fbos.append(((sz_w, sz_h), fbo_gpu._fbo_cache[(sz_w, sz_h)]))
+            active_keys = set(fbo_gpu._fbo_cache.keys())
+            evicted = [obj for k, obj in seen_fbos if k not in active_keys]
+            leaked_evicted = sum(1 for obj in evicted if _shiboken.isValid(obj))
+            live_handles = sorted(int(obj.handle()) for obj in fbo_gpu._fbo_cache.values() if _shiboken.isValid(obj))
+            fbo_gpu.shutdown()
+            leaked_after_shutdown = sum(1 for _, obj in seen_fbos if _shiboken.isValid(obj))
+            fbo_probe_ok = (
+                len(seen_fbos) == 14
+                and len(active_keys) <= 4
+                and len(evicted) >= 10
+                and leaked_evicted == 0
+                and leaked_after_shutdown == 0
+                and len(live_handles) <= 4
+                and (max(live_handles) <= 5 if live_handles else False)
+            )
+            fbo_detail = (
+                f"sizes={len(seen_fbos)} evicted={len(evicted)} leaked_evicted={leaked_evicted} "
+                f"leaked_shutdown={leaked_after_shutdown} live_handles={live_handles}"
+            )
+        else:
+            fbo_detail = f"gpu_init_failed={fbo_gpu.init_error}"
+    finally:
+        fbo_gpu.shutdown()
+    check("sprint1_fbo_leak_probe", fbo_probe_ok, fbo_detail)
+
+    # (9c) Custom GLSL Negative Cache & Sandbox (PFX-H05): 5x broken -> 1 compile; reject while/do
+    cache_gpu = OffscreenGpuEngine()
+    cache_sandbox_ok = False
+    cache_detail = ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="prismfx_glsl_probe_") as td_gl:
+            gdir = pathlib.Path(td_gl)
+            broken_path = gdir / "broken_syntax.glsl"
+            broken_path.write_text("void main() { THIS_IS_INVALID_GLSL( }\n", encoding="utf-8")
+            while_path = gdir / "bad_while.glsl"
+            while_path.write_text("void main() { int i = 0; while (i < 5) { i++; } fragColor = vec4(1.0); }\n", encoding="utf-8")
+            do_path = gdir / "bad_do.glsl"
+            do_path.write_text("void main() { int i = 0; do { i++; } while (i < 5); fragColor = vec4(1.0); }\n", encoding="utf-8")
+
+            if cache_gpu.ensure_ready():
+                for _ in range(5):
+                    cache_gpu.render_to_image(
+                        64, 64, (4.0, 4.0, 56.0, 56.0),
+                        1000, 0.3, 0.3, 0.5,
+                        custom_frag_path=str(broken_path),
+                    )
+                comp_cnt = cache_gpu.custom_compile_count(str(broken_path))
+                err_msg = cache_gpu.get_custom_shader_error(str(broken_path))
+            else:
+                comp_cnt = -1
+                err_msg = ""
+
+            while_ok, while_err = validate_custom_glsl_source(while_path.read_text(encoding="utf-8"))
+            do_ok, do_err = validate_custom_glsl_source(do_path.read_text(encoding="utf-8"))
+            bypass_payloads = [
+                "void main() { wh\\\nile (true) {} fragColor = vec4(1.0); }",
+                "#define LP (\nvoid main() { for LP ;; ) {} fragColor = vec4(1.0); }",
+                "void main() { for (int i = 0; i < 4, true; ++i) {} fragColor = vec4(1.0); }",
+                "void main() { for (int i = 0; i < 4; ++i) { i = 0; } fragColor = vec4(1.0); }",
+            ]
+            bypasses_rejected = all(not validate_custom_glsl_source(src)[0] for src in bypass_payloads)
+            while_load_none = load_custom_fragment_shader(str(while_path)) is None
+            do_load_none = load_custom_fragment_shader(str(do_path)) is None
+            repo_ripple = pathlib.Path(__file__).resolve().parents[1] / "assets" / "shaders" / "chromatic_ripple_custom.glsl"
+            ripple_ok = load_custom_fragment_shader(str(repo_ripple)) is not None if repo_ripple.is_file() else True
+
+            cache_sandbox_ok = (
+                comp_cnt == 1
+                and bool(err_msg)
+                and (not while_ok)
+                and (not do_ok)
+                and bypasses_rejected
+                and while_load_none
+                and do_load_none
+                and ripple_ok
+            )
+            cache_detail = (
+                f"compile_cnt={comp_cnt} err_cached={bool(err_msg)} "
+                f"while_rejected={not while_ok and while_load_none} "
+                f"do_rejected={not do_ok and do_load_none} bypasses_rejected={bypasses_rejected} ripple_ok={ripple_ok}"
+            )
+    finally:
+        cache_gpu.shutdown()
+    check("sprint1_custom_glsl_cache_and_sandbox", cache_sandbox_ok, cache_detail)
+
+    # (9d) Safe GL Fallback Latch (PFX-H01) & DIB Viewport Bounds Guard (PFX-H02)
+    fail_gpu = OffscreenGpuEngine()
+    orig_ctx_create = QtGui.QOpenGLContext.create
+    create_calls = 0
+    try:
+        def _fail_create(_self) -> bool:
+            nonlocal create_calls
+            create_calls += 1
+            return False
+
+        QtGui.QOpenGLContext.create = _fail_create  # type: ignore[method-assign]
+        fail_results = [fail_gpu.ensure_ready() for _ in range(10)]
+    finally:
+        QtGui.QOpenGLContext.create = orig_ctx_create  # type: ignore[method-assign]
+        fail_gpu.shutdown()
+
+    latch_ok = (
+        not any(fail_results)
+        and create_calls == 1
+        and fail_gpu._init_attempted is True
+        and bool(fail_gpu.init_error)
+    )
+
+    dib_gpu = OffscreenGpuEngine()
+    dib_guard_ok = False
+    try:
+        if dib_gpu.ensure_ready():
+            scratch = (_ct.c_ubyte * (64 * 64 * 4))()
+            ptr = _ct.addressof(scratch)
+            rej_8x8 = not dib_gpu.render_to_dib_ptr(
+                8, 8, (0.0, 0.0, 8.0, 8.0), 37, 0.2, 0.2, 0.5, dib_ptr=ptr, dib_byte_size=8 * 8 * 4
+            )
+            rej_15x32 = not dib_gpu.render_to_dib_ptr(
+                15, 32, (0.0, 0.0, 15.0, 32.0), 37, 0.2, 0.2, 0.5, dib_ptr=ptr, dib_byte_size=15 * 32 * 4
+            )
+            rej_small_buf = not dib_gpu.render_to_dib_ptr(
+                64, 64, (0.0, 0.0, 64.0, 64.0), 37, 0.2, 0.2, 0.5, dib_ptr=ptr, dib_byte_size=64
+            )
+            ok_valid = dib_gpu.render_to_dib_ptr(
+                64, 64, (0.0, 0.0, 64.0, 64.0), 37, 0.2, 0.2, 0.5, dib_ptr=ptr, dib_byte_size=64 * 64 * 4
+            )
+            dib_guard_ok = rej_8x8 and rej_15x32 and rej_small_buf and ok_valid
+    finally:
+        dib_gpu.shutdown()
+
+    check(
+        "sprint1_safe_gl_fallback_and_dib_bounds",
+        latch_ok and dib_guard_ok,
+        f"create_calls={create_calls} latched={fail_gpu._init_attempted} dib_guard={dib_guard_ok}",
+    )
 
     return results
 
@@ -655,7 +943,10 @@ def run_overlay_test(profile_dir: pathlib.Path) -> dict:
     dib_ptr = surf.acquire_bottom_up_dib(128, 128)
     dib_render_ok = bool(
         dib_ptr
-        and gpu.render_to_dib_ptr(128, 128, (0, 0, 128, 128), 37, 0.5, 0.5, 0.5, dib_ptr=dib_ptr, texture=tex)
+        and gpu.render_to_dib_ptr(
+            128, 128, (0, 0, 128, 128), 37, 0.5, 0.5, 0.5,
+            dib_ptr=dib_ptr, texture=tex, dib_byte_size=surf.dib_byte_size,
+        )
         and surf.commit_premul_dib(120, 120, 128, 128)
     )
     check("overlay_zero_copy_dib_glreadpixels", dib_render_ok, f"dib_ptr=0x{dib_ptr:x}")
@@ -839,7 +1130,7 @@ def run_snapshots(profile_dir: pathlib.Path, out_dir: pathlib.Path) -> list[str]
     fbo = QtOpenGL.QOpenGLFramebufferObject(cw - 16, ch - 38)
     fbo.bind()
     mock_img = generate_mock_window_image(420, 260)
-    tex = QtOpenGL.QOpenGLTexture(mock_img)
+    tex = QtOpenGL.QOpenGLTexture(mock_img, QtOpenGL.QOpenGLTexture.DontGenerateMipMaps)
     tex.setMinificationFilter(QtOpenGL.QOpenGLTexture.Linear)
     tex.setMagnificationFilter(QtOpenGL.QOpenGLTexture.Linear)
     funcs = ctx.functions()

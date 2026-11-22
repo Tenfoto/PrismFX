@@ -64,6 +64,7 @@ class _LiveWobble:
     cur_fade: float = 0.0
     settling: bool = False
     settle_started_at: float = 0.0
+    frozen_since: float = 0.0
 
 
 @dataclass
@@ -222,7 +223,14 @@ class DesktopFxOverlay(QtCore.QObject):
 
         dib_ptr = item.surface.acquire_bottom_up_dib(item.union_w, item.union_h)
         if dib_ptr and self._gpu.render_morph_to_dib_ptr(
-            item.union_w, item.union_h, rect, item.from_tex, item.to_tex, blend_t, dib_ptr
+            item.union_w,
+            item.union_h,
+            rect,
+            item.from_tex,
+            item.to_tex,
+            blend_t,
+            dib_ptr,
+            dib_byte_size=item.surface.dib_byte_size,
         ):
             item.surface.commit_premul_dib(item.union_x, item.union_y, item.union_w, item.union_h)
             return
@@ -349,6 +357,7 @@ class DesktopFxOverlay(QtCore.QObject):
             texture=wob.texture,
             clear_rgba=(0.0, 0.0, 0.0, 0.0),
             wobble_offsets=wobble_offsets,
+            dib_byte_size=wob.surface.dib_byte_size,
         ):
             return wob.surface.commit_premul_dib(surf_x, surf_y, wob.surf_w, wob.surf_h)
 
@@ -410,6 +419,7 @@ class DesktopFxOverlay(QtCore.QObject):
         ):
             wob = self._wobble
             wob.settling = False
+            wob.frozen_since = 0.0
             wob.drag_fade_target = fade_target
             wob.mesh.grab_u = max(0.0, min(1.0, req.grab_u))
             wob.mesh.grab_v = max(0.0, min(1.0, req.grab_v))
@@ -566,6 +576,7 @@ class DesktopFxOverlay(QtCore.QObject):
             texture=item.texture,
             clear_rgba=(0.0, 0.0, 0.0, 0.0),
             custom_frag_path=spec.custom_frag_path,
+            dib_byte_size=item.surface.dib_byte_size,
         ):
             item.surface.commit_premul_dib(item.surf_x, item.surf_y, item.surf_w, item.surf_h)
             return
@@ -754,16 +765,27 @@ class DesktopFxOverlay(QtCore.QObject):
                             and self.engine.config.physics.smooth_maximize_enabled
                             and w32.user32.IsZoomed(wob.hwnd)
                         ):
+                            if wob.frozen_since <= 0.0:
+                                wob.frozen_since = now
+                            if (now - wob.frozen_since) >= 0.180:
+                                self._finish_wobble(instant_cancel=True)
                             wob = None
                         else:
                             self._finish_wobble(instant_cancel=True)
                             wob = None
-                    elif lx != wob.x or ly != wob.y:
-                        dx = lx - wob.x
-                        dy = ly - wob.y
-                        wob.x = lx
-                        wob.y = ly
-                        wob.mesh.apply_drag_delta((dx / max(1.0, float(wob.w))) * 0.78, (dy / max(1.0, float(wob.h))) * 0.78)
+                    else:
+                        wob.frozen_since = 0.0
+                        if lx != wob.x or ly != wob.y:
+                            dx = lx - wob.x
+                            dy = ly - wob.y
+                            wob.x = lx
+                            wob.y = ly
+                            wob.mesh.apply_drag_delta((dx / max(1.0, float(wob.w))) * 0.78, (dy / max(1.0, float(wob.h))) * 0.78)
+
+                if wob is not None and wob.frozen_since > 0.0:
+                    if (now - wob.frozen_since) >= 0.180:
+                        self._finish_wobble(instant_cancel=True)
+                    wob = None
 
             if wob is not None:
                 wob.mesh.step(dt)
@@ -813,6 +835,37 @@ class DesktopFxOverlay(QtCore.QObject):
 
         if not self._active and not self._morphs and self._wobble is None:
             self._timer.stop()
+
+    def cancel_all_active(self) -> None:
+        """Immediately cancel all active animations, morphs, wobble, and precover (e.g. on suspend/lock)."""
+        self._precover_timer.stop()
+        self._timer.stop()
+        while True:
+            try:
+                qjob = self.engine.animation_queue.get_nowait()
+            except queue.Empty:
+                break
+            if qjob.restore_hidden_hwnd:
+                self.engine.finish_hidden_handoff(qjob.restore_hidden_hwnd, qjob.restore_alpha)
+        if self._wobble is not None:
+            self._finish_wobble(instant_cancel=True)
+        for m in self._morphs:
+            if m.job.restore_hidden_hwnd:
+                self.engine.finish_hidden_handoff(m.job.restore_hidden_hwnd, m.job.restore_alpha)
+            self._release_surface(m.surface)
+            self._gpu.destroy_texture(m.from_tex)
+            if m.to_tex is not None:
+                self._gpu.destroy_texture(m.to_tex)
+        self._morphs.clear()
+        if self._precover is not None:
+            self._on_precover_cancel(0)
+            self.engine._active_precover_hwnd = 0
+        for item in self._active:
+            if item.job.restore_hidden_hwnd:
+                self.engine.finish_hidden_handoff(item.job.restore_hidden_hwnd, item.job.restore_alpha)
+            self._release_surface(item.surface)
+            self._gpu.destroy_texture(item.texture)
+        self._active.clear()
 
     def shutdown(self) -> None:
         if self.engine.on_animation_queued == self._on_engine_job_queued:

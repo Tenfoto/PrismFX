@@ -22,10 +22,14 @@ class WindowMutation:
     hwnd: int
     cloaked: bool = False
     original_alpha: Optional[int] = None
+    had_layered: Optional[bool] = None
     pinned_by_app: bool = False
     original_height: Optional[int] = None
     rolled_up: bool = False
     timestamp: float = field(default_factory=time.time)
+    pid: int = 0
+    class_name: str = ""
+    boot_tick_ms: int = 0
 
 
 class RecoveryJournal:
@@ -62,6 +66,11 @@ class RecoveryJournal:
                         if item.get("original_alpha") is not None
                         else None
                     ),
+                    had_layered=(
+                        bool(item["had_layered"])
+                        if item.get("had_layered") is not None
+                        else None
+                    ),
                     pinned_by_app=bool(item.get("pinned_by_app", False)),
                     original_height=(
                         int(item["original_height"])
@@ -70,6 +79,9 @@ class RecoveryJournal:
                     ),
                     rolled_up=bool(item.get("rolled_up", False)),
                     timestamp=float(item.get("timestamp", 0.0)),
+                    pid=int(item.get("pid", 0) or 0),
+                    class_name=str(item.get("class_name", "") or ""),
+                    boot_tick_ms=int(item.get("boot_tick_ms", 0) or 0),
                 )
                 loaded_windows[m.hwnd] = m
             orig_min = raw.get("original_min_animate", None)
@@ -142,34 +154,83 @@ class RecoveryJournal:
                 self._original_min_animate = bool(original_value)
             self._flush_locked()
 
-    def record_cloak(self, hwnd: int, cloaked: bool) -> None:
+    @staticmethod
+    def _apply_identity(
+        m: WindowMutation,
+        pid: int = 0,
+        class_name: str = "",
+        boot_tick_ms: int = 0,
+    ) -> None:
+        if pid:
+            m.pid = int(pid)
+        if class_name:
+            m.class_name = str(class_name)
+        if boot_tick_ms:
+            m.boot_tick_ms = int(boot_tick_ms)
+
+    def record_cloak(
+        self,
+        hwnd: int,
+        cloaked: bool,
+        pid: int = 0,
+        class_name: str = "",
+        boot_tick_ms: int = 0,
+    ) -> None:
         with self._lock:
             m = self._windows.get(hwnd) or WindowMutation(hwnd=hwnd)
             m.cloaked = cloaked
+            self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
             self._flush_locked()
 
-    def record_alpha(self, hwnd: int, original_alpha: Optional[int]) -> None:
+    def record_alpha(
+        self,
+        hwnd: int,
+        original_alpha: Optional[int],
+        had_layered: Optional[bool] = None,
+        pid: int = 0,
+        class_name: str = "",
+        boot_tick_ms: int = 0,
+    ) -> None:
         with self._lock:
             m = self._windows.get(hwnd) or WindowMutation(hwnd=hwnd)
             if original_alpha is None:
                 m.original_alpha = None
+                m.had_layered = None
             elif m.original_alpha is None:
                 m.original_alpha = int(original_alpha)
+                m.had_layered = None if had_layered is None else bool(had_layered)
+            self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
             self._flush_locked()
 
-    def record_pin(self, hwnd: int, pinned: bool) -> None:
+    def record_pin(
+        self,
+        hwnd: int,
+        pinned: bool,
+        pid: int = 0,
+        class_name: str = "",
+        boot_tick_ms: int = 0,
+    ) -> None:
         with self._lock:
             m = self._windows.get(hwnd) or WindowMutation(hwnd=hwnd)
             m.pinned_by_app = pinned
+            self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
             self._flush_locked()
 
-    def record_rollup(self, hwnd: int, rolled_up: bool, original_height: Optional[int] = None) -> None:
+    def record_rollup(
+        self,
+        hwnd: int,
+        rolled_up: bool,
+        original_height: Optional[int] = None,
+        pid: int = 0,
+        class_name: str = "",
+        boot_tick_ms: int = 0,
+    ) -> None:
         with self._lock:
             m = self._windows.get(hwnd) or WindowMutation(hwnd=hwnd)
             m.rolled_up = rolled_up
@@ -177,9 +238,19 @@ class RecoveryJournal:
                 m.original_height = int(original_height)
             elif not rolled_up:
                 m.original_height = None
+            self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
             self._flush_locked()
+
+    def prune_hwnd(self, hwnd: int) -> bool:
+        """Remove a destroyed HWND from the recovery journal without restoring it."""
+        with self._lock:
+            removed = self._windows.pop(int(hwnd), None)
+            if removed is not None:
+                self._flush_locked()
+                return True
+            return False
 
     def record_desktop_icons_hidden(self, hidden: bool) -> None:
         with self._lock:
@@ -209,6 +280,8 @@ class RecoveryJournal:
         unroll_fn: Callable[[int, int], object],
         show_desktop_icons_fn: Callable[[], object],
         restore_min_animate_fn: Optional[Callable[[bool], object]] = None,
+        restore_alpha_layered_fn: Optional[Callable[[int, int, Optional[bool]], object]] = None,
+        verify_window_fn: Optional[Callable[[WindowMutation], bool]] = None,
     ) -> int:
         """Revert every recorded mutation safely, preserving any failed entries on disk."""
         with self._lock:
@@ -217,10 +290,14 @@ class RecoveryJournal:
                     hwnd=m.hwnd,
                     cloaked=m.cloaked,
                     original_alpha=m.original_alpha,
+                    had_layered=m.had_layered,
                     pinned_by_app=m.pinned_by_app,
                     original_height=m.original_height,
                     rolled_up=m.rolled_up,
                     timestamp=m.timestamp,
+                    pid=m.pid,
+                    class_name=m.class_name,
+                    boot_tick_ms=m.boot_tick_ms,
                 )
                 for m in self._windows.values()
             ]
@@ -237,6 +314,15 @@ class RecoveryJournal:
         win_results: dict[int, tuple[bool, bool, bool, bool]] = {}
 
         for m in items:
+            if verify_window_fn is not None:
+                try:
+                    valid_identity = bool(verify_window_fn(m))
+                except Exception:
+                    valid_identity = False
+                if not valid_identity:
+                    win_results[m.hwnd] = (True, True, True, True)
+                    continue
+
             ok_cloak = False
             ok_alpha = False
             ok_pin = False
@@ -254,7 +340,12 @@ class RecoveryJournal:
 
             if m.original_alpha is not None:
                 try:
-                    if _succeeded(restore_alpha_fn(m.hwnd, m.original_alpha)):
+                    alpha_res = (
+                        restore_alpha_layered_fn(m.hwnd, m.original_alpha, m.had_layered)
+                        if restore_alpha_layered_fn is not None
+                        else restore_alpha_fn(m.hwnd, m.original_alpha)
+                    )
+                    if _succeeded(alpha_res):
                         ok_alpha = True
                         restored += 1
                     else:
@@ -315,6 +406,7 @@ class RecoveryJournal:
                     cur.cloaked = False
                 if ok_alpha:
                     cur.original_alpha = None
+                    cur.had_layered = None
                 if ok_pin:
                     cur.pinned_by_app = False
                 if ok_roll:
