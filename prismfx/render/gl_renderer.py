@@ -39,6 +39,7 @@ GL_ONE_MINUS_SRC_ALPHA = 0x0303
 GL_COLOR_BUFFER_BIT = 0x4000
 GL_PACK_ROW_LENGTH = 0x0D02
 GL_PACK_ALIGNMENT = 0x0D05
+GL_MAX_TEXTURE_SIZE = 0x0D33
 GL_VIEWPORT = 0x0BA2
 GL_TEXTURE_2D = 0x0DE1
 GL_TEXTURE0 = 0x84C0
@@ -703,9 +704,13 @@ class OffscreenGpuEngine:
         self._gl_read_pixels_fn = None
         self._gl_reset_status_fn = None
         self._is_gles: bool = False
+        self._max_texture_size: int = 4096
         self._pipeline = ShaderPipeline(subdiv=32)
         self._fbo_cache: dict[tuple[int, int], QtOpenGL.QOpenGLFramebufferObject] = {}
         self._mock_tex: Optional[QtOpenGL.QOpenGLTexture] = None
+
+    def max_texture_size(self) -> int:
+        return max(2048, int(self._max_texture_size))
 
     @property
     def init_error(self) -> str:
@@ -794,6 +799,18 @@ class OffscreenGpuEngine:
             except Exception:
                 reset_status_fn = None
 
+            detected_max_tex = 4096
+            try:
+                gi_addr = ctx.getProcAddress(b"glGetIntegerv")
+                if gi_addr:
+                    gl_get_iv = _GL_GET_INTEGERV_FUNC(int(gi_addr))
+                    max_tex_val = ctypes.c_int(0)
+                    gl_get_iv(GL_MAX_TEXTURE_SIZE, ctypes.byref(max_tex_val))
+                    if max_tex_val.value > 0:
+                        detected_max_tex = max(2048, int(max_tex_val.value))
+            except Exception:
+                detected_max_tex = 4096
+
             mock_img = generate_mock_window_image(560, 340)
             mock_tex = QtOpenGL.QOpenGLTexture(mock_img, QtOpenGL.QOpenGLTexture.DontGenerateMipMaps)
             mock_tex.setMinificationFilter(QtOpenGL.QOpenGLTexture.Linear)
@@ -818,6 +835,7 @@ class OffscreenGpuEngine:
         self._gl_read_pixels_fn = read_pixels_fn
         self._gl_reset_status_fn = reset_status_fn
         self._is_gles = is_gles
+        self._max_texture_size = detected_max_tex
         self.gpu_renderer = detected_renderer
         self.ready = True
         return True
@@ -1195,6 +1213,7 @@ class OffscreenGpuEngine:
         self._gl_read_pixels_fn = None
         self._gl_reset_status_fn = None
         self._is_gles = False
+        self._max_texture_size = 4096
         self.ready = False
 
 

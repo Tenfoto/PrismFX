@@ -9,7 +9,12 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+import os
+import threading
+import time
 from typing import Optional
+
+from .catalog import classify_app, is_protected_window_class
 
 # ---------------------------------------------------------------------------
 # DLL handles (strictly loaded from System32 to prevent CWD/AppDir DLL hijacking)
@@ -30,7 +35,6 @@ gdi32 = _load_system_dll("gdi32")
 dwmapi = _load_system_dll("dwmapi")
 kernel32 = _load_system_dll("kernel32")
 shell32 = _load_system_dll("shell32")
-psapi = _load_system_dll("psapi")
 try:
     wtsapi32: Optional[ctypes.WinDLL] = _load_system_dll("wtsapi32")
 except OSError:
@@ -132,7 +136,6 @@ WINEVENT_SKIPOWNPROCESS = 0x0002
 OBJID_WINDOW = 0
 CHILDID_SELF = 0
 
-WH_MOUSE_LL = 14
 WM_INPUT = 0x00FF
 WM_APP = 0x8000
 WM_MOUSEMOVE = 0x0200
@@ -291,16 +294,6 @@ class SYSTEM_POWER_STATUS(ctypes.Structure):
     ]
 
 
-class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("pt", POINT),
-        ("mouseData", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
 )
@@ -438,12 +431,6 @@ WINEVENTPROC = ctypes.WINFUNCTYPE(
     wintypes.DWORD,
     wintypes.DWORD,
 )
-HOOKPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t,
-    ctypes.c_int,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
-)
 ENUMWINDOWSPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 MONITORENUMPROC = ctypes.WINFUNCTYPE(
     wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(RECT), wintypes.LPARAM
@@ -523,12 +510,6 @@ user32.SetWinEventHook.argtypes = [
 user32.SetWinEventHook.restype = wintypes.HANDLE
 user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
 user32.UnhookWinEvent.restype = wintypes.BOOL
-user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
-user32.SetWindowsHookExW.restype = wintypes.HANDLE
-user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
-user32.UnhookWindowsHookEx.restype = wintypes.BOOL
-user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
-user32.CallNextHookEx.restype = ctypes.c_ssize_t
 user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 user32.FindWindowW.restype = wintypes.HWND
 user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
@@ -968,24 +949,58 @@ def get_class_name(hwnd: int) -> str:
     return buf.value[:n] if n > 0 else ""
 
 
+_PROCESS_INFO_CACHE_LOCK = threading.Lock()
+_PROCESS_INFO_CACHE: dict[int, tuple[str, str, float]] = {}  # pid -> (exe_name, full_path, monotonic_ts)
+_PROCESS_INFO_CACHE_TTL_SEC = 5.0
+_PROCESS_INFO_CACHE_MAX_SIZE = 512
+
+
+def clear_process_info_cache() -> None:
+    """Clear the thread-safe PID -> process image info TTL cache."""
+    with _PROCESS_INFO_CACHE_LOCK:
+        _PROCESS_INFO_CACHE.clear()
+
+
 def get_process_info(hwnd: int) -> tuple[int, str, str]:
     pid = wintypes.DWORD(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    if not pid.value:
+    pid_val = int(pid.value)
+    if not pid_val:
         return (0, "", "")
-    hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-    if not hproc:
-        return (pid.value, "", "")
-    try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = wintypes.DWORD(1024)
-        if kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(size)):
-            full = buf.value
-            exe = full.rsplit("\\", 1)[-1]
-            return (pid.value, exe, full)
-        return (pid.value, "", "")
-    finally:
-        kernel32.CloseHandle(hproc)
+
+    now = time.monotonic()
+    with _PROCESS_INFO_CACHE_LOCK:
+        cached = _PROCESS_INFO_CACHE.get(pid_val)
+        if cached is not None and (now - cached[2]) < _PROCESS_INFO_CACHE_TTL_SEC:
+            return (pid_val, cached[0], cached[1])
+
+    exe = ""
+    full = ""
+    hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_val)
+    if hproc:
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(size)):
+                full = buf.value
+                exe = full.rsplit("\\", 1)[-1]
+        finally:
+            kernel32.CloseHandle(hproc)
+
+    with _PROCESS_INFO_CACHE_LOCK:
+        if len(_PROCESS_INFO_CACHE) >= _PROCESS_INFO_CACHE_MAX_SIZE and pid_val not in _PROCESS_INFO_CACHE:
+            expired = [
+                k for k, v in _PROCESS_INFO_CACHE.items()
+                if (now - v[2]) >= _PROCESS_INFO_CACHE_TTL_SEC
+            ]
+            for k in expired:
+                _PROCESS_INFO_CACHE.pop(k, None)
+            if len(_PROCESS_INFO_CACHE) >= _PROCESS_INFO_CACHE_MAX_SIZE:
+                oldest_pid = min(_PROCESS_INFO_CACHE, key=lambda k: _PROCESS_INFO_CACHE[k][2])
+                _PROCESS_INFO_CACHE.pop(oldest_pid, None)
+        _PROCESS_INFO_CACHE[pid_val] = (exe, full, now)
+
+    return (pid_val, exe, full)
 
 
 def get_extended_frame_bounds(hwnd: int) -> tuple[int, int, int, int]:
@@ -1240,7 +1255,7 @@ def move_window_visible_pos(hwnd: int, vis_x: int, vis_y: int) -> bool:
     ):
         off_x = r_ext.left - r_win.left
         off_y = r_ext.top - r_win.top
-    flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
     return bool(user32.SetWindowPos(hwnd, 0, int(vis_x) - off_x, int(vis_y) - off_y, 0, 0, flags))
 
 
@@ -1316,13 +1331,149 @@ def is_on_battery_power() -> bool:
     return False
 
 
-def is_fullscreen_game_active() -> bool:
+_BORDERLESS_SHELL_CLASSES = frozenset({
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+})
+
+_BORDERLESS_EXCLUDED_BROWSERS = frozenset({
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "arc.exe",
+    "iexplore.exe",
+    "waterfox.exe",
+})
+
+
+def is_borderless_fullscreen_candidate(
+    class_name: str,
+    exe_name: str,
+    style: int,
+    ex_style: int,
+    rect: tuple[int, int, int, int],
+    monitor_rect: MonitorRect,
+    is_cloaked: bool = False,
+    is_iconic: bool = False,
+) -> bool:
+    """Pure testable predicate for borderless fullscreen DX12/Vulkan game detection.
+
+    ``rect`` uses PrismFX's standard ``(x, y, w, h)`` format (as returned by
+    ``get_extended_frame_bounds`` and ``RECT.as_tuple``).
+    """
+    if is_cloaked or is_iconic:
+        return False
+    if style & WS_CHILD:
+        return False
+    if ex_style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE):
+        return False
+    if (ex_style & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_APPWINDOW):
+        return False
+
+    cls = (class_name or "").strip()
+    if cls in _BORDERLESS_SHELL_CLASSES or cls == _OVERLAY_CLASS_NAME or is_protected_window_class(cls):
+        return False
+
+    exe_low = (exe_name or "").strip().lower()
+    if exe_low in _BORDERLESS_EXCLUDED_BROWSERS:
+        return False
+
+    if monitor_rect is None or monitor_rect.width < 640 or monitor_rect.height < 480:
+        return False
+    if len(rect) != 4:
+        return False
+    x, y, w, h = rect
+    if w <= 0 or h <= 0:
+        return False
+
+    left, top, right, bottom = x, y, x + w, y + h
+    covers_monitor = (
+        left <= monitor_rect.left + 2
+        and top <= monitor_rect.top + 2
+        and right >= monitor_rect.right - 2
+        and bottom >= monitor_rect.bottom - 2
+    )
+    if not covers_monitor:
+        return False
+
+    is_borderless_style = ((style & WS_CAPTION) != WS_CAPTION) and not bool(style & WS_THICKFRAME)
+    is_known_game = bool(exe_low) and (classify_app(exe_name, cls).category == "Game / Anti-Cheat")
+    return is_borderless_style or is_known_game
+
+
+def is_borderless_fullscreen_hwnd(hwnd: int, own_pid: int = 0) -> bool:
+    """Inspect a live Win32 HWND to detect borderless fullscreen DX12/Vulkan games."""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return False
+    if own_pid:
+        pid_dw = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_dw))
+        if pid_dw.value == own_pid:
+            return False
+
+    cls = get_class_name(hwnd)
+    if cls in _BORDERLESS_SHELL_CLASSES or cls == _OVERLAY_CLASS_NAME or is_protected_window_class(cls):
+        return False
+
+    x, y, w, h = get_extended_frame_bounds(hwnd)
+    if w < 636 or h < 476:
+        return False
+
+    cx = x + w // 2
+    cy = y + h // 2
+    mon: Optional[MonitorRect] = None
+    for m in enum_monitors():
+        if m.left <= cx < m.right and m.top <= cy < m.bottom:
+            mon = m
+            break
+    if mon is None or mon.width < 640 or mon.height < 480:
+        return False
+
+    # Fast reject before DWM cloak query or OpenProcess when window does not cover its monitor
+    if not (x <= mon.left + 2 and y <= mon.top + 2 and (x + w) >= mon.right - 2 and (y + h) >= mon.bottom - 2):
+        return False
+
+    cloaked = is_window_cloaked(hwnd)
+    if cloaked:
+        return False
+
+    style = int(user32.GetWindowLongPtrW(hwnd, GWL_STYLE))
+    ex_style = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    pid, exe_name, _ = get_process_info(hwnd)
+    if own_pid and pid == own_pid:
+        return False
+
+    return is_borderless_fullscreen_candidate(
+        class_name=cls,
+        exe_name=exe_name,
+        style=style,
+        ex_style=ex_style,
+        rect=(x, y, w, h),
+        monitor_rect=mon,
+        is_cloaked=cloaked,
+        is_iconic=False,
+    )
+
+
+def is_fullscreen_game_active(own_pid: int = 0) -> bool:
     state = ctypes.c_int(0)
     hr = shell32.SHQueryUserNotificationState(ctypes.byref(state))
     if hr == 0:
         # Exclude QUNS_BUSY (2): Win11 returns QUNS_BUSY for Focus Assist / NVIDIA ShadowPlay / normal full windows!
-        return state.value in (QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE)
-    return False
+        if state.value in (QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE):
+            return True
+    fg = int(user32.GetForegroundWindow() or 0)
+    if not fg:
+        return False
+    eff_pid = own_pid if own_pid else os.getpid()
+    return is_borderless_fullscreen_hwnd(fg, own_pid=eff_pid)
 
 
 def find_desktop_listview_hwnd() -> int:
@@ -1560,10 +1711,13 @@ class Win32LayeredSurface:
     Creates NO OpenGL/DXGI swapchain HWND -> 100% immune to NVIDIA Overlay (Alt+Z) / MPO flicker!
     """
 
-    def __init__(self) -> None:
+    def __init__(self, topmost: bool = True) -> None:
         cls_name = _ensure_overlay_window_class()
         hinst = kernel32.GetModuleHandleW(None)
-        ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+        self._topmost: bool = bool(topmost)
+        ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        if self._topmost:
+            ex |= WS_EX_TOPMOST
         self.hwnd: int = int(
             user32.CreateWindowExW(ex, cls_name, "", WS_POPUP, 0, 0, 1, 1, 0, 0, hinst, None) or 0
         )
@@ -1583,6 +1737,14 @@ class Win32LayeredSurface:
         self._blend_alpha = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
         self._blend_opaque = BLENDFUNCTION(AC_SRC_OVER, 0, 255, 0)
         self._pt_src = POINT(0, 0)
+
+    @property
+    def is_visible(self) -> bool:
+        return bool(self._visible)
+
+    @property
+    def is_parked(self) -> bool:
+        return bool(self._parked)
 
     @property
     def dib_byte_size(self) -> int:
@@ -1668,17 +1830,24 @@ class Win32LayeredSurface:
         if ok:
             if not self._visible:
                 # Reveal atomically AFTER pixels are committed — zero blank/black first frame!
-                user32.SetWindowPos(
-                    self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
+                if self._topmost:
+                    user32.SetWindowPos(
+                        self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
+                else:
+                    user32.SetWindowPos(
+                        self.hwnd, 0, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
                 self._visible = True
             elif self._parked:
                 # Surface is already live on DWM -> just ensure topmost Z-order without SWP_SHOWWINDOW!
-                user32.SetWindowPos(
-                    self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                )
+                if self._topmost:
+                    user32.SetWindowPos(
+                        self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    )
             self._parked = False
         return ok
 
@@ -1710,10 +1879,16 @@ class Win32LayeredSurface:
             user32.ReleaseDC(0, hdc_scr)
         if ok:
             if not self._visible:
-                user32.SetWindowPos(
-                    self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
+                if self._topmost:
+                    user32.SetWindowPos(
+                        self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
+                else:
+                    user32.SetWindowPos(
+                        self.hwnd, 0, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
                 self._visible = True
             self._parked = True
         return ok

@@ -811,6 +811,799 @@ def run_selftest() -> dict:
         f"create_calls={create_calls} latched={fail_gpu._init_attempted} dib_guard={dib_guard_ok}",
     )
 
+    # 10. Sprint 2 Track 1 Regression Tests (PFX-C07 Borderless Fullscreen Game Auto-Pause + PFX-M05 Anti-Cheat Hygiene)
+    # (10a) sprint2_borderless_game_pause
+    mon_primary = w32.MonitorRect("\\\\.\\DISPLAY1", 0, 0, 1920, 1080, 0, 0, 1920, 1032, True)
+    mon_right = w32.MonitorRect("\\\\.\\DISPLAY2", 1920, 0, 2560, 1440, 1920, 0, 2560, 1392, False)
+    mon_left_neg = w32.MonitorRect("\\\\.\\DISPLAY3", -1920, 0, 1920, 1080, -1920, 0, 1920, 1032, False)
+    mon_tiny = w32.MonitorRect("\\\\.\\DISPLAY4", 0, 0, 320, 240, 0, 0, 320, 240, False)
+    borderless_style = w32.WS_VISIBLE | w32.WS_POPUP
+    captioned_style = w32.WS_VISIBLE | w32.WS_CAPTION | w32.WS_THICKFRAME | w32.WS_SYSMENU
+
+    cand_pos_ok = (
+        w32.is_borderless_fullscreen_candidate(
+            "UnrealWindow", "SomeDX12Game.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_primary
+        )
+        and w32.is_borderless_fullscreen_candidate(
+            "UnrealWindow", "SomeDX12Game.exe", borderless_style, 0, (2, 2, 1916, 1076), mon_primary
+        )
+        and w32.is_borderless_fullscreen_candidate(
+            "VulkanWnd", "VulkanGame.exe", borderless_style, 0, (1920, 0, 2560, 1440), mon_right
+        )
+        and w32.is_borderless_fullscreen_candidate(
+            "DX12Wnd", "LeftGame.exe", borderless_style, 0, (-1920, 0, 1920, 1080), mon_left_neg
+        )
+        and w32.is_borderless_fullscreen_candidate(
+            "SDL_app", "cs2.exe", captioned_style, 0, (0, 0, 1920, 1080), mon_primary
+        )
+    )
+
+    shell_rejected = all(
+        not w32.is_borderless_fullscreen_candidate(
+            cls, "explorer.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_primary
+        )
+        for cls in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+    )
+    browsers_rejected = all(
+        not w32.is_borderless_fullscreen_candidate(
+            "Chrome_WidgetWin_1", br, borderless_style, 0, (0, 0, 1920, 1080), mon_primary
+        )
+        for br in (
+            "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+            "opera.exe", "vivaldi.exe", "arc.exe", "iexplore.exe", "waterfox.exe",
+        )
+    )
+    normal_rejected = (
+        not w32.is_borderless_fullscreen_candidate(
+            "Notepad", "Notepad.exe", captioned_style, 0, (0, 0, 1920, 1080), mon_primary
+        )
+        and not w32.is_borderless_fullscreen_candidate(
+            "Chrome_WidgetWin_1", "Code.exe", captioned_style, 0, (0, 0, 1920, 1032), mon_primary
+        )
+        and not w32.is_borderless_fullscreen_candidate(
+            "UnrealWindow", "SomeDX12Game.exe", borderless_style, 0, (3, 0, 1917, 1080), mon_primary
+        )
+        and not w32.is_borderless_fullscreen_candidate(
+            "UnrealWindow", "SomeDX12Game.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_primary, is_cloaked=True
+        )
+        and not w32.is_borderless_fullscreen_candidate(
+            "UnrealWindow", "SomeDX12Game.exe", borderless_style, 0, (0, 0, 1920, 1080), mon_primary, is_iconic=True
+        )
+        and not w32.is_borderless_fullscreen_candidate(
+            "UnrealWindow", "SomeDX12Game.exe", borderless_style, w32.WS_EX_TRANSPARENT, (0, 0, 1920, 1080), mon_primary
+        )
+        and not w32.is_borderless_fullscreen_candidate(
+            "UnrealWindow", "SomeDX12Game.exe", borderless_style, 0, (0, 0, 320, 240), mon_tiny
+        )
+        and not w32.is_borderless_fullscreen_hwnd(0, own_pid=os.getpid())
+    )
+
+    # Full Engine + DesktopFxOverlay + SpotlightOverlay + MainWindow pause hygiene verification
+    eng_pause_ok = False
+    lbutton_guarded_ok = False
+    overlay_hidden_ok = False
+    spotlight_hidden_ok = False
+    exit_resume_ok = False
+    pause_detail = ""
+    with tempfile.TemporaryDirectory(prefix="prismfx_s2_t1_") as td_s2:
+        store_s2 = ConfigStore(pathlib.Path(td_s2))
+        demo_b = DemoWindowBackend(seed=42)
+        eng_s2 = PrismEngine(demo_b, store_s2, EffectRegistry())
+        win_s2 = MainWindow(eng_s2, enable_overlays=True, enable_tray=False)
+        orig_lbutton_fn = w32.is_lbutton_down
+        lbutton_calls = 0
+        try:
+            w32.set_window_cloaked(int(win_s2.winId()), True)
+            assert win_s2.fx_overlay is not None and win_s2.spotlight_overlay is not None
+            for s in win_s2.fx_overlay._surface_pool:
+                w32.set_window_cloaked(s.hwnd, True)
+            from .core.engine import SpotlightState as _S2SpotState
+            win_s2.spotlight_overlay.apply_state(
+                _S2SpotState(
+                    active=True,
+                    mode="halo",
+                    opacity=0.45,
+                    color_hex="#06080E",
+                    active_hwnd=1001,
+                    active_rect=(120, 80, 1180, 760),
+                    cursor_pos=(500, 400),
+                )
+            )
+            QtCore.QCoreApplication.processEvents()
+
+            initial_ok = (
+                eng_s2.paused_reason() == ""
+                and eng_s2._want_raw_input_mouse() is True
+                and win_s2.spotlight_overlay.isVisible()
+                and any(s.is_visible and s.is_parked for s in win_s2.fx_overlay._surface_pool)
+            )
+
+            # Switch foreground to borderless fullscreen game (1007 = VALORANT 1920x1080)
+            demo_b.set_foreground_hwnd(1007)
+            eng_s2._drag_hwnd = 1001
+            eng_s2._housekeeping_tick(time.perf_counter())
+            QtCore.QCoreApplication.processEvents()
+
+            eng_pause_ok = (
+                initial_ok
+                and eng_s2._cached_paused_reason == "fullscreen_game"
+                and eng_s2._want_raw_input_mouse() is False
+                and eng_s2._drag_hwnd == 0
+            )
+
+            # Verify GetAsyncKeyState (is_lbutton_down) is NEVER called while paused for fullscreen_game
+            def _spy_lbutton() -> bool:
+                nonlocal lbutton_calls
+                lbutton_calls += 1
+                return orig_lbutton_fn()
+
+            w32.is_lbutton_down = _spy_lbutton  # type: ignore[assignment]
+            eng_s2._drag_hwnd = 1001
+            eng_s2._watchdog_tick(time.perf_counter())
+            eng_s2._drag_hwnd = 0
+            lbutton_guarded_ok = (lbutton_calls == 0)
+
+            # Verify DesktopFxOverlay surfaces are SW_HIDE (not visible, not parked!) + Spotlight hidden
+            pool_hidden = bool(win_s2.fx_overlay._surface_pool) and all(
+                (not s.is_visible) and (not s.is_parked) and (not w32.user32.IsWindowVisible(s.hwnd))
+                for s in win_s2.fx_overlay._surface_pool
+            )
+            # Also verify _release_surface keeps surface hidden while paused
+            tmp_s = win_s2.fx_overlay._acquire_surface()
+            w32.set_window_cloaked(tmp_s.hwnd, True)
+            win_s2.fx_overlay._release_surface(tmp_s)
+            release_hidden = (not tmp_s.is_visible) and (not tmp_s.is_parked) and (not w32.user32.IsWindowVisible(tmp_s.hwnd))
+            overlay_hidden_ok = win_s2.fx_overlay._fullscreen_game_paused and pool_hidden and release_hidden
+            spotlight_hidden_ok = (
+                (not win_s2.spotlight_overlay.isVisible())
+                and all(
+                    (not s.is_visible) and (not s.is_parked) and (not w32.user32.IsWindowVisible(s.hwnd))
+                    for s in win_s2.spotlight_overlay._surfaces.values()
+                )
+            )
+
+            # Exit fullscreen game -> engine resumes and re-enables raw input & overlay flag
+            demo_b.set_foreground_hwnd(1001)
+            eng_s2._housekeeping_tick(time.perf_counter())
+            QtCore.QCoreApplication.processEvents()
+            exit_resume_ok = (
+                eng_s2._cached_paused_reason == ""
+                and eng_s2._want_raw_input_mouse() is True
+                and win_s2.fx_overlay._fullscreen_game_paused is False
+            )
+            pause_detail = (
+                f"cand={cand_pos_ok} shell_rej={shell_rejected} browser_rej={browsers_rejected} "
+                f"norm_rej={normal_rejected} eng_pause={eng_pause_ok} lbtn_calls={lbutton_calls} "
+                f"ov_hidden={overlay_hidden_ok} spot_hidden={spotlight_hidden_ok} exit_resume={exit_resume_ok}"
+            )
+        finally:
+            w32.is_lbutton_down = orig_lbutton_fn  # type: ignore[assignment]
+            win_s2.full_shutdown()
+        shutdown_unbound_ok = eng_s2.on_pause_state_changed is None
+
+    check(
+        "sprint2_borderless_game_pause",
+        cand_pos_ok
+        and shell_rejected
+        and browsers_rejected
+        and normal_rejected
+        and eng_pause_ok
+        and lbutton_guarded_ok
+        and overlay_hidden_ok
+        and spotlight_hidden_ok
+        and exit_resume_ok
+        and shutdown_unbound_ok,
+        pause_detail,
+    )
+
+    # (10b) sprint2_anticheat_hygiene (PFX-M05)
+    win32_src = pathlib.Path(w32.__file__).read_text(encoding="utf-8")
+    dead_symbols = (
+        "SetWindowsHookExW",
+        "UnhookWindowsHookEx",
+        "CallNextHookEx",
+        "WH_MOUSE_LL",
+        "MSLLHOOKSTRUCT",
+        "HOOKPROC",
+        '_load_system_dll("psapi")',
+        "psapi =",
+    )
+    dead_in_src = [tok for tok in dead_symbols if tok in win32_src]
+    dead_on_mod = [sym for sym in ("psapi", "WH_MOUSE_LL", "MSLLHOOKSTRUCT", "HOOKPROC") if hasattr(w32, sym)]
+    dead_removed_ok = (not dead_in_src) and (not dead_on_mod)
+
+    # Verify TTL cache in get_process_info avoids repeat OpenProcess calls for the same PID
+    open_proc_calls = 0
+    orig_k32 = w32.kernel32
+    surf_pid_probe = w32.Win32LayeredSurface()
+
+    class _Kernel32OpenProcessSpy:
+        def __getattr__(self, name: str):
+            return getattr(orig_k32, name)
+
+        def OpenProcess(self, *args, **kwargs):
+            nonlocal open_proc_calls
+            open_proc_calls += 1
+            return orig_k32.OpenProcess(*args, **kwargs)
+
+    cache_ttl_ok = False
+    cache_detail = ""
+    try:
+        w32.clear_process_info_cache()
+        w32.kernel32 = _Kernel32OpenProcessSpy()  # type: ignore[assignment]
+        p_first = w32.get_process_info(surf_pid_probe.hwnd)
+        for _ in range(4):
+            p_next = w32.get_process_info(surf_pid_probe.hwnd)
+        calls_after_5 = open_proc_calls
+
+        w32.clear_process_info_cache()
+        _ = w32.get_process_info(surf_pid_probe.hwnd)
+        calls_after_clear = open_proc_calls
+
+        # Age cached timestamp beyond 5.0s TTL and verify refresh calls OpenProcess once more
+        with w32._PROCESS_INFO_CACHE_LOCK:
+            if p_first[0] in w32._PROCESS_INFO_CACHE:
+                ex_n, fp_n, ts_n = w32._PROCESS_INFO_CACHE[p_first[0]]
+                w32._PROCESS_INFO_CACHE[p_first[0]] = (ex_n, fp_n, ts_n - 6.0)
+        _ = w32.get_process_info(surf_pid_probe.hwnd)
+        calls_after_ttl = open_proc_calls
+
+        cache_ttl_ok = (
+            p_first[0] == os.getpid()
+            and bool(p_first[1])
+            and p_next == p_first
+            and calls_after_5 == 1
+            and calls_after_clear == 2
+            and calls_after_ttl == 3
+        )
+        cache_detail = f"pid={p_first[0]} exe={p_first[1]!r} calls={calls_after_5}/{calls_after_clear}/{calls_after_ttl}"
+    finally:
+        w32.kernel32 = orig_k32
+        w32.clear_process_info_cache()
+        surf_pid_probe.destroy()
+
+    # Verify all 9 new games & GPU/game overlays are auto-excluded in catalog.py and SafetyConfig
+    required_new_exes = [
+        "GameOverlayUI.exe",
+        "LosslessScaling.exe",
+        "RadeonSoftware.exe",
+        "AMDRSServ.exe",
+        "r5apex.exe",
+        "Overwatch.exe",
+        "League of Legends.exe",
+        "TslGame.exe",
+        "EscapeFromTarkov.exe",
+    ]
+    safety_ex_low = {e.lower() for e in PrismConfig().safety.excluded_exes}
+    missing_catalog = [exe for exe in required_new_exes if not classify_app(exe).recommended_exclude]
+    missing_config = [exe for exe in required_new_exes if exe.lower() not in safety_ex_low]
+    new_exes_ok = (not missing_catalog) and (not missing_config)
+
+    check(
+        "sprint2_anticheat_hygiene",
+        dead_removed_ok and cache_ttl_ok and new_exes_ok,
+        f"dead_src={dead_in_src} dead_mod={dead_on_mod} {cache_detail} "
+        f"missing_cat={missing_catalog} missing_cfg={missing_config}",
+    )
+
+    # 11. Sprint 2 Track 2 Regression Tests (PFX-C08, PFX-H11, PFX-P05)
+    from .core.engine import SpotlightState, WobblyTextureUpdate, is_proportional_dpi_scale
+    from .render.overlay import (
+        ScreenTopologyEntry,
+        SpotlightOverlay,
+        clamp_to_virtual_screens,
+        compute_overscan_padding,
+        compute_wobble_padding,
+        physical_to_qt_logical,
+    )
+
+    # (10a) Mixed-DPI & Negative Virtual Desktop Coords + Cross-Monitor Wobbly DPI Rescale
+    dual_topo = [
+        ScreenTopologyEntry(
+            name="\\\\.\\DISPLAY2",
+            phys_x=-1920, phys_y=0, phys_w=1920, phys_h=1080,
+            log_x=-1280, log_y=0, log_w=1280, log_h=720,
+            avail_x=-1280, avail_y=0, avail_w=1280, avail_h=680,
+            dpr=1.5, is_primary=False,
+        ),
+        ScreenTopologyEntry(
+            name="\\\\.\\DISPLAY1",
+            phys_x=0, phys_y=0, phys_w=1920, phys_h=1080,
+            log_x=0, log_y=0, log_w=1920, log_h=1080,
+            avail_x=0, avail_y=0, avail_w=1920, avail_h=1040,
+            dpr=1.0, is_primary=True,
+        ),
+    ]
+    neg_origin_log = physical_to_qt_logical(-1920, 0, screens=dual_topo)
+    neg_center_log = physical_to_qt_logical(-960, 540, screens=dual_topo)
+    prim_center_log = physical_to_qt_logical(960, 540, screens=dual_topo)
+    neg_map_ok = (
+        neg_origin_log == (-1280, 0)
+        and neg_center_log == (-640, 360)
+        and prim_center_log == (960, 540)
+    )
+
+    kept_neg = clamp_to_virtual_screens(-1200, 40, 800, 600, screens=dual_topo)
+    clamped_neg_edge = clamp_to_virtual_screens(-1400, -50, 360, 280, screens=dual_topo)
+    clamped_oversize = clamp_to_virtual_screens(-1000, 100, 1400, 800, screens=dual_topo)
+    clamped_disconn = clamp_to_virtual_screens(9999, 9999, 1120, 720, screens=dual_topo)
+    clamp_ok = (
+        kept_neg == (-1200, 40, 800, 600)
+        and kept_neg[0] < 0
+        and clamped_neg_edge == (-1280, 0, 360, 280)
+        and clamped_oversize == (-1280, 0, 1400, 800)
+        and 0 <= clamped_disconn[0] <= (1920 - 1120)
+        and 0 <= clamped_disconn[1] <= (1040 - 720)
+    )
+
+    # Verify PFX-P05 engine cross-monitor Mixed-DPI drag keeps Wobbly alive (no cancel) & emits texture update
+    dpi_scale_fn_ok = (
+        is_proportional_dpi_scale(800, 600, 1200, 900)
+        and is_proportional_dpi_scale(1200, 900, 800, 600)
+        and is_proportional_dpi_scale(800, 600, 1600, 1200, crossed_monitor=True)
+        and not is_proportional_dpi_scale(960, 1040, 1180, 760)
+    )
+    dpi_drag_ok = False
+    with tempfile.TemporaryDirectory(prefix="prismfx_s2_dpi_") as td_dpi:
+        demo_be = DemoWindowBackend(seed=42)
+        eng_dpi = PrismEngine(demo_be, ConfigStore(pathlib.Path(td_dpi)), EffectRegistry())
+        wob_ends: list[tuple[int, int, int, bool]] = []
+        tex_updates: list[WobblyTextureUpdate] = []
+        eng_dpi.on_wobbly_end = lambda h, fx, fy, sc: wob_ends.append((h, fx, fy, sc))
+        eng_dpi.on_wobbly_texture_update = lambda u: tex_updates.append(u)
+        demo_be.move_resize_window(1001, 200, 100, 800, 600)
+        eng_dpi._drag_hwnd = 1001
+        eng_dpi._drag_wobble_started = True
+        eng_dpi._drag_start_rect = (200, 100, 800, 600)
+        eng_dpi._drag_last_pos = (200, 100)
+        eng_dpi._drag_monitor_key = ("\\\\.\\DISPLAY1", 0, 0, 1920, 1080)
+        # Cross onto DISPLAY2 at 1.5x DPI scale (800x600 -> 1200x900)
+        demo_be.move_resize_window(1001, 2000, 120, 1200, 900)
+        eng_dpi._handle_win_event(w32.EVENT_OBJECT_LOCATIONCHANGE, 1001)
+        kept_alive = eng_dpi._drag_wobble_started and eng_dpi._drag_dpi_recapture_pending and not wob_ends
+        # Simulate >=2 stable moves after >=38 ms
+        eng_dpi._drag_size_changed_at = time.perf_counter() - 0.05
+        demo_be.move_resize_window(1001, 2020, 125, 1200, 900)
+        eng_dpi._handle_win_event(w32.EVENT_OBJECT_LOCATIONCHANGE, 1001)
+        demo_be.move_resize_window(1001, 2040, 130, 1200, 900)
+        eng_dpi._handle_win_event(w32.EVENT_OBJECT_LOCATIONCHANGE, 1001)
+        dpi_drag_ok = (
+            kept_alive
+            and not wob_ends
+            and eng_dpi._drag_wobble_started
+            and not eng_dpi._drag_dpi_recapture_pending
+            and len(tex_updates) == 1
+            and tex_updates[0].hwnd == 1001
+            and tex_updates[0].w == 1200
+            and tex_updates[0].h == 900
+        )
+
+    check(
+        "sprint2_mixed_dpi_and_negative_coords",
+        neg_map_ok and clamp_ok and dpi_scale_fn_ok and dpi_drag_ok,
+        f"neg_map=({neg_origin_log},{neg_center_log}) kept_neg={kept_neg[:2]} "
+        f"disconn={clamped_disconn[:2]} dpi_drag={dpi_drag_ok}",
+    )
+
+    # (10b) 1080p Maximized / Ultrawide / 4K Overscan + GL_MAX_TEXTURE_SIZE + Per-Monitor SpotlightOverlay
+    res_cases = [
+        ("1080p_max", 1920, 1080, w32.MonitorRect("M1", 0, 0, 1920, 1080, 0, 0, 1920, 1040, True)),
+        ("ultrawide", 3440, 1440, w32.MonitorRect("M2", 0, 0, 3440, 1440, 0, 0, 3440, 1400, True)),
+        ("4k", 3840, 2160, w32.MonitorRect("M3", 0, 0, 3840, 2160, 0, 0, 3840, 2120, True)),
+    ]
+    overscan_ok = True
+    overscan_notes: list[str] = []
+    for label, rw, rh, mrect in res_cases:
+        px_lg, py_lg = compute_overscan_padding(rw, rh, shader_id=3, monitor_rect=mrect, gl_max_texture_size=16384)
+        px_sm, py_sm = compute_overscan_padding(rw, rh, shader_id=1, monitor_rect=mrect, gl_max_texture_size=16384)
+        wx, wy = compute_wobble_padding(rw, rh, monitor_rect=mrect, gl_max_texture_size=16384)
+        case_ok = (
+            px_lg > 0 and py_lg > 0
+            and px_sm > 0 and py_sm > 0
+            and wx > 0 and wy > 0
+            and (rw + px_lg * 2) <= 4096 and (rh + py_lg * 2) <= 4096
+            and (rw + px_sm * 2) <= 4096 and (rh + py_sm * 2) <= 4096
+            and (rw + wx * 2) <= 4096 and (rh + wy * 2) <= 4096
+        )
+        if not case_ok:
+            overscan_ok = False
+        overscan_notes.append(f"{label}:os=({px_lg},{py_lg}) wob=({wx},{wy})")
+
+    max_tex_gpu = OffscreenGpuEngine()
+    gl_max_tex = 0
+    try:
+        if max_tex_gpu.ensure_ready():
+            gl_max_tex = max_tex_gpu.max_texture_size()
+    finally:
+        max_tex_gpu.shutdown()
+    gl_max_tex_ok = gl_max_tex >= 2048
+
+    spot_ok = False
+    spot_detail = ""
+    with tempfile.TemporaryDirectory(prefix="prismfx_s2_spot_") as td_sp:
+        eng_sp = PrismEngine(DemoWindowBackend(seed=42), ConfigStore(pathlib.Path(td_sp)), EffectRegistry())
+        spot = SpotlightOverlay(eng_sp)
+        try:
+            spot.apply_state(
+                SpotlightState(
+                    active=True,
+                    mode="halo",
+                    opacity=0.45,
+                    color_hex="#06080E",
+                    active_hwnd=1001,
+                    active_rect=(120, 80, 1180, 760),
+                    cursor_pos=(500, 400),
+                )
+            )
+            surfs = list(spot._surfaces.values())
+            n_surfs = len(surfs)
+            all_non_topmost = all(
+                s.hwnd > 0
+                and (w32.user32.GetWindowLongPtrW(s.hwnd, w32.GWL_EXSTYLE) & w32.WS_EX_TOPMOST) == 0
+                for s in surfs
+            )
+            all_cloaked = all(w32.is_window_cloaked(s.hwnd) for s in surfs)
+            vis_before_hide = spot.isVisible() and all(s.is_visible for s in surfs)
+            spot.hide()
+            vis_after_hide = spot.isVisible() or any(s.is_visible for s in surfs)
+            spot_ok = (
+                n_surfs == 2
+                and all_non_topmost
+                and all_cloaked
+                and vis_before_hide
+                and not vis_after_hide
+            )
+            spot_detail = (
+                f"surfs={n_surfs} non_topmost={all_non_topmost} cloaked={all_cloaked} "
+                f"vis_on={vis_before_hide} hidden={not vis_after_hide}"
+            )
+        finally:
+            spot.close()
+
+    check(
+        "sprint2_4k_overscan_and_spotlight",
+        overscan_ok and gl_max_tex_ok and spot_ok,
+        f"{' '.join(overscan_notes)} gl_max_tex={gl_max_tex} {spot_detail}",
+    )
+
+    # 12. Sprint 2 Track 3 Regression Tests (PFX-H09, PFX-H10, PFX-M02, PFX-M03, PFX-M04, Board Resolutions #1 & #2)
+    from .core.engine import AnimationJob, MAX_CAPTURE_CACHE_BYTES, MorphJob, WobblyDragStart
+
+    with tempfile.TemporaryDirectory(prefix="prismfx_s2_t3_") as td_s2:
+        s2_dir = pathlib.Path(td_s2)
+
+        # (10a) sprint2_idle_cpu_and_target_fps
+        s2_store = ConfigStore(s2_dir / "idle_profile")
+        s2_reg = EffectRegistry()
+        s2_eng = PrismEngine(DemoWindowBackend(seed=42), s2_store, s2_reg)
+        ATLAS.initialize()
+        s2_win = MainWindow(s2_eng, enable_overlays=False, enable_tray=False)
+        s2_ov = None
+        try:
+            _cloak_and_show_silently(s2_win)
+            QtWidgets.QApplication.sendEvent(s2_win, QtCore.QEvent(QtCore.QEvent.WindowDeactivate))
+            # Let initial static paint & async startup query finish before measuring steady-state idle CPU
+            settle_loop = QtCore.QEventLoop()
+            QtCore.QTimer.singleShot(80, settle_loop.quit)
+            settle_loop.exec()
+
+            unfocused_paused_before = (
+                not s2_win.home_stage._timer.isActive()
+                and not s2_win.lab_stage._timer.isActive()
+                and not s2_win.wobble_stage._timer.isActive()
+            )
+            cpu_t0 = time.process_time()
+            wall_t0 = time.perf_counter()
+            idle_loop = QtCore.QEventLoop()
+            QtCore.QTimer.singleShot(820, idle_loop.quit)
+            idle_loop.exec()
+            wall_dt = max(0.001, time.perf_counter() - wall_t0)
+            idle_cpu_pct = 100.0 * (time.process_time() - cpu_t0) / wall_dt
+            unfocused_paused_after = not s2_win.home_stage._timer.isActive()
+
+            # Wake immediately on hover/interaction
+            enter_ev = QtGui.QEnterEvent(
+                QtCore.QPointF(24.0, 24.0), QtCore.QPointF(24.0, 24.0), QtCore.QPointF(24.0, 24.0)
+            )
+            QtWidgets.QApplication.sendEvent(s2_win.home_stage, enter_ev)
+            wake_on_hover_ok = s2_win.home_stage._timer.isActive()
+
+            # 15s idle timeout pauses clock in _on_tick()
+            s2_win.home_stage._last_interaction_ts = time.perf_counter() - (s2_win.home_stage._idle_timeout_sec + 1.0)
+            s2_win.home_stage._on_tick()
+            idle_timeout_ok = not s2_win.home_stage._timer.isActive()
+
+            # target_fps binding on ShaderPreviewWidget & DesktopFxOverlay
+            s2_ov = DesktopFxOverlay(s2_eng)
+            ov_h = s2_ov.primary_surface_hwnd()
+            if ov_h:
+                w32.set_window_cloaked(ov_h, True)
+            s2_win.home_stage.set_target_fps(60)
+            pw_iv_60 = s2_win.home_stage._timer.interval()
+            s2_win.home_stage.set_target_fps(240)
+            pw_iv_240 = s2_win.home_stage._timer.interval()
+            s2_ov.set_target_fps(60)
+            ov_iv_60 = s2_ov._timer.interval()
+            s2_ov.set_target_fps(240)
+            ov_iv_240 = s2_ov._timer.interval()
+            fps_bind_ok = (
+                pw_iv_60 == 17
+                and pw_iv_240 == 4
+                and ov_iv_60 == 17
+                and ov_iv_240 == 4
+                and pw_iv_60 > pw_iv_240
+                and ov_iv_60 > ov_iv_240
+            )
+            check(
+                "sprint2_idle_cpu_and_target_fps",
+                unfocused_paused_before
+                and unfocused_paused_after
+                and idle_cpu_pct < 2.0
+                and wake_on_hover_ok
+                and idle_timeout_ok
+                and fps_bind_ok,
+                f"paused={unfocused_paused_before and unfocused_paused_after} cpu={idle_cpu_pct:.2f}% "
+                f"wake={wake_on_hover_ok} idle_15s={idle_timeout_ok} iv60={pw_iv_60}/{ov_iv_60} iv240={pw_iv_240}/{ov_iv_240}",
+            )
+        finally:
+            if s2_ov is not None:
+                s2_ov.shutdown()
+            s2_win.full_shutdown()
+            OffscreenGpuEngine.shared().reset_init_attempt()
+
+        # (10b) sprint2_two_tier_journal_and_dwm_coalesce
+        j2_path = s2_dir / "two_tier" / "recovery_journal.json"
+        j2_tier = RecoveryJournal(j2_path)
+        try:
+            j2_tier.record_alpha(5001, 255, had_layered=False, sync=False)
+            in_mem_immediate = (j2_tier.get_mutation(5001) is not None) and (j2_tier.pending_count() == 1)
+            j2_tier.record_alpha(5002, 220, had_layered=False, sync=False)
+            coalesced_ok = False
+            deadline_j = time.perf_counter() + 0.5
+            while time.perf_counter() < deadline_j:
+                if j2_path.is_file():
+                    reloaded_j = RecoveryJournal(j2_path)
+                    if reloaded_j.get_mutation(5001) is not None and reloaded_j.get_mutation(5002) is not None:
+                        coalesced_ok = True
+                        break
+                time.sleep(0.015)
+
+            j2_tier.record_alpha(5003, 180, had_layered=False, sync=False)
+            j2_tier.flush_sync()
+            flush_sync_ok = RecoveryJournal(j2_path).get_mutation(5003) is not None
+        finally:
+            j2_tier.close()
+
+        dwm_backend = DemoWindowBackend(seed=42)
+        dwm_flush_calls = 0
+
+        def _counted_dwm_flush() -> None:
+            nonlocal dwm_flush_calls
+            dwm_flush_calls += 1
+
+        dwm_backend.dwm_flush = _counted_dwm_flush  # type: ignore[method-assign]
+        dwm_store = ConfigStore(s2_dir / "dwm_profile")
+        dwm_eng = PrismEngine(dwm_backend, dwm_store, EffectRegistry())
+        dwm_ov = DesktopFxOverlay(dwm_eng)
+        try:
+            for s in dwm_ov._surface_pool:
+                if s.hwnd:
+                    w32.set_window_cloaked(s.hwnd, True)
+            raw_64 = bytes([255, 129, 45, 255]) * (64 * 64)
+            now_t = time.perf_counter()
+            for idx, h_id in enumerate((1001, 1002), start=1):
+                dwm_eng.animation_queue.put_nowait(
+                    AnimationJob(
+                        job_id=idx,
+                        hwnd=h_id,
+                        trigger="open",
+                        effect_id="clean_fade",
+                        shader_id=37,
+                        reverse=True,
+                        duration_ms=100,
+                        easing="linear",
+                        intensity=1.0,
+                        accent_hex="#2D81FF",
+                        x=100 + idx * 20,
+                        y=100,
+                        w=64,
+                        h=64,
+                        img_w=64,
+                        img_h=64,
+                        bgra_bytes=raw_64,
+                        restore_hidden_hwnd=h_id,
+                        restore_alpha=255,
+                        started_at=now_t,
+                    )
+                )
+            dwm_ov._drain_jobs()
+            dwm_ov._on_morph_queued(
+                MorphJob(
+                    hwnd=1003,
+                    from_rect=(120, 120, 64, 64),
+                    to_rect=(140, 140, 96, 96),
+                    from_img_w=64,
+                    from_img_h=64,
+                    from_bgra=raw_64,
+                    to_img_w=64,
+                    to_img_h=64,
+                    to_bgra=raw_64,
+                    duration_ms=100,
+                    restore_hidden_hwnd=1003,
+                    restore_alpha=255,
+                    started_at=now_t,
+                )
+            )
+            for item in dwm_ov._active:
+                if item.surface.hwnd:
+                    w32.set_window_cloaked(item.surface.hwnd, True)
+                item.start_time = now_t - 1.0
+            for m_item in dwm_ov._morphs:
+                if m_item.surface.hwnd:
+                    w32.set_window_cloaked(m_item.surface.hwnd, True)
+                m_item.start_time = now_t - 1.0
+            staged_counts_ok = len(dwm_ov._active) == 2 and len(dwm_ov._morphs) == 1
+            dwm_flush_calls = 0
+            dwm_ov._tick()
+            coalesced_dwm_ok = (
+                staged_counts_ok
+                and len(dwm_ov._active) == 0
+                and len(dwm_ov._morphs) == 0
+                and dwm_flush_calls == 1
+            )
+        finally:
+            dwm_ov.shutdown()
+            dwm_eng.journal.close()
+
+        check(
+            "sprint2_two_tier_journal_and_dwm_coalesce",
+            in_mem_immediate and coalesced_ok and flush_sync_ok and coalesced_dwm_ok,
+            f"in_mem={in_mem_immediate} bg_coalesced={coalesced_ok} flush_sync={flush_sync_ok} dwm_flushes={dwm_flush_calls}",
+        )
+
+        # (10c) sprint2_capture_budget_and_quick_fixes
+        qf_store = ConfigStore(s2_dir / "quickfix_profile")
+        qf_eng = PrismEngine(DemoWindowBackend(seed=42), qf_store, EffectRegistry())
+        try:
+            # Capture cache <= 64 MB budget
+            chunk_10mb = b"\x20" * (10 * 1024 * 1024)
+            for idx in range(10):
+                qf_eng._store_cached_capture(
+                    9000 + idx, 1024, 2560, chunk_10mb, (0, 0, 1024, 2560), float(idx + 1)
+                )
+            # Single > 64 MB capture must be rejected
+            oversize_65mb = b"\x20" * (65 * 1024 * 1024)
+            qf_eng._store_cached_capture(9999, 4096, 4160, oversize_65mb, (0, 0, 4096, 4160), 999.0)
+            cache_bytes = qf_eng.cached_capture_bytes()
+            budget_ok = (
+                0 < cache_bytes <= MAX_CAPTURE_CACHE_BYTES
+                and 9999 not in qf_eng._cached_captures
+                and 9009 in qf_eng._cached_captures
+                and 9000 not in qf_eng._cached_captures
+            )
+
+            # PFX-M02: menu & popup triggers produce reverse == True
+            j_menu = qf_eng.trigger_effect_for_window(1001, "menu")
+            j_popup = qf_eng.trigger_effect_for_window(1002, "popup")
+            m02_ok = (
+                j_menu is not None
+                and j_menu.reverse is True
+                and j_popup is not None
+                and j_popup.reverse is True
+            )
+
+            # PFX-M03: _on_wobbly_end(..., snap_cancel=True) must NOT stop overlay._timer while _morphs is non-empty
+            m03_ov = DesktopFxOverlay(qf_eng)
+            m03_ok = False
+            try:
+                for s in m03_ov._surface_pool:
+                    if s.hwnd:
+                        w32.set_window_cloaked(s.hwnd, True)
+                raw_64 = bytes([255, 129, 45, 255]) * (64 * 64)
+                m03_ov._on_wobbly_start(
+                    WobblyDragStart(
+                        hwnd=1001, x=100, y=100, w=64, h=64,
+                        img_w=64, img_h=64, bgra_bytes=raw_64,
+                        grab_u=0.5, grab_v=0.1, orig_alpha=255, init_dx=8, init_dy=0,
+                    )
+                )
+                if m03_ov._wobble is not None and m03_ov._wobble.surface.hwnd:
+                    w32.set_window_cloaked(m03_ov._wobble.surface.hwnd, True)
+                m03_ov._on_morph_queued(
+                    MorphJob(
+                        hwnd=1002,
+                        from_rect=(120, 120, 64, 64),
+                        to_rect=(160, 160, 96, 96),
+                        from_img_w=64,
+                        from_img_h=64,
+                        from_bgra=raw_64,
+                        to_img_w=64,
+                        to_img_h=64,
+                        to_bgra=raw_64,
+                        duration_ms=200,
+                        restore_hidden_hwnd=0,
+                        restore_alpha=255,
+                    )
+                )
+                for m_item in m03_ov._morphs:
+                    if m_item.surface.hwnd:
+                        w32.set_window_cloaked(m_item.surface.hwnd, True)
+                m03_ov._on_wobbly_end(1001, 100, 100, True)
+                m03_ok = (
+                    m03_ov._wobble is None
+                    and len(m03_ov._morphs) == 1
+                    and m03_ov._timer.isActive()
+                )
+            finally:
+                m03_ov.shutdown()
+        finally:
+            qf_eng.journal.close()
+
+        # PFX-M04: Win32 failure (False) must NEVER leave fake pending journal entries + Virtual Desktop cloak guard
+        class _FailWin32Backend(DemoWindowBackend):
+            @property
+            def is_demo(self) -> bool:
+                return False
+
+            def set_window_topmost(self, hwnd: int, topmost: bool) -> bool:
+                return False
+
+            def move_resize_window(self, hwnd: int, x: int, y: int, w: int, h: int) -> bool:
+                return False
+
+            def set_desktop_icons_visible(self, visible: bool) -> bool:
+                return False
+
+            def set_window_opacity(self, hwnd: int, alpha: int, had_layered=None) -> bool:
+                return False
+
+        m04_store = ConfigStore(s2_dir / "m04_profile")
+        m04_cfg = m04_store.load()
+        m04_cfg.focus.inactive_fade_enabled = True
+        m04_cfg.focus.desktop_icons_autohide = True
+        m04_store.save(m04_cfg)
+        m04_eng = PrismEngine(_FailWin32Backend(seed=42), m04_store, EffectRegistry())
+        try:
+            m04_eng.toggle_pin_window(1001)
+            m04_eng.toggle_rollup_window(1001)
+            m04_eng.toggle_desktop_icons()
+            m04_eng.set_custom_opacity(1001, 70)
+            m04_eng._housekeeping_tick(time.perf_counter())
+            m04_fail_journal_ok = (
+                m04_eng.journal.pending_count() == 0
+                and len(m04_eng._pinned) == 0
+                and len(m04_eng._rolled_up) == 0
+                and len(m04_eng._faded_hwnds) == 0
+            )
+
+            # Virtual Desktop single-window cloak -> uncloak (>100ms apart) must NOT replay Open
+            vd_hwnd = 777701
+            stage_calls: list[tuple[int, str]] = []
+            m04_eng._stage_open_window = lambda h, trig="open": (stage_calls.append((h, trig)) or True)  # type: ignore[method-assign]
+            with m04_eng._state_lock:
+                m04_eng._known_visible_hwnds.add(vd_hwnd)
+            m04_eng._handle_win_event(w32.EVENT_OBJECT_CLOAKED, vd_hwnd)
+            cloaked_recorded = vd_hwnd in m04_eng._cloaked_hwnds
+            m04_eng._last_cloak_ts -= 0.50  # simulate >500 ms between cloak and uncloak
+            m04_eng._handle_win_event(w32.EVENT_OBJECT_UNCLOAKED, vd_hwnd)
+            m04_vd_ok = (
+                cloaked_recorded
+                and len(stage_calls) == 0
+                and vd_hwnd not in m04_eng._cloaked_hwnds
+                and vd_hwnd in m04_eng._known_visible_hwnds
+            )
+        finally:
+            m04_eng.journal.close()
+
+        check(
+            "sprint2_capture_budget_and_quick_fixes",
+            budget_ok and m02_ok and m03_ok and m04_fail_journal_ok and m04_vd_ok,
+            f"cache_mb={cache_bytes / (1024 * 1024):.1f} m02={m02_ok} m03={m03_ok} "
+            f"m04_journal={m04_fail_journal_ok} m04_vd={m04_vd_ok}",
+        )
+        OffscreenGpuEngine.shared().shutdown()
+        OffscreenGpuEngine.shared().reset_init_attempt()
+
     return results
 
 
@@ -965,7 +1758,8 @@ def run_overlay_test(profile_dir: pathlib.Path) -> dict:
         f"park={park_ok} precover_show={has_pc} precover_cancel={cleared_pc}",
     )
 
-    # Verify live 165 Hz GPU Wobbly Windows overlay lifecycle (start -> drag deform -> settle -> handoff)!
+    # Verify live 165 Hz GPU Wobbly Windows overlay lifecycle (start -> drag deform -> Mixed-DPI swap -> settle)!
+    from .core.engine import WobblyTextureUpdate
     wreq = WobblyDragStart(
         hwnd=88888, x=200, y=180, w=128, h=128,
         img_w=128, img_h=128, bgra_bytes=gdi_zero_alpha_buf,
@@ -975,6 +1769,7 @@ def run_overlay_test(profile_dir: pathlib.Path) -> dict:
     overlay._on_wobbly_start(wreq)
     wob_started = overlay._wobble is not None and overlay._wobble.hwnd == 88888
     peak_wob = 0.0
+    dpi_swap_ok = False
     if wob_started and overlay._wobble is not None:
         w32.set_window_cloaked(overlay._wobble.surface.hwnd, True)
         engine._wobble_live_pos = (88888, 280, 140, 128, 128)
@@ -982,7 +1777,24 @@ def run_overlay_test(profile_dir: pathlib.Path) -> dict:
         overlay._tick()
         if overlay._wobble is not None:
             peak_wob = max(abs(v) for v in overlay._wobble.mesh.flat_offsets())
-        overlay._on_wobbly_end(88888, 280, 140, False)
+        # Simulate proportional Mixed-DPI cross-monitor resize (128x128 -> 192x192) & seamless texture swap
+        engine._wobble_live_pos = (88888, 2000, 140, 192, 192)
+        overlay._last_tick = time.perf_counter() - 0.006
+        overlay._tick()
+        resized_alive = (
+            overlay._wobble is not None
+            and overlay._wobble.w == 192
+            and overlay._wobble.h == 192
+        )
+        new_dpi_buf = bytes([80, 200, 255, 255]) * (192 * 192)
+        old_tex_id = id(overlay._wobble.texture) if overlay._wobble is not None else 0
+        overlay._on_wobbly_texture_update(WobblyTextureUpdate(88888, 192, 192, 192, 192, new_dpi_buf))
+        dpi_swap_ok = (
+            resized_alive
+            and overlay._wobble is not None
+            and id(overlay._wobble.texture) != old_tex_id
+        )
+        overlay._on_wobbly_end(88888, 2000, 140, False)
         for _ in range(120):
             if overlay._wobble is None:
                 break
@@ -993,10 +1805,12 @@ def run_overlay_test(profile_dir: pathlib.Path) -> dict:
         "overlay_live_wobbly_lifecycle",
         engine.on_wobbly_start is not None
         and engine.on_wobbly_end is not None
+        and engine.on_wobbly_texture_update is not None
         and wob_started
         and peak_wob > 0.03
+        and dpi_swap_ok
         and wob_settled,
-        f"started={wob_started} peak_disp={peak_wob:.4f} settled={wob_settled}",
+        f"started={wob_started} peak_disp={peak_wob:.4f} dpi_swap={dpi_swap_ok} settled={wob_settled}",
     )
 
     # Verify 165 Hz Dual-Texture Smooth Maximize / Snap Morph lifecycle!

@@ -108,6 +108,21 @@ _KNOWN_APPS: dict[str, tuple[str, str, str, bool, str, str]] = {
                           "Fullscreen game — auto-excluded.", "เกมเต็มจอ — ยกเว้นอัตโนมัติ"),
     "cyberpunk2077.exe": ("Cyberpunk 2077", "Game / Anti-Cheat", "เกม / แอนตี้ชีต", True,
                           "GPU-intensive fullscreen game — auto-excluded.", "เกมกราฟิกสูง — ยกเว้นอัตโนมัติ"),
+    "r5apex.exe": ("Apex Legends", "Game / Anti-Cheat", "เกม / แอนตี้ชีต", True,
+                   "Competitive Easy Anti-Cheat game — auto-excluded for zero latency & safety.",
+                   "เกมแข่งขันมี Easy Anti-Cheat — ยกเว้นอัตโนมัติเพื่อความปลอดภัยและความลื่นไหล"),
+    "overwatch.exe": ("Overwatch 2", "Game / Anti-Cheat", "เกม / แอนตี้ชีต", True,
+                      "Competitive fullscreen shooter — auto-excluded for zero input lag.",
+                      "เกมยิงแข่งขัน — ยกเว้นอัตโนมัติเพื่อลด Input Lag"),
+    "league of legends.exe": ("League of Legends", "Game / Anti-Cheat", "เกม / แอนตี้ชีต", True,
+                              "Vanguard-protected game client — auto-excluded for zero latency & safety.",
+                              "เกมมีระบบ Vanguard Anti-Cheat — ยกเว้นอัตโนมัติเพื่อความปลอดภัย"),
+    "tslgame.exe": ("PUBG: BATTLEGROUNDS", "Game / Anti-Cheat", "เกม / แอนตี้ชีต", True,
+                    "BattlEye-protected fullscreen game — auto-excluded for zero latency & safety.",
+                    "เกมมี BattlEye Anti-Cheat — ยกเว้นอัตโนมัติเพื่อความปลอดภัย"),
+    "escapefromtarkov.exe": ("Escape from Tarkov", "Game / Anti-Cheat", "เกม / แอนตี้ชีต", True,
+                             "BattlEye-protected fullscreen game — auto-excluded for zero latency & safety.",
+                             "เกมมี BattlEye Anti-Cheat — ยกเว้นอัตโนมัติเพื่อความปลอดภัย"),
     "steamwebhelper.exe": ("Steam Client", "Game Launcher", "แพลตฟอร์มเกม", False,
                            "Launcher UI — safe for animations.", "หน้าต่าง Steam — รองรับแอนิเมชัน"),
     "notepad.exe": ("Notepad", "Utility", "ยูทิลิตี้", False,
@@ -130,11 +145,25 @@ _KNOWN_APPS: dict[str, tuple[str, str, str, bool, str, str]] = {
                     "Windows Game Bar overlay — protected.", "Xbox Game Bar — ป้องกันอัตโนมัติ"),
     "rtss.exe": ("RivaTuner Overlay", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
                  "RTSS OSD overlay — protected.", "RivaTuner OSD — ป้องกันอัตโนมัติ"),
+    "gameoverlayui.exe": ("Steam In-Game Overlay", "GPU Overlay", "โอเวอร์เลย์เกม", True,
+                          "Steam in-game overlay — auto-excluded to prevent overlay flicker & stutter.",
+                          "โอเวอร์เลย์ในเกมของ Steam — ยกเว้นอัตโนมัติเพื่อไม่ให้เกมกระตุก"),
+    "losslessscaling.exe": ("Lossless Scaling", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
+                            "Frame generation & upscaling overlay — auto-excluded to preserve frame pacing.",
+                            "โปรแกรมเพิ่มเฟรมและอัปสเกลภาพ — ยกเว้นอัตโนมัติเพื่อรักษาเฟรมเรต"),
+    "radeonsoftware.exe": ("AMD Software: Adrenalin", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
+                           "AMD Radeon overlay & telemetry HUD — protected automatically.",
+                           "โอเวอร์เลย์และ HUD การ์ดจอ AMD Radeon — ป้องกันอัตโนมัติ"),
+    "amdrsserv.exe": ("AMD Radeon Host Service", "GPU Overlay", "โอเวอร์เลย์การ์ดจอ", True,
+                      "AMD Radeon overlay host service — protected automatically.",
+                      "บริการโฮสต์โอเวอร์เลย์ AMD Radeon — ป้องกันอัตโนมัติ"),
 }
 
 _GAME_PATTERNS = (
     "-win64-shipping.exe", "unityplayer", "anticheat", "easyanticheat", "battleye",
-    "riotclient", "nvidia overlay", "nvidia share", "nvcontainer", "nvsphelper", "gamebar", "rtss", "overwolf"
+    "riotclient", "vanguard", "faceit", "eanticheat",
+    "nvidia overlay", "nvidia share", "nvcontainer", "nvsphelper",
+    "gamebar", "rtss", "overwolf", "gameoverlayui", "losslessscaling", "radeonsoftware", "amdrsserv",
 )
 
 

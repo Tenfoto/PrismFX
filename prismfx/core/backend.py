@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import ctypes
+import os
 import random
 from dataclasses import dataclass
 from typing import Optional
@@ -272,7 +273,7 @@ class Win32WindowBackend(IWindowSystemBackend):
         return w32.is_on_battery_power()
 
     def is_fullscreen_game(self) -> bool:
-        return w32.is_fullscreen_game_active()
+        return w32.is_fullscreen_game_active(own_pid=os.getpid())
 
 
 class DemoWindowBackend(IWindowSystemBackend):
@@ -299,8 +300,11 @@ class DemoWindowBackend(IWindowSystemBackend):
             (1008, "Notepad — Architecture Notes.md", "Notepad", 9812, "Notepad.exe", 640, 220, 720, 520),
         ]
         self._windows: dict[int, WindowInfo] = {}
+        self._window_styles: dict[int, tuple[int, int]] = {}
         self._layered_hwnds: set[int] = set()
         self._per_pixel_layered_hwnds: set[int] = set()
+        default_style = w32.WS_VISIBLE | w32.WS_CAPTION | w32.WS_THICKFRAME | w32.WS_SYSMENU
+        borderless_style = w32.WS_VISIBLE | w32.WS_POPUP
         for hwnd, title, cls, pid, exe, x, y, w, h in specs:
             self._windows[hwnd] = WindowInfo(
                 hwnd=hwnd,
@@ -320,6 +324,7 @@ class DemoWindowBackend(IWindowSystemBackend):
                 opacity=255,
                 classification=classify_app(exe, cls),
             )
+            self._window_styles[hwnd] = (borderless_style if hwnd == 1007 else default_style, 0)
 
     @property
     def is_demo(self) -> bool:
@@ -465,5 +470,37 @@ class DemoWindowBackend(IWindowSystemBackend):
     def is_on_battery(self) -> bool:
         return self._battery
 
+    def set_foreground_hwnd(self, hwnd: int) -> None:
+        self._foreground = int(hwnd)
+
+    def set_window_style(self, hwnd: int, style: int, ex_style: int = 0) -> None:
+        self._window_styles[int(hwnd)] = (int(style), int(ex_style))
+
     def is_fullscreen_game(self) -> bool:
-        return self._fullscreen
+        if self._fullscreen:
+            return True
+        fg = self._windows.get(self._foreground)
+        if not fg or not fg.visible or fg.minimized:
+            return False
+        cx = fg.x + fg.w // 2
+        cy = fg.y + fg.h // 2
+        mon: Optional[w32.MonitorRect] = None
+        for m in self._monitors:
+            if m.left <= cx < m.right and m.top <= cy < m.bottom:
+                mon = m
+                break
+        if mon is None:
+            return False
+        style, ex_style = self._window_styles.get(
+            fg.hwnd, (w32.WS_VISIBLE | w32.WS_CAPTION | w32.WS_THICKFRAME | w32.WS_SYSMENU, 0)
+        )
+        return w32.is_borderless_fullscreen_candidate(
+            class_name=fg.class_name,
+            exe_name=fg.exe_name,
+            style=style,
+            ex_style=ex_style,
+            rect=(fg.x, fg.y, fg.w, fg.h),
+            monitor_rect=mon,
+            is_cloaked=False,
+            is_iconic=fg.minimized,
+        )

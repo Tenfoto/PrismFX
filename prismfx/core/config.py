@@ -195,8 +195,17 @@ class SafetyConfig:
             "PresentMon_x64.exe",
             "GameBar.exe",
             "RTSS.exe",
+            "GameOverlayUI.exe",
+            "LosslessScaling.exe",
+            "RadeonSoftware.exe",
+            "AMDRSServ.exe",
             "VALORANT-Win64-Shipping.exe",
             "cs2.exe",
+            "r5apex.exe",
+            "Overwatch.exe",
+            "League of Legends.exe",
+            "TslGame.exe",
+            "EscapeFromTarkov.exe",
         ]
     )
 

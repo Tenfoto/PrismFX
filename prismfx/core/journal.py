@@ -33,15 +33,30 @@ class WindowMutation:
 
 
 class RecoveryJournal:
-    """Atomic `.part` -> fsync -> `os.replace` crash journal."""
+    """Two-tier crash-safe atomic `.part` -> fsync -> `os.replace` recovery journal.
 
-    def __init__(self, path: pathlib.Path) -> None:
+    - Tier 1 (sync=True): Immediate atomic write + fsync for persistent OS mutations
+      (pin, rollup, desktop icons, native minimize suppression, cloak, custom opacity, restore_all).
+    - Tier 2 (sync=False): Zero-I/O in-memory update for transient animation alpha=0
+      mutations, coalesced over ~25 ms by a dedicated background writer thread.
+    """
+
+    def __init__(self, path: pathlib.Path, coalesce_sec: float = 0.025) -> None:
         self.path = path
         self._lock = threading.Lock()
+        self._io_lock = threading.Lock()
         self._windows: dict[int, WindowMutation] = {}
         self._desktop_icons_hidden_by_app: bool = False
         self._original_min_animate: Optional[bool] = None
         self.last_restore_failed_count: int = 0
+        self._coalesce_sec: float = max(0.016, min(0.050, float(coalesce_sec)))
+        self._dirty: bool = False
+        self._write_gen: int = 0
+        self._flushed_gen: int = 0
+        self._closed: bool = False
+        self._write_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._writer_thread: Optional[threading.Thread] = None
         self._load_existing()
 
     def _try_load_file(self, candidate: pathlib.Path) -> bool:
@@ -102,16 +117,12 @@ class RecoveryJournal:
         self._desktop_icons_hidden_by_app = False
         self._original_min_animate = None
 
-    def _flush_locked(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "pid": os.getpid(),
-            "updated_at": time.time(),
-            "desktop_icons_hidden_by_app": self._desktop_icons_hidden_by_app,
-            "original_min_animate": self._original_min_animate,
-            "windows": [asdict(m) for m in self._windows.values()],
-        }
+    def _write_payload_atomic(self, payload: dict[str, object]) -> bool:
+        """Atomically write payload to `.json.part` -> fsync -> `os.replace` (caller holds `_io_lock`)."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
         tmp = self.path.with_suffix(".json.part")
         data = json.dumps(payload, indent=2).encode("utf-8")
         for attempt in range(6):
@@ -121,14 +132,89 @@ class RecoveryJournal:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, self.path)
-                return
+                return True
             except PermissionError:
                 if attempt == 5:
                     # Never fall back to non-atomic direct overwrite; preserve valid .part for recovery
-                    return
+                    return False
                 time.sleep(0.008 * (attempt + 1))
             except OSError:
-                return
+                return False
+        return False
+
+    def _flush_to_disk(self, min_gen: Optional[int] = None, force: bool = False) -> bool:
+        """Snapshot latest state under `_lock` and flush atomically under `_io_lock` outside `_lock`."""
+        with self._io_lock:
+            with self._lock:
+                if not force and not self._dirty:
+                    if min_gen is None or self._flushed_gen >= min_gen:
+                        return False
+                snap_gen = self._write_gen
+                payload: dict[str, object] = {
+                    "version": 1,
+                    "pid": os.getpid(),
+                    "updated_at": time.time(),
+                    "desktop_icons_hidden_by_app": self._desktop_icons_hidden_by_app,
+                    "original_min_animate": self._original_min_animate,
+                    "windows": [asdict(m) for m in self._windows.values()],
+                }
+                self._dirty = False
+            ok = self._write_payload_atomic(payload)
+            with self._lock:
+                if ok:
+                    if snap_gen > self._flushed_gen:
+                        self._flushed_gen = snap_gen
+                else:
+                    self._dirty = True
+            return ok
+
+    def _schedule_async_flush_locked(self) -> bool:
+        """Mark dirty and wake background writer thread (caller holds `_lock`). Returns True if caller must sync-flush."""
+        self._write_gen += 1
+        self._dirty = True
+        if self._closed:
+            return True
+        if self._writer_thread is None or not self._writer_thread.is_alive():
+            self._stop_event.clear()
+            th = threading.Thread(
+                target=self._writer_loop, name="PrismFX-JournalWriter", daemon=True
+            )
+            self._writer_thread = th
+            th.start()
+        self._write_event.set()
+        return False
+
+    def _writer_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._write_event.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                break
+            if not self._write_event.is_set():
+                with self._lock:
+                    if not self._dirty:
+                        continue
+            # Coalesce rapid transient animation mutations (~25 ms window)
+            self._stop_event.wait(self._coalesce_sec)
+            if self._stop_event.is_set():
+                break
+            self._write_event.clear()
+            self._flush_to_disk(force=False)
+
+    def flush_sync(self) -> None:
+        """Immediately flush any dirty in-memory journal state atomically with `fsync`."""
+        self._flush_to_disk(force=False)
+
+    def close(self) -> None:
+        """Stop the background writer thread cleanly and perform a final synchronous flush."""
+        with self._lock:
+            self._closed = True
+            th = self._writer_thread
+            self._writer_thread = None
+        self._stop_event.set()
+        self._write_event.set()
+        if th is not None and th is not threading.current_thread() and th.is_alive():
+            th.join(timeout=1.0)
+        self.flush_sync()
 
     def has_pending_recovery(self) -> bool:
         with self._lock:
@@ -152,7 +238,10 @@ class RecoveryJournal:
                 self._original_min_animate = None
             elif self._original_min_animate is None:
                 self._original_min_animate = bool(original_value)
-            self._flush_locked()
+            self._write_gen += 1
+            self._dirty = True
+            target_gen = self._write_gen
+        self._flush_to_disk(min_gen=target_gen)
 
     @staticmethod
     def _apply_identity(
@@ -182,7 +271,10 @@ class RecoveryJournal:
             self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
-            self._flush_locked()
+            self._write_gen += 1
+            self._dirty = True
+            target_gen = self._write_gen
+        self._flush_to_disk(min_gen=target_gen)
 
     def record_alpha(
         self,
@@ -192,9 +284,15 @@ class RecoveryJournal:
         pid: int = 0,
         class_name: str = "",
         boot_tick_ms: int = 0,
+        sync: bool = True,
     ) -> None:
+        need_sync_flush = False
+        target_gen = 0
         with self._lock:
-            m = self._windows.get(hwnd) or WindowMutation(hwnd=hwnd)
+            existing = self._windows.get(hwnd)
+            if original_alpha is None and existing is None:
+                return
+            m = existing or WindowMutation(hwnd=hwnd)
             if original_alpha is None:
                 m.original_alpha = None
                 m.had_layered = None
@@ -204,7 +302,16 @@ class RecoveryJournal:
             self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
-            self._flush_locked()
+            if sync:
+                self._write_gen += 1
+                self._dirty = True
+                target_gen = self._write_gen
+                need_sync_flush = True
+            else:
+                need_sync_flush = self._schedule_async_flush_locked()
+                target_gen = self._write_gen
+        if need_sync_flush:
+            self._flush_to_disk(min_gen=target_gen)
 
     def record_pin(
         self,
@@ -220,7 +327,10 @@ class RecoveryJournal:
             self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
-            self._flush_locked()
+            self._write_gen += 1
+            self._dirty = True
+            target_gen = self._write_gen
+        self._flush_to_disk(min_gen=target_gen)
 
     def record_rollup(
         self,
@@ -241,21 +351,38 @@ class RecoveryJournal:
             self._apply_identity(m, pid=pid, class_name=class_name, boot_tick_ms=boot_tick_ms)
             m.timestamp = time.time()
             self._cleanup_entry_locked(hwnd, m)
-            self._flush_locked()
+            self._write_gen += 1
+            self._dirty = True
+            target_gen = self._write_gen
+        self._flush_to_disk(min_gen=target_gen)
 
-    def prune_hwnd(self, hwnd: int) -> bool:
+    def prune_hwnd(self, hwnd: int, sync: bool = True) -> bool:
         """Remove a destroyed HWND from the recovery journal without restoring it."""
+        need_sync_flush = False
+        target_gen = 0
         with self._lock:
             removed = self._windows.pop(int(hwnd), None)
-            if removed is not None:
-                self._flush_locked()
-                return True
-            return False
+            if removed is None:
+                return False
+            if sync:
+                self._write_gen += 1
+                self._dirty = True
+                target_gen = self._write_gen
+                need_sync_flush = True
+            else:
+                need_sync_flush = self._schedule_async_flush_locked()
+                target_gen = self._write_gen
+        if need_sync_flush:
+            self._flush_to_disk(min_gen=target_gen)
+        return True
 
     def record_desktop_icons_hidden(self, hidden: bool) -> None:
         with self._lock:
             self._desktop_icons_hidden_by_app = bool(hidden)
-            self._flush_locked()
+            self._write_gen += 1
+            self._dirty = True
+            target_gen = self._write_gen
+        self._flush_to_disk(min_gen=target_gen)
 
     def get_mutation(self, hwnd: int) -> Optional[WindowMutation]:
         with self._lock:
@@ -420,5 +547,8 @@ class RecoveryJournal:
                 self._original_min_animate = None
 
             self.last_restore_failed_count = failed
-            self._flush_locked()
+            self._write_gen += 1
+            self._dirty = True
+            target_gen = self._write_gen
+        self._flush_to_disk(min_gen=target_gen, force=True)
         return restored

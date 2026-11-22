@@ -76,7 +76,10 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         self._win_offset = QtCore.QPointF(0.0, 0.0)
         self._last_mouse = QtCore.QPointF(0.0, 0.0)
 
-        # Frame pacing & telemetry
+        # Frame pacing, idle auto-pause & telemetry
+        self._target_fps: int = 165
+        self._idle_timeout_sec: float = 15.0
+        self._last_interaction_ts: float = time.perf_counter()
         self._last_tick = time.perf_counter()
         self._frame_times: list[float] = []
         self._work_times: list[float] = []
@@ -84,10 +87,29 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
 
         self._timer = QtCore.QTimer(self)
         self._timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self._timer.setInterval(6)  # ~165 Hz pacing
+        self._timer.setInterval(max(2, int(round(1000.0 / self._target_fps))))
         self._timer.timeout.connect(self._on_tick)
 
+    def set_target_fps(self, fps: int) -> None:
+        clamped = max(30, min(360, int(fps)))
+        self._target_fps = clamped
+        self._timer.setInterval(max(2, int(round(1000.0 / clamped))))
+
+    def notify_interaction(self) -> None:
+        self._last_interaction_ts = time.perf_counter()
+        if not self.isVisible():
+            return
+        win = self.window()
+        if win is not None and win.isMinimized():
+            return
+        self.start_clock()
+
     def start_clock(self) -> None:
+        if not self.isVisible():
+            return
+        win = self.window()
+        if win is not None and win.isMinimized():
+            return
         self._last_tick = time.perf_counter()
         if not self._timer.isActive():
             self._timer.start()
@@ -101,7 +123,7 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         self._manual_scrub = None
         self._win_offset = QtCore.QPointF(0.0, 0.0)
         self.setCursor(QtCore.Qt.OpenHandCursor if enabled else QtCore.Qt.PointingHandCursor)
-        self.start_clock()
+        self.notify_interaction()
         self._render_current_frame()
         self.update()
 
@@ -151,7 +173,7 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         self._playing = True
         self._play_start = time.perf_counter()
         self._hold_until = 0.0
-        self.start_clock()
+        self.notify_interaction()
         self._render_current_frame()
         self.update()
 
@@ -165,9 +187,11 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
             return
         w = max(64, self.width())
         h = max(64, self.height())
-        # Cap internal offscreen preview buffer neatly for ultra-fast <0.6 ms GPU render
-        rw = min(w, 720)
-        rh = max(64, int(round(rw * (h / max(1, w)))))
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        # Scale offscreen preview buffer by DPR for crisp HiDPI rendering while bounding GPU cost
+        max_rw = min(1920, int(round(720.0 * dpr)))
+        rw = max(64, min(int(round(w * dpr)), max_rw))
+        rh = max(64, min(1920, int(round(rw * (h / max(1, w))))))
 
         card_w = min(rw * 0.72, rh * 1.18)
         card_h = card_w * (340.0 / 560.0)
@@ -195,6 +219,7 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
                 custom_frag_path=self._custom_frag,
             )
         if img is not None:
+            img.setDevicePixelRatio(dpr)
             self._frame_img = img
         self._work_times.append((time.perf_counter() - t0) * 1000.0)
         if len(self._work_times) > 120:
@@ -301,59 +326,76 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
 
     def benchmark_frames(self, duration_sec: float = 1.0) -> FramePerfSummary:
         """Measure real GPU offscreen shader rendering + widget presentation throughput."""
+        was_active = self._timer.isActive()
+        self.pause_clock()
         self._manual_scrub = None
         self._playing = True
         self._loop_mode = True
-        for _ in range(5):
-            self._advance_animation(time.perf_counter())
-            self._render_current_frame()
-            self.repaint()
-            QtCore.QCoreApplication.processEvents()
+        fps_target = max(30, min(360, int(self._target_fps)))
+        target_dt = 1.0 / float(fps_target)
+        budget_ms = 1000.0 / float(fps_target)
 
-        gc_before = gc.get_count()
-        times: list[float] = []
-        works: list[float] = []
-        target_dt = 1.0 / 165.0
-        t0 = time.perf_counter()
-        prev = t0
-        while (time.perf_counter() - t0) < duration_sec:
-            w0 = time.perf_counter()
-            self._advance_animation(w0)
-            self._render_current_frame()
-            self.repaint()
-            QtCore.QCoreApplication.processEvents()
-            w1 = time.perf_counter()
-            work_ms = (w1 - w0) * 1000.0
-            works.append(work_ms)
-            # Pace cleanly to 165 Hz budget to report honest real-world 165 Hz headroom
-            rem = target_dt - (w1 - w0)
-            if rem > 0.0005:
-                time.sleep(rem)
-            end_t = time.perf_counter()
-            times.append((end_t - prev) * 1000.0)
-            prev = end_t
+        try:
+            for _ in range(5):
+                self._advance_animation(time.perf_counter())
+                self._render_current_frame()
+                self.repaint()
+                QtCore.QCoreApplication.processEvents()
 
-        gc_after = gc.get_count()
-        times_sorted = sorted(times) if times else [0.0]
-        n = len(times_sorted)
-        avg_ms = sum(times_sorted) / max(1, n)
-        avg_work = sum(works) / max(1, len(works))
-        return FramePerfSummary(
-            frames=n,
-            avg_fps=round(1000.0 / max(0.001, avg_ms), 1),
-            p50_ms=round(times_sorted[int(n * 0.50)], 2),
-            p95_ms=round(times_sorted[min(n - 1, int(n * 0.95))], 2),
-            p99_ms=round(times_sorted[min(n - 1, int(n * 0.99))], 2),
-            max_ms=round(times_sorted[-1], 2),
-            ui_work_ms=round(avg_work, 2),
-            missed_vsync=sum(1 for ms in works if ms > 6.06),
-            gc_gen0=max(0, gc_after[0] - gc_before[0]),
-            gc_gen2=max(0, gc_after[2] - gc_before[2]),
-            gpu_renderer=self.gpu_renderer_name(),
-        )
+            gc_before = gc.get_count()
+            times: list[float] = []
+            works: list[float] = []
+            t0 = time.perf_counter()
+            prev = t0
+            while (time.perf_counter() - t0) < duration_sec:
+                w0 = time.perf_counter()
+                self._advance_animation(w0)
+                self._render_current_frame()
+                self.repaint()
+                QtCore.QCoreApplication.processEvents()
+                w1 = time.perf_counter()
+                work_ms = (w1 - w0) * 1000.0
+                works.append(work_ms)
+                # Pace cleanly to configured target_fps budget to report honest headroom
+                rem = target_dt - (w1 - w0)
+                if rem > 0.0005:
+                    time.sleep(rem)
+                end_t = time.perf_counter()
+                times.append((end_t - prev) * 1000.0)
+                prev = end_t
+
+            gc_after = gc.get_count()
+            times_sorted = sorted(times) if times else [0.0]
+            n = len(times_sorted)
+            avg_ms = sum(times_sorted) / max(1, n)
+            avg_work = sum(works) / max(1, len(works))
+            return FramePerfSummary(
+                frames=n,
+                avg_fps=round(1000.0 / max(0.001, avg_ms), 1),
+                p50_ms=round(times_sorted[int(n * 0.50)], 2),
+                p95_ms=round(times_sorted[min(n - 1, int(n * 0.95))], 2),
+                p99_ms=round(times_sorted[min(n - 1, int(n * 0.99))], 2),
+                max_ms=round(times_sorted[-1], 2),
+                ui_work_ms=round(avg_work, 2),
+                missed_vsync=sum(1 for ms in works if ms > budget_ms),
+                gc_gen0=max(0, gc_after[0] - gc_before[0]),
+                gc_gen2=max(0, gc_after[2] - gc_before[2]),
+                gpu_renderer=self.gpu_renderer_name(),
+            )
+        finally:
+            if was_active and self.isVisible():
+                win = self.window()
+                if win is None or (not win.isMinimized() and win.isActiveWindow()):
+                    self.start_clock()
 
     def _on_tick(self) -> None:
         now = time.perf_counter()
+        if not self.isVisible():
+            self.pause_clock()
+            return
+        if not self._dragging and (now - self._last_interaction_ts) > self._idle_timeout_sec:
+            self.pause_clock()
+            return
         dt = min(0.05, max(0.0005, now - self._last_tick))
         self._last_tick = now
         self._elapsed += dt
@@ -401,7 +443,16 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
             else:
                 self._playing = False
 
+    def enterEvent(self, event: QtGui.QEnterEvent) -> None:
+        self.notify_interaction()
+        super().enterEvent(event)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        self.notify_interaction()
+        super().wheelEvent(event)
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        self.notify_interaction()
         if event.button() == QtCore.Qt.LeftButton:
             if self._wobble_sandbox:
                 self._dragging = True
@@ -419,6 +470,7 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        self.notify_interaction()
         if self._wobble_sandbox and self._dragging:
             pos = event.position()
             dx = pos.x() - self._last_mouse.x()
@@ -439,6 +491,7 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         if self._wobble_sandbox and self._dragging:
             self._dragging = False
             self.setCursor(QtCore.Qt.OpenHandCursor)
+        self.notify_interaction()
         super().mouseReleaseEvent(event)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
@@ -446,8 +499,14 @@ class ShaderPreviewWidget(QtWidgets.QWidget):
         super().hideEvent(event)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
-        self.start_clock()
         super().showEvent(event)
+        win = self.window()
+        if win is None or (not win.isMinimized() and win.isActiveWindow()):
+            self.notify_interaction()
+        else:
+            self.pause_clock()
+            if self._frame_img is None:
+                self.update()
 
     def cleanup_gl(self) -> None:
         self.pause_clock()

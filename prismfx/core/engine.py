@@ -34,6 +34,8 @@ from .physics import (
 _WM_APP_SYNC_RAWINPUT = w32.WM_APP + 11
 _WM_APP_UNHOOK_DRAG = w32.WM_APP + 12
 
+MAX_CAPTURE_CACHE_BYTES = 64 * 1024 * 1024  # Strict 64 MB capture cache memory budget
+
 _ACTIVE_NATIVE_CALLBACKS: set[object] = set()
 _ACTIVE_NATIVE_CALLBACKS_LOCK = threading.Lock()
 
@@ -179,6 +181,44 @@ class WobblyDragStart:
 
 
 @dataclass
+class WobblyTextureUpdate:
+    """Seamless mid-drag texture swap when a dragged window rescales across Mixed-DPI monitors."""
+    hwnd: int
+    w: int
+    h: int
+    img_w: int
+    img_h: int
+    bgra_bytes: bytes
+
+
+def is_proportional_dpi_scale(
+    old_w: int,
+    old_h: int,
+    new_w: int,
+    new_h: int,
+    crossed_monitor: bool = False,
+) -> bool:
+    """Return True if (old_w, old_h) -> (new_w, new_h) looks like a Mixed-DPI monitor rescale."""
+    if old_w < 40 or old_h < 40 or new_w < 40 or new_h < 40:
+        return False
+    if old_w == new_w and old_h == new_h:
+        return False
+    old_ar = old_w / float(old_h)
+    new_ar = new_w / float(new_h)
+    if abs(new_ar - old_ar) / max(1e-6, old_ar) > 0.18:
+        return False
+    sw = new_w / float(old_w)
+    sh = new_h / float(old_h)
+    if not ((sw >= 0.98 and sh >= 0.98) or (sw <= 1.02 and sh <= 1.02)):
+        return False
+    if 0.55 <= sw <= 1.85 and 0.55 <= sh <= 1.85:
+        return True
+    if crossed_monitor and 0.35 <= sw <= 3.0 and 0.35 <= sh <= 3.0:
+        return True
+    return False
+
+
+@dataclass
 class PreCoverJob:
     """Pixel-identical pre-emptive Frame-0 cover placed BEFORE Windows unmaps a minimizing/closing window."""
     hwnd: int
@@ -300,7 +340,11 @@ class PrismEngine:
         self._prehidden_creating: dict[int, tuple[float, float, bool]] = {}  # hwnd -> (created_at, first_visible_at, had_layered)
         self._pending_opens: dict[int, _PendingOpen] = {}           # async first-frame staging off hook thread!
         self._pending_morphs: dict[int, _PendingMorph] = {}         # async smooth maximize/snap morph staging!
+        self._pending_hook_triggers: list[tuple[int, str]] = []     # async restore/menu triggers off hook thread!
+        self._pending_wobble_captures: dict[int, tuple[int, int, int, int, float]] = {}  # async drag captures!
+        self._pending_dpi_wobble_captures: dict[int, tuple[int, int, int, int, float]] = {}  # async Mixed-DPI recaptures!
         self._known_visible_hwnds: set[int] = set()                 # already-open windows (never fake-open on Alt+Tab)
+        self._cloaked_hwnds: set[int] = set()                       # virtual-desktop cloaked known windows
         self._recent_uncloak_times: list[float] = []                # virtual-desktop burst guard
         self._last_cloak_ts: float = 0.0
         self._last_caption_click: tuple[int, int, int, float] = (0, 0, 0, 0.0)
@@ -332,6 +376,8 @@ class PrismEngine:
         self._drag_wobble_started: bool = False
         self._drag_is_resize: bool = False
         self._drag_size_changed: bool = False
+        self._drag_dpi_recapture_pending: bool = False
+        self._drag_monitor_key: tuple[str, int, int, int, int] = ("", 0, 0, 0, 0)
         self._drag_size_changed_at: float = 0.0
         self._drag_stable_moves: int = 0
         self._drag_recapture_tries: int = 0
@@ -373,8 +419,10 @@ class PrismEngine:
         self.on_precover_cancel: Optional[Callable[[int], None]] = None
         self.on_wobbly_start: Optional[Callable[[WobblyDragStart], None]] = None
         self.on_wobbly_end: Optional[Callable[[int, int, int, bool], None]] = None
+        self.on_wobbly_texture_update: Optional[Callable[[WobblyTextureUpdate], None]] = None
         self.on_wobbly_drag: Optional[Callable[[int, int, int, int, int, float, float, bool], None]] = None
         self.on_spotlight_changed: Optional[Callable[[SpotlightState], None]] = None
+        self.on_pause_state_changed: Optional[Callable[[str], None]] = None
 
         # Crash recovery on startup!
         if self.journal.has_pending_recovery() and not backend.is_demo:
@@ -450,11 +498,12 @@ class PrismEngine:
                 self._cached_captures.clear()
         if persist:
             self.store.save(cfg)
-        self._cached_paused_reason = self.paused_reason()
+        self._apply_paused_reason_transition(self.paused_reason())
         if not cfg.enabled or not cfg.physics.wobbly_enabled:
             if (self._drag_wobble_started or self._momentum_wobble_hwnd) and self.on_wobbly_end:
                 wh = self._drag_hwnd or self._momentum_wobble_hwnd
                 self._drag_wobble_started = False
+                self._drag_dpi_recapture_pending = False
                 self._momentum_wobble_hwnd = 0
                 try:
                     self.on_wobbly_end(wh, 0, 0, True)
@@ -479,7 +528,7 @@ class PrismEngine:
         self._publish_frame()
 
     def _want_raw_input_mouse(self) -> bool:
-        if not self.config.enabled:
+        if not self.config.enabled or self._cached_paused_reason == "fullscreen_game":
             return False
         tc_min = self.config.triggers.get("minimize")
         tc_cls = self.config.triggers.get("close")
@@ -530,13 +579,13 @@ class PrismEngine:
             return False
         pid, cls_name, boot_ms = self._window_identity(hwnd, info)
         self.journal.record_alpha(
-            hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+            hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms, sync=False
         )
         if self.backend.set_window_hidden_alpha(hwnd, True):
             with self._hidden_lock:
                 self._prehidden_minimized[hwnd] = (orig_alpha, had_layered)
             return True
-        self.journal.record_alpha(hwnd, None)
+        self.journal.record_alpha(hwnd, None, sync=False)
         return False
 
     def _try_prehide_on_create(self, hwnd: int) -> bool:
@@ -587,7 +636,13 @@ class PrismEngine:
             return False
         orig_alpha = cur_alpha if cur_alpha >= 20 else 255
         self.journal.record_alpha(
-            hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls, boot_tick_ms=w32.get_boot_tick_ms()
+            hwnd,
+            orig_alpha,
+            had_layered=had_layered,
+            pid=pid,
+            class_name=cls,
+            boot_tick_ms=w32.get_boot_tick_ms(),
+            sync=False,
         )
         if self.backend.set_window_hidden_alpha(hwnd, True):
             now = time.perf_counter()
@@ -595,7 +650,7 @@ class PrismEngine:
             with self._hidden_lock:
                 self._prehidden_creating[hwnd] = (now, vis_now, had_layered)
             return True
-        self.journal.record_alpha(hwnd, None)
+        self.journal.record_alpha(hwnd, None, sync=False)
         return False
 
     def _unhide_if_prehidden(self, hwnd: int) -> None:
@@ -615,7 +670,7 @@ class PrismEngine:
         if orig_alpha is not None:
             if self.backend.is_valid_window(hwnd):
                 self.backend.set_window_hidden_alpha(hwnd, False, orig_alpha, had_layered=had_layered)
-            self.journal.record_alpha(hwnd, None)
+            self.journal.record_alpha(hwnd, None, sync=False)
 
     def _release_all_prehidden(self, minimized_only: bool = False, creating_only: bool = False) -> None:
         to_restore: list[tuple[int, int, bool]] = []
@@ -635,7 +690,7 @@ class PrismEngine:
         for h, orig_a, hl in to_restore:
             if self.backend.is_valid_window(h):
                 self.backend.set_window_hidden_alpha(h, False, orig_a, had_layered=hl)
-            self.journal.record_alpha(h, None)
+            self.journal.record_alpha(h, None, sync=False)
 
     def _sync_native_min_anim(self, active: bool) -> None:
         """Crash-safe suppression of conflicting Win11 native minimize/restore zoom."""
@@ -645,13 +700,13 @@ class PrismEngine:
         if want_suppress and not self._suppressed_min_anim:
             orig = self.backend.get_native_min_animate()
             if orig:
-                self.journal.record_native_min_animate(True)
-                self.backend.set_native_min_animate(False)
-                self._suppressed_min_anim = True
+                if self.backend.set_native_min_animate(False):
+                    self.journal.record_native_min_animate(True)
+                    self._suppressed_min_anim = True
         elif not want_suppress and self._suppressed_min_anim:
-            self.backend.set_native_min_animate(True)
-            self.journal.record_native_min_animate(None)
-            self._suppressed_min_anim = False
+            if self.backend.set_native_min_animate(True):
+                self.journal.record_native_min_animate(None)
+                self._suppressed_min_anim = False
 
     def is_excluded(self, info: WindowInfo) -> bool:
         with self._state_lock:
@@ -678,6 +733,87 @@ class PrismEngine:
             return "battery"
         return ""
 
+    def _cancel_active_interaction_for_pause(self) -> None:
+        """Cancel any active drag, wobble, momentum, or precover cleanly when entering fullscreen_game."""
+        if self._drag_hwnd:
+            drag_h = self._drag_hwnd
+            was_wob = self._drag_wobble_started
+            was_mutated = self._drag_alpha_mutated
+            drag_orig_a = self._drag_orig_alpha
+            drag_had_l = self._drag_had_layered
+            self._drag_hwnd = 0
+            self._drag_wobble_started = False
+            self._drag_dpi_recapture_pending = False
+            self._drag_alpha_mutated = False
+            self._drag_unsafe_layered = False
+            self._drag_lbutton_up_since = 0.0
+            if self._hook_tid:
+                try:
+                    w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
+                except Exception:
+                    pass
+            if (not was_wob) and was_mutated:
+                if self.backend.is_valid_window(drag_h):
+                    self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
+                self.journal.record_alpha(drag_h, None)
+            if was_wob and self.on_wobbly_end:
+                try:
+                    self.on_wobbly_end(drag_h, 0, 0, True)
+                except Exception:
+                    pass
+        self._momentum = None
+        if self._momentum_wobble_hwnd:
+            mw_h = self._momentum_wobble_hwnd
+            self._momentum_wobble_hwnd = 0
+            if self.on_wobbly_end:
+                try:
+                    self.on_wobbly_end(mw_h, 0, 0, True)
+                except Exception:
+                    pass
+        self._drag_dpi_recapture_pending = False
+        self._wobble_live_pos = None
+        self._armed_precover = None
+        if self._active_precover_hwnd:
+            self._cancel_active_precover()
+        with self._hidden_lock:
+            wobble_items = list(self._hidden_for_wobble.items())
+            self._hidden_for_wobble.clear()
+            self._pending_wobble_captures.clear()
+            self._pending_dpi_wobble_captures.clear()
+        for h, (orig_a, _ts, had_layered) in wobble_items:
+            if self.backend.is_valid_window(h):
+                self.backend.set_window_hidden_alpha(h, False, orig_a, had_layered=had_layered)
+            self.journal.record_alpha(h, None)
+        self._open_wake.set()
+
+    def _apply_paused_reason_transition(self, new_paused: str) -> bool:
+        """Atomically update _cached_paused_reason and enforce full hygiene on pause transitions."""
+        with self._state_lock:
+            prev_paused = self._cached_paused_reason
+            if new_paused == prev_paused:
+                return False
+            self._cached_paused_reason = new_paused
+
+        # Immediately sync Raw Input registration (RIDEV_REMOVE on fullscreen_game, re-register on exit)
+        if self._raw_input_hwnd:
+            try:
+                w32.user32.PostMessageW(self._raw_input_hwnd, _WM_APP_SYNC_RAWINPUT, 0, 0)
+            except Exception:
+                pass
+
+        if new_paused == "fullscreen_game":
+            self._cancel_active_interaction_for_pause()
+            self._release_all_prehidden()
+            self._update_spotlight_state(force_off=True)
+
+        cb = self.on_pause_state_changed
+        if cb is not None:
+            try:
+                cb(new_paused)
+            except Exception:
+                pass
+        return True
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -687,7 +823,7 @@ class PrismEngine:
         self._running = True
         self._stop_event.clear()
         self._open_wake.clear()
-        self._cached_paused_reason = self.paused_reason()
+        self._apply_paused_reason_transition(self.paused_reason())
         self._sync_native_min_anim(active=True)
         # Seed known visible windows so focusing/Alt-Tabbing existing apps never false-triggers Open!
         seed_vis = {
@@ -712,6 +848,7 @@ class PrismEngine:
     def stop(self) -> None:
         with self._stop_lock:
             if not self._running:
+                self.journal.flush_sync()
                 return
             self._running = False
             self._stop_event.set()
@@ -749,6 +886,7 @@ class PrismEngine:
             # Pass 2: final sweep in case a worker mutated a window right as stop_event fired
             if self.journal.has_pending_recovery() or self._prehidden_minimized or self._hidden_for_anim:
                 self.restore_all_os_state()
+            self.journal.flush_sync()
 
     def on_system_suspend(self) -> None:
         """Immediately release all hidden/pre-hidden/wobble-hidden windows before system sleep or session lock."""
@@ -760,6 +898,7 @@ class PrismEngine:
             drag_had_l = self._drag_had_layered
             self._drag_hwnd = 0
             self._drag_wobble_started = False
+            self._drag_dpi_recapture_pending = False
             self._drag_alpha_mutated = False
             self._drag_unsafe_layered = False
             self._drag_lbutton_up_since = 0.0
@@ -771,7 +910,7 @@ class PrismEngine:
             if (not was_wob) and was_mutated:
                 if self.backend.is_valid_window(drag_h):
                     self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
-                self.journal.record_alpha(drag_h, None)
+                self.journal.record_alpha(drag_h, None, sync=False)
             if was_wob and self.on_wobbly_end:
                 try:
                     self.on_wobbly_end(drag_h, 0, 0, True)
@@ -804,6 +943,9 @@ class PrismEngine:
             self._pending_opens.clear()
             pm_items = list(self._pending_morphs.values())
             self._pending_morphs.clear()
+            self._pending_hook_triggers.clear()
+            self._pending_wobble_captures.clear()
+            self._pending_dpi_wobble_captures.clear()
             self._pending_prehide.clear()
             self._prehidden_uniconic_since.clear()
 
@@ -812,35 +954,36 @@ class PrismEngine:
             restored_set.add(hwnd)
             if self.backend.is_valid_window(hwnd):
                 self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
-            self.journal.record_alpha(hwnd, None)
+            self.journal.record_alpha(hwnd, None, sync=False)
         for hwnd, (orig_a, _ts, had_layered) in wobble_items:
             restored_set.add(hwnd)
             if self.backend.is_valid_window(hwnd):
                 self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
-            self.journal.record_alpha(hwnd, None)
+            self.journal.record_alpha(hwnd, None, sync=False)
         for hwnd, (orig_a, had_layered) in pre_min_items:
             restored_set.add(hwnd)
             if self.backend.is_valid_window(hwnd):
                 self.backend.set_window_hidden_alpha(hwnd, False, orig_a, had_layered=had_layered)
-            self.journal.record_alpha(hwnd, None)
+            self.journal.record_alpha(hwnd, None, sync=False)
         for hwnd, (_created, _vis, had_layered) in pre_crt_items:
             restored_set.add(hwnd)
             if self.backend.is_valid_window(hwnd):
                 self.backend.set_window_hidden_alpha(hwnd, False, 255, had_layered=had_layered)
-            self.journal.record_alpha(hwnd, None)
+            self.journal.record_alpha(hwnd, None, sync=False)
         for po in po_items:
             if po.hwnd not in restored_set:
                 restored_set.add(po.hwnd)
                 if self.backend.is_valid_window(po.hwnd):
                     self.backend.set_window_hidden_alpha(po.hwnd, False, po.orig_alpha, had_layered=po.had_layered)
-                self.journal.record_alpha(po.hwnd, None)
+                self.journal.record_alpha(po.hwnd, None, sync=False)
         for pm in pm_items:
             if pm.hwnd not in restored_set:
                 restored_set.add(pm.hwnd)
                 if self.backend.is_valid_window(pm.hwnd):
                     self.backend.set_window_hidden_alpha(pm.hwnd, False, pm.orig_alpha, had_layered=pm.had_layered)
-                self.journal.record_alpha(pm.hwnd, None)
+                self.journal.record_alpha(pm.hwnd, None, sync=False)
 
+        self.journal.flush_sync()
         self._clear_inactive_fades()
         self._update_spotlight_state(force_off=True)
         self._publish_frame()
@@ -854,12 +997,13 @@ class PrismEngine:
         self._armed_precover = None
         with self._state_lock:
             self._last_trigger_info.clear()
+            self._cloaked_hwnds.clear()
             for h in list(self._last_active_time):
                 self._last_active_time[h] = now
         with self._cache_lock:
             self._cached_captures.clear()
             self._pending_cache_hwnds.clear()
-        self._cached_paused_reason = self.paused_reason()
+        self._apply_paused_reason_transition(self.paused_reason())
         self.backend.list_monitors()
         self._publish_frame()
 
@@ -873,6 +1017,7 @@ class PrismEngine:
         self._suppressed_min_anim = False
         self._drag_hwnd = 0
         self._drag_wobble_started = False
+        self._drag_dpi_recapture_pending = False
         self._drag_alpha_mutated = False
         self._drag_unsafe_layered = False
         self._momentum_wobble_hwnd = 0
@@ -888,6 +1033,9 @@ class PrismEngine:
             self._prehidden_creating.clear()
             self._pending_opens.clear()
             self._pending_morphs.clear()
+            self._pending_hook_triggers.clear()
+            self._pending_wobble_captures.clear()
+            self._pending_dpi_wobble_captures.clear()
             self._pending_prehide.clear()
         for hwnd, (orig_a, _ts, had_layered) in hidden_items:
             if self.backend.is_valid_window(hwnd):
@@ -917,7 +1065,11 @@ class PrismEngine:
         return count
 
     def finish_hidden_handoff(
-        self, hwnd: int, restore_alpha: int = 255, had_layered: Optional[bool] = None
+        self,
+        hwnd: int,
+        restore_alpha: int = 255,
+        had_layered: Optional[bool] = None,
+        flush_dwm: bool = True,
     ) -> None:
         """Called by overlay on the final opaque frame BEFORE hiding overlay -> zero flash!"""
         with self._hidden_lock:
@@ -944,8 +1096,9 @@ class PrismEngine:
                 hl = mut.had_layered if mut is not None else None
         if self.backend.is_valid_window(hwnd):
             self.backend.set_window_hidden_alpha(hwnd, False, alpha, had_layered=hl)
-        self.journal.record_alpha(hwnd, None)
-        self.backend.dwm_flush()
+        self.journal.record_alpha(hwnd, None, sync=False)
+        if flush_dwm:
+            self.backend.dwm_flush()
         # Queue a background cache refresh now that the restored/opened window is visible & crisp
         if hwnd:
             with self._cache_lock:
@@ -997,7 +1150,9 @@ class PrismEngine:
         else:
             alpha = max(20, min(255, int(orig_alpha))) if orig_alpha > 0 else 255
         pid, cls_name, boot_ms = self._window_identity(hwnd)
-        self.journal.record_alpha(hwnd, alpha, had_layered=hl, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms)
+        self.journal.record_alpha(
+            hwnd, alpha, had_layered=hl, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms, sync=False
+        )
         if self.backend.set_window_hidden_alpha(hwnd, True):
             with self._hidden_lock:
                 self._hidden_for_wobble[hwnd] = (alpha, time.perf_counter(), hl)
@@ -1006,18 +1161,22 @@ class PrismEngine:
             with self._state_lock:
                 self._faded_hwnds[hwnd] = faded_entry
         else:
-            self.journal.record_alpha(hwnd, None)
+            self.journal.record_alpha(hwnd, None, sync=False)
         return False
 
     def finish_wobble_handoff(
-        self, hwnd: int, restore_alpha: int = 255, had_layered: Optional[bool] = None
-    ) -> None:
+        self,
+        hwnd: int,
+        restore_alpha: int = 255,
+        had_layered: Optional[bool] = None,
+        flush_dwm: bool = True,
+    ) -> bool:
         """Called by overlay after jelly settles & flat opaque Frame is presented -> 0 ms handoff!"""
         with self._hidden_lock:
             entry = self._hidden_for_wobble.pop(hwnd, None)
             claimed_by_morph = (hwnd in self._hidden_for_anim) or (hwnd in self._pending_morphs)
         if claimed_by_morph:
-            return
+            return False
         alpha = entry[0] if entry is not None else restore_alpha
         hl = had_layered
         if hl is None:
@@ -1028,11 +1187,13 @@ class PrismEngine:
                 hl = mut.had_layered if mut is not None else None
         if self.backend.is_valid_window(hwnd):
             self.backend.set_window_hidden_alpha(hwnd, False, alpha, had_layered=hl)
-        self.journal.record_alpha(hwnd, None)
-        self.backend.dwm_flush()
+        self.journal.record_alpha(hwnd, None, sync=False)
+        if flush_dwm:
+            self.backend.dwm_flush()
         if hwnd:
             with self._cache_lock:
                 self._pending_cache_hwnds.add(hwnd)
+        return True
 
     def _restore_window_height(self, hwnd: int, orig_h: int) -> bool:
         if not self.backend.is_valid_window(hwnd):
@@ -1050,15 +1211,17 @@ class PrismEngine:
         if not info:
             return False
         new_state = not info.topmost
+        ok = bool(self.backend.set_window_topmost(hwnd, new_state))
+        if not ok:
+            self._publish_frame()
+            return info.topmost
         pid, cls_name, boot_ms = self._window_identity(hwnd, info)
         self.journal.record_pin(hwnd, new_state, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms)
-        ok = self.backend.set_window_topmost(hwnd, new_state)
-        if ok:
-            with self._state_lock:
-                if new_state:
-                    self._pinned.add(hwnd)
-                else:
-                    self._pinned.discard(hwnd)
+        with self._state_lock:
+            if new_state:
+                self._pinned.add(hwnd)
+            else:
+                self._pinned.discard(hwnd)
         self._publish_frame()
         return new_state
 
@@ -1077,21 +1240,16 @@ class PrismEngine:
         else:
             orig_alpha, orig_had_layered = cur_alpha, had_layered
         if alpha < 255:
-            pid, cls_name, boot_ms = self._window_identity(hwnd, info)
-            self.journal.record_alpha(
-                hwnd, orig_alpha, had_layered=orig_had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
-            )
-            ok = self.backend.set_window_opacity(hwnd, alpha, had_layered=orig_had_layered)
+            ok = bool(self.backend.set_window_opacity(hwnd, alpha, had_layered=orig_had_layered))
             if ok:
+                pid, cls_name, boot_ms = self._window_identity(hwnd, info)
+                self.journal.record_alpha(
+                    hwnd, orig_alpha, had_layered=orig_had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+                )
                 with self._state_lock:
                     self._custom_opacity_orig[hwnd] = (orig_alpha, orig_had_layered)
-            else:
-                with self._state_lock:
-                    has_orig = hwnd in self._custom_opacity_orig
-                if not has_orig:
-                    self.journal.record_alpha(hwnd, None)
             return ok
-        ok = self.backend.set_window_opacity(hwnd, alpha, had_layered=orig_had_layered)
+        ok = bool(self.backend.set_window_opacity(hwnd, alpha, had_layered=orig_had_layered))
         if ok:
             with self._state_lock:
                 self._custom_opacity_orig.pop(hwnd, None)
@@ -1103,19 +1261,27 @@ class PrismEngine:
         if not info:
             return False
         with self._state_lock:
-            orig_h = self._rolled_up.pop(hwnd, None)
+            orig_h = self._rolled_up.get(hwnd)
         if orig_h is not None:
+            ok = bool(self.backend.move_resize_window(hwnd, info.x, info.y, info.w, orig_h))
+            if not ok:
+                self._publish_frame()
+                return True
+            with self._state_lock:
+                self._rolled_up.pop(hwnd, None)
             self.journal.record_rollup(hwnd, False)
-            self.backend.move_resize_window(hwnd, info.x, info.y, info.w, orig_h)
             self._publish_frame()
             return False
         if info.h <= 56:
+            return False
+        ok = bool(self.backend.move_resize_window(hwnd, info.x, info.y, info.w, 38))
+        if not ok:
+            self._publish_frame()
             return False
         with self._state_lock:
             self._rolled_up[hwnd] = info.h
         pid, cls_name, boot_ms = self._window_identity(hwnd, info)
         self.journal.record_rollup(hwnd, True, info.h, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms)
-        self.backend.move_resize_window(hwnd, info.x, info.y, info.w, 38)
         self._publish_frame()
         return True
 
@@ -1209,8 +1375,11 @@ class PrismEngine:
     def toggle_desktop_icons(self) -> bool:
         currently = self.backend.are_desktop_icons_visible()
         new_vis = not currently
+        ok = bool(self.backend.set_desktop_icons_visible(new_vis))
+        if not ok:
+            self._publish_frame()
+            return currently
         self.journal.record_desktop_icons_hidden(not new_vis)
-        self.backend.set_desktop_icons_visible(new_vis)
         self._publish_frame()
         return new_vis
 
@@ -1266,7 +1435,11 @@ class PrismEngine:
                 self._unhide_if_prehidden(hwnd)
             return None
 
-        reverse = reverse_override if reverse_override is not None else (trigger in ("open", "restore"))
+        reverse = (
+            reverse_override
+            if reverse_override is not None
+            else (trigger in ("open", "restore", "menu", "popup"))
+        )
         with self._cache_lock:
             cached = self._cached_captures.get(hwnd)
         cap_data: Optional[tuple[int, int, bytes]] = None
@@ -1320,14 +1493,20 @@ class PrismEngine:
                     hidden_had_layered = had_layered
                     pid, cls_name, boot_ms = self._window_identity(hwnd, pre_info)
                     self.journal.record_alpha(
-                        hwnd, hidden_orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+                        hwnd,
+                        hidden_orig_alpha,
+                        had_layered=had_layered,
+                        pid=pid,
+                        class_name=cls_name,
+                        boot_tick_ms=boot_ms,
+                        sync=False,
                     )
                     if self.backend.set_window_hidden_alpha(hwnd, True):
                         did_hide = True
                         with self._hidden_lock:
                             self._hidden_for_anim[hwnd] = (hidden_orig_alpha, now, had_layered)
                     else:
-                        self.journal.record_alpha(hwnd, None)
+                        self.journal.record_alpha(hwnd, None, sync=False)
                         return None
 
                 # Only wait if window is STILL reporting minimized (-32000) coordinates (0 ms when ready!)
@@ -1534,10 +1713,16 @@ class PrismEngine:
         # Hide IMMEDIATELY before DWM composites its next frame!
         orig_alpha = max(20, cur_alpha) if cur_alpha > 0 else 255
         self.journal.record_alpha(
-            hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_chk, boot_tick_ms=w32.get_boot_tick_ms()
+            hwnd,
+            orig_alpha,
+            had_layered=had_layered,
+            pid=pid,
+            class_name=cls_chk,
+            boot_tick_ms=w32.get_boot_tick_ms(),
+            sync=False,
         )
         if not self.backend.set_window_hidden_alpha(hwnd, True):
-            self.journal.record_alpha(hwnd, None)
+            self.journal.record_alpha(hwnd, None, sync=False)
             return False
         with self._hidden_lock:
             self._hidden_for_anim[hwnd] = (orig_alpha, now, had_layered)
@@ -1689,10 +1874,16 @@ class PrismEngine:
         if not already_hidden:
             pid, cls_name, boot_ms = self._window_identity(hwnd)
             self.journal.record_alpha(
-                hwnd, orig_alpha, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+                hwnd,
+                orig_alpha,
+                had_layered=had_layered,
+                pid=pid,
+                class_name=cls_name,
+                boot_tick_ms=boot_ms,
+                sync=False,
             )
             if not self.backend.set_window_hidden_alpha(hwnd, True):
-                self.journal.record_alpha(hwnd, None)
+                self.journal.record_alpha(hwnd, None, sync=False)
                 if self._active_precover_hwnd == hwnd:
                     self._cancel_active_precover()
                 return False
@@ -1760,16 +1951,118 @@ class PrismEngine:
         self.finish_hidden_handoff(pm.hwnd, pm.orig_alpha, had_layered=pm.had_layered)
         return None
 
+    def _perform_dpi_wobble_recapture(
+        self, hwnd: int, x: int, y: int, w: int, h: int, now: float
+    ) -> None:
+        """Capture crisp new-DPI texture for an active Mixed-DPI wobble drag and emit texture swap."""
+        if (
+            hwnd != self._drag_hwnd
+            or not self._drag_wobble_started
+            or not self._drag_dpi_recapture_pending
+            or not self.backend.is_valid_window(hwnd)
+        ):
+            return
+        if not self.backend.is_demo and w32.user32.IsIconic(hwnd):
+            return
+        fresh = self.backend.capture_window_bgra(hwnd, allow_screen_fallback=False)
+        cap_now = time.perf_counter()
+        if fresh and fresh[0] >= 40 and fresh[1] >= 40 and not _is_mostly_blank_bgra(fresh[2]):
+            if hwnd != self._drag_hwnd or not self._drag_wobble_started:
+                return
+            self._drag_dpi_recapture_pending = False
+            self._drag_wobble_cap = fresh
+            self._drag_last_normal_cap = fresh
+            self._store_cached_capture(hwnd, fresh[0], fresh[1], fresh[2], (x, y, w, h), cap_now)
+            if self.on_wobbly_texture_update:
+                try:
+                    self.on_wobbly_texture_update(
+                        WobblyTextureUpdate(
+                            hwnd=hwnd,
+                            w=w,
+                            h=h,
+                            img_w=fresh[0],
+                            img_h=fresh[1],
+                            bgra_bytes=fresh[2],
+                        )
+                    )
+                except Exception:
+                    pass
+        else:
+            if hwnd == self._drag_hwnd:
+                self._drag_size_changed_at = cap_now
+
     def _open_stager_loop(self) -> None:
-        """0%-idle background worker staging newly opened windows AND smooth maximize/snap morphs."""
+        """0%-idle background worker staging opens, morphs, async hook triggers & wobble captures off PrismFX-Hooks."""
         while not self._stop_event.is_set():
             try:
                 self._open_wake.clear()
                 with self._hidden_lock:
                     pending_list = list(self._pending_opens.values())
                     morph_list = list(self._pending_morphs.values())
-                if not pending_list and not morph_list:
+                    hook_triggers = list(self._pending_hook_triggers)
+                    self._pending_hook_triggers.clear()
+                    wobble_caps = list(self._pending_wobble_captures.items())
+                    self._pending_wobble_captures.clear()
+                    dpi_wobble_caps = list(self._pending_dpi_wobble_captures.items())
+                    self._pending_dpi_wobble_captures.clear()
+                if not pending_list and not morph_list and not hook_triggers and not wobble_caps and not dpi_wobble_caps:
                     self._open_wake.wait(timeout=0.4)
+                    continue
+
+                # 1a) Drain async Mixed-DPI wobble texture recaptures off PrismFX-Hooks!
+                for wh, (wx, wy, ww, wh_px, req_at) in dpi_wobble_caps:
+                    if self._stop_event.is_set():
+                        break
+                    self._perform_dpi_wobble_recapture(wh, wx, wy, ww, wh_px, req_at)
+
+                # 1b) Drain async wobble drag captures off PrismFX-Hooks (zero PrintWindow on hook thread!)
+                for wh, (wx, wy, ww, wh_px, _req_at) in wobble_caps:
+                    if self._stop_event.is_set():
+                        break
+                    if wh != self._drag_hwnd or self._drag_wobble_started or self._drag_is_resize:
+                        continue
+                    if not self.backend.is_valid_window(wh) or w32.user32.IsIconic(wh):
+                        continue
+                    fresh = self.backend.capture_window_bgra(wh)
+                    cap_now = time.perf_counter()
+                    if fresh and fresh[0] >= 40 and fresh[1] >= 40 and not _is_mostly_blank_bgra(fresh[2]):
+                        if wh == self._drag_hwnd and not self._drag_wobble_started:
+                            cur_sx, cur_sy, cur_sw, cur_sh = self._drag_start_rect
+                            if abs(fresh[0] - cur_sw) <= 16 and abs(fresh[1] - cur_sh) <= 16:
+                                self._drag_wobble_cap = fresh
+                                self._store_cached_capture(
+                                    wh, fresh[0], fresh[1], fresh[2], (cur_sx, cur_sy, cur_sw, cur_sh), cap_now
+                                )
+                                cx, cy = w32.get_cursor_pos()
+                                live = self._wobble_live_pos
+                                lx, ly = (live[1], live[2]) if (live and live[0] == wh) else (cur_sx, cur_sy)
+                                gu = max(0.05, min(0.95, (cx - lx) / max(1, cur_sw)))
+                                gv = max(0.02, min(0.35, (cy - ly) / max(1, cur_sh)))
+                                self._drag_grab_uv = (gu, gv)
+                                self._drag_tracker.reset(cap_now, lx, ly)
+                    else:
+                        if wh == self._drag_hwnd:
+                            self._drag_size_changed_at = cap_now
+
+                # 2) Drain async restore/menu triggers off PrismFX-Hooks (zero sleep/PrintWindow on hook thread!)
+                for thwnd, tname in hook_triggers:
+                    if self._stop_event.is_set():
+                        break
+                    if not self.config.enabled or self._cached_paused_reason:
+                        if tname == "restore":
+                            self._unhide_if_prehidden(thwnd)
+                        continue
+                    if tname == "restore":
+                        if self.trigger_effect_for_window(thwnd, "restore") is None:
+                            self._unhide_if_prehidden(thwnd)
+                    elif tname == "menu":
+                        if not self.backend.is_valid_window(thwnd):
+                            continue
+                        info = self.backend.get_window_info(thwnd)
+                        if info and info.w >= 60 and info.h >= 40 and not self.is_excluded(info):
+                            self.trigger_effect_for_window(thwnd, "menu")
+
+                if not pending_list and not morph_list:
                     continue
 
                 now = time.perf_counter()
@@ -1906,14 +2199,28 @@ class PrismEngine:
 
             self._stop_event.wait(0.010)
 
+    def cached_capture_bytes(self) -> int:
+        """Return total raw BGRA bytes currently held in the capture cache."""
+        with self._cache_lock:
+            return sum(len(entry[2]) for entry in self._cached_captures.values())
+
     def _store_cached_capture(
         self, hwnd: int, img_w: int, img_h: int, raw: bytes, rect: tuple[int, int, int, int], ts: float
     ) -> None:
+        raw_len = len(raw)
+        if raw_len <= 0 or raw_len > MAX_CAPTURE_CACHE_BYTES:
+            return
         with self._cache_lock:
             self._cached_captures[hwnd] = (img_w, img_h, raw, rect, ts)
-            if len(self._cached_captures) > 20:
-                oldest = min(self._cached_captures, key=lambda k: self._cached_captures[k][4])
-                self._cached_captures.pop(oldest, None)
+            total_bytes = sum(len(v[2]) for v in self._cached_captures.values())
+            while total_bytes > MAX_CAPTURE_CACHE_BYTES and len(self._cached_captures) > 1:
+                oldest = min(
+                    (k for k in self._cached_captures if k != hwnd),
+                    key=lambda k: self._cached_captures[k][4],
+                )
+                evicted = self._cached_captures.pop(oldest, None)
+                if evicted is not None:
+                    total_bytes -= len(evicted[2])
 
     def _refresh_cache_for_hwnd(self, hwnd: int, now: float) -> None:
         """Non-blocking background window capture refresh (called on Core thread, never hook thread)."""
@@ -2012,12 +2319,12 @@ class PrismEngine:
                         self._prehidden_uniconic_since.pop(h, None)
 
         for h in stale_journal_clear:
-            self.journal.record_alpha(h, None)
+            self.journal.record_alpha(h, None, sync=False)
 
         for h, orig_a, hl in to_unhide:
             if self.backend.is_valid_window(h):
                 self.backend.set_window_hidden_alpha(h, False, orig_a, had_layered=hl)
-            self.journal.record_alpha(h, None)
+            self.journal.record_alpha(h, None, sync=False)
 
         # 3. Fail-safe drag & wobble watchdog: catch crashed app OR missed MOVESIZEEND (e.g. UAC/Alt+Tab)
         if self._drag_hwnd:
@@ -2025,11 +2332,12 @@ class PrismEngine:
             if not self.backend.is_valid_window(drag_h):
                 self._drag_hwnd = 0
                 self._drag_wobble_started = False
+                self._drag_dpi_recapture_pending = False
                 self._drag_alpha_mutated = False
                 self._drag_unsafe_layered = False
                 self._drag_lbutton_up_since = 0.0
                 if self.journal.get_mutation(drag_h) is not None:
-                    self.journal.prune_hwnd(drag_h)
+                    self.journal.prune_hwnd(drag_h, sync=False)
                 if self._hook_tid:
                     try:
                         w32.user32.PostThreadMessageW(self._hook_tid, _WM_APP_UNHOOK_DRAG, 0, 0)
@@ -2040,6 +2348,8 @@ class PrismEngine:
                         self.on_wobbly_end(drag_h, 0, 0, True)
                     except Exception:
                         pass
+            elif self._cached_paused_reason == "fullscreen_game":
+                self._drag_lbutton_up_since = 0.0
             elif not w32.is_lbutton_down():
                 if self._drag_lbutton_up_since <= 0.0:
                     self._drag_lbutton_up_since = now
@@ -2050,6 +2360,7 @@ class PrismEngine:
                     drag_orig_a = self._drag_orig_alpha
                     drag_had_l = self._drag_had_layered
                     self._drag_wobble_started = False
+                    self._drag_dpi_recapture_pending = False
                     self._drag_alpha_mutated = False
                     self._drag_unsafe_layered = False
                     self._drag_lbutton_up_since = 0.0
@@ -2061,7 +2372,7 @@ class PrismEngine:
                     if (not was_wob) and was_mutated:
                         if self.backend.is_valid_window(drag_h):
                             self.backend.set_window_opacity(drag_h, drag_orig_a, had_layered=drag_had_l)
-                        self.journal.record_alpha(drag_h, None)
+                        self.journal.record_alpha(drag_h, None, sync=False)
                     if was_wob and self.on_wobbly_end:
                         if is_demo:
                             d_info = self.backend.get_window_info(drag_h)
@@ -2087,7 +2398,7 @@ class PrismEngine:
         for h, orig_a, hl in stale_wobble:
             if self.backend.is_valid_window(h):
                 self.backend.set_window_hidden_alpha(h, False, orig_a, had_layered=hl)
-            self.journal.record_alpha(h, None)
+            self.journal.record_alpha(h, None, sync=False)
 
     # ------------------------------------------------------------------
     # Background Core Loop (Physics, Watchdog, Caching, Spotlight, Auto-Min, Fade)
@@ -2141,15 +2452,18 @@ class PrismEngine:
             except Exception:
                 logging.getLogger(__name__).exception("Unhandled exception in PrismFX-Core _poll_loop")
 
-            sleep_sec = 0.006 if self._momentum is not None else 0.04
+            if self._momentum is not None:
+                sleep_sec = max(0.0025, 1.0 / max(30, min(360, int(self.config.target_fps))))
+            else:
+                sleep_sec = 0.04
             self._stop_event.wait(sleep_sec)
 
     def _housekeeping_tick(self, now: float) -> None:
-        self._watchdog_tick(now)
-
         # Refresh paused_reason ONCE per 350 ms here (zero SHQueryUserNotificationState on hooks!)
         paused = self.paused_reason()
-        self._cached_paused_reason = paused
+        self._apply_paused_reason_transition(paused)
+
+        self._watchdog_tick(now)
 
         do_bg_scan = (now - self._last_bg_scan) >= 2.0
         if do_bg_scan:
@@ -2192,7 +2506,16 @@ class PrismEngine:
                 prev = self._cached_captures.get(fg)
                 if prev and prev[0] == fg_info.w and prev[1] == fg_info.h and prev[3] != cur_rect:
                     self._cached_captures[fg] = (prev[0], prev[1], prev[2], cur_rect, prev[4])
-            if not prev or (now - prev[4]) > 1.5 or prev[0] != fg_info.w or prev[1] != fg_info.h:
+            # Event-driven active capture (zero periodic PrintWindow polling when idle!)
+            need_fg_cap = prev is None or prev[0] != fg_info.w or prev[1] != fg_info.h
+            if not need_fg_cap and prev is not None and (now - prev[4]) > 2.5 and not self.backend.is_demo:
+                cx, cy = w32.get_cursor_pos()
+                if (
+                    fg_info.x <= cx <= fg_info.x + fg_info.w
+                    and fg_info.y <= cy <= fg_info.y + 48
+                ):
+                    need_fg_cap = True
+            if need_fg_cap:
                 cap = self.backend.capture_window_bgra(fg)
                 if cap and not _is_mostly_blank_bgra(cap[2]):
                     self._store_cached_capture(fg, cap[0], cap[1], cap[2], cur_rect, now)
@@ -2211,7 +2534,7 @@ class PrismEngine:
             self.backend.list_windows(own_pid=self.own_pid) if need_win_list else None
         )
 
-        # Round-robin cache 1 background visible window every 2 s so unfocused closes/minimizes hit cache
+        # Round-robin cache 1 uncached/resized background visible window every 2 s (no periodic 8s re-poll!)
         if do_bg_scan and vis_wins is not None:
             eligible = [w for w in vis_wins if not w.minimized and w.hwnd != fg and not self.is_excluded(w)]
             if eligible:
@@ -2219,7 +2542,7 @@ class PrismEngine:
                 self._bg_cache_cursor += 1
                 with self._cache_lock:
                     prev_bg = self._cached_captures.get(w_bg.hwnd)
-                if not prev_bg or (now - prev_bg[4]) > 8.0:
+                if prev_bg is None or prev_bg[0] != w_bg.w or prev_bg[1] != w_bg.h:
                     self._refresh_cache_for_hwnd(w_bg.hwnd, now)
 
         if not paused and self.config.focus.spotlight_enabled and fg_info and not self.is_excluded(fg_info):
@@ -2231,7 +2554,7 @@ class PrismEngine:
             target_alpha = max(60, min(255, int(round(self.config.focus.inactive_opacity_pct * 2.55))))
             if fg:
                 with self._state_lock:
-                    fg_faded = self._faded_hwnds.pop(fg, None)
+                    fg_faded = self._faded_hwnds.get(fg)
                 if fg_faded is not None:
                     with self._hidden_lock:
                         fg_is_hidden = (
@@ -2244,15 +2567,18 @@ class PrismEngine:
                         )
                     if not fg_is_hidden:
                         orig_a, had_layered = fg_faded
-                        if self.backend.is_valid_window(fg):
-                            self.backend.set_window_opacity(fg, orig_a, had_layered=had_layered)
-                        self.journal.record_alpha(fg, None)
+                        if (not self.backend.is_valid_window(fg)) or self.backend.set_window_opacity(
+                            fg, orig_a, had_layered=had_layered
+                        ):
+                            with self._state_lock:
+                                self._faded_hwnds.pop(fg, None)
+                            self.journal.record_alpha(fg, None)
             for win in vis_wins:
                 if self.is_excluded(win) or win.minimized:
                     continue
                 if win.hwnd == fg:
                     with self._state_lock:
-                        win_faded = self._faded_hwnds.pop(win.hwnd, None)
+                        win_faded = self._faded_hwnds.get(win.hwnd)
                     if win_faded is not None:
                         with self._hidden_lock:
                             win_is_hidden = (
@@ -2265,8 +2591,10 @@ class PrismEngine:
                             )
                         if not win_is_hidden:
                             orig_a, had_layered = win_faded
-                            self.backend.set_window_opacity(win.hwnd, orig_a, had_layered=had_layered)
-                            self.journal.record_alpha(win.hwnd, None)
+                            if self.backend.set_window_opacity(win.hwnd, orig_a, had_layered=had_layered):
+                                with self._state_lock:
+                                    self._faded_hwnds.pop(win.hwnd, None)
+                                self.journal.record_alpha(win.hwnd, None)
                 else:
                     with self._state_lock:
                         already_faded = win.hwnd in self._faded_hwnds
@@ -2286,15 +2614,13 @@ class PrismEngine:
                         if cur_alpha is None or cur_alpha == 0:
                             continue
                         orig_a = max(20, cur_alpha) if cur_alpha > 0 else 255
-                        pid, cls_name, boot_ms = self._window_identity(win.hwnd, win)
-                        self.journal.record_alpha(
-                            win.hwnd, orig_a, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
-                        )
                         if self.backend.set_window_opacity(win.hwnd, target_alpha):
+                            pid, cls_name, boot_ms = self._window_identity(win.hwnd, win)
+                            self.journal.record_alpha(
+                                win.hwnd, orig_a, had_layered=had_layered, pid=pid, class_name=cls_name, boot_tick_ms=boot_ms
+                            )
                             with self._state_lock:
                                 self._faded_hwnds[win.hwnd] = (orig_a, had_layered)
-                        else:
-                            self.journal.record_alpha(win.hwnd, None)
             with self._state_lock:
                 faded_keys = list(self._faded_hwnds)
             for h in faded_keys:
@@ -2325,18 +2651,17 @@ class PrismEngine:
             on_desktop = fg_cls in ("Progman", "WorkerW")
             cur_vis = self.backend.are_desktop_icons_visible()
             if on_desktop and not cur_vis:
-                self.journal.record_desktop_icons_hidden(False)
-                self.backend.set_desktop_icons_visible(True)
+                if self.backend.set_desktop_icons_visible(True):
+                    self.journal.record_desktop_icons_hidden(False)
             elif not on_desktop and cur_vis:
-                self.journal.record_desktop_icons_hidden(True)
-                self.backend.set_desktop_icons_visible(False)
+                if self.backend.set_desktop_icons_visible(False):
+                    self.journal.record_desktop_icons_hidden(True)
 
         self._publish_frame(fg_info=fg_info)
 
     def _clear_inactive_fades(self) -> None:
         with self._state_lock:
             faded_items = list(self._faded_hwnds.items())
-            self._faded_hwnds.clear()
         for hwnd, (orig_a, had_layered) in faded_items:
             with self._hidden_lock:
                 is_hidden_now = (
@@ -2348,32 +2673,46 @@ class PrismEngine:
                     or hwnd in self._pending_morphs
                 )
             if is_hidden_now:
+                with self._state_lock:
+                    self._faded_hwnds.pop(hwnd, None)
                 continue
-            if self.backend.is_valid_window(hwnd):
-                self.backend.set_window_opacity(hwnd, orig_a, had_layered=had_layered)
-            self.journal.record_alpha(hwnd, None)
+            if (not self.backend.is_valid_window(hwnd)) or self.backend.set_window_opacity(
+                hwnd, orig_a, had_layered=had_layered
+            ):
+                with self._state_lock:
+                    self._faded_hwnds.pop(hwnd, None)
+                self.journal.record_alpha(hwnd, None)
 
     def _update_spotlight_state(self, fg_info: Optional[WindowInfo] = None, force_off: bool = False) -> None:
-        if force_off or not fg_info:
+        if force_off or not fg_info or self._cached_paused_reason:
             changed = self._spotlight.active
             self._spotlight = SpotlightState(active=False)
             if changed and self.on_spotlight_changed:
                 self.on_spotlight_changed(self._spotlight)
             return
 
-        cursor = w32.get_cursor_pos() if not self.backend.is_demo else (fg_info.x + fg_info.w // 2, fg_info.y + fg_info.h // 2)
+        mode = self.config.focus.spotlight_mode
+        if mode == "cursor":
+            cursor = (
+                w32.get_cursor_pos()
+                if not self.backend.is_demo
+                else (fg_info.x + fg_info.w // 2, fg_info.y + fg_info.h // 2)
+            )
+        else:
+            cursor = (0, 0)
         new_st = SpotlightState(
             active=True,
-            mode=self.config.focus.spotlight_mode,
+            mode=mode,
             opacity=self.config.focus.spotlight_opacity_pct / 100.0,
             color_hex=self.config.focus.spotlight_color_hex,
             active_hwnd=fg_info.hwnd,
             active_rect=(fg_info.x, fg_info.y, fg_info.w, fg_info.h),
             cursor_pos=cursor,
         )
-        self._spotlight = new_st
-        if self.on_spotlight_changed:
-            self.on_spotlight_changed(new_st)
+        if new_st != self._spotlight:
+            self._spotlight = new_st
+            if self.on_spotlight_changed:
+                self.on_spotlight_changed(new_st)
 
     # ------------------------------------------------------------------
     # Out-of-Process Windows Event Hook & Async Raw Input Pump (ZERO DLL injection, ZERO WH_MOUSE_LL!)
@@ -2754,6 +3093,7 @@ class PrismEngine:
                         self._drag_morph_handled = True
                         if self._drag_wobble_started and self.on_wobbly_end:
                             self._drag_wobble_started = False
+                            self._drag_dpi_recapture_pending = False
                             try:
                                 self.on_wobbly_end(drag_h, f_rect[0], f_rect[1], True)
                             except Exception:
@@ -2863,6 +3203,7 @@ class PrismEngine:
                 was_wob = self._drag_wobble_started
                 self._drag_hwnd = 0
                 self._drag_wobble_started = False
+                self._drag_dpi_recapture_pending = False
                 self._drag_alpha_mutated = False
                 self._drag_unsafe_layered = False
                 self._drag_wobble_cap = None
@@ -2897,6 +3238,7 @@ class PrismEngine:
                 self._last_active_time.pop(hwnd, None)
                 self._last_trigger_info.pop(hwnd, None)
                 self._known_visible_hwnds.discard(hwnd)
+                self._cloaked_hwnds.discard(hwnd)
             if was_tiled:
                 try:
                     self.destroyed_tile_hwnds.put_nowait(hwnd)
@@ -2908,11 +3250,17 @@ class PrismEngine:
                 self._prehidden_creating.pop(hwnd, None)
                 self._pending_opens.pop(hwnd, None)
                 self._pending_morphs.pop(hwnd, None)
+                self._pending_wobble_captures.pop(hwnd, None)
+                self._pending_dpi_wobble_captures.pop(hwnd, None)
+                if self._pending_hook_triggers:
+                    self._pending_hook_triggers = [
+                        item for item in self._pending_hook_triggers if item[0] != hwnd
+                    ]
                 self._pending_prehide.pop(hwnd, None)
                 self._hidden_for_anim.pop(hwnd, None)
                 self._hidden_for_wobble.pop(hwnd, None)
             if self.journal.get_mutation(hwnd) is not None:
-                self.journal.prune_hwnd(hwnd)
+                self.journal.prune_hwnd(hwnd, sync=False)
             return
 
         if event == w32.EVENT_SYSTEM_MOVESIZESTART:
@@ -2955,6 +3303,9 @@ class PrismEngine:
             self._drag_alpha_mutated = False
             self._drag_wobble_started = False
             self._drag_size_changed = False
+            self._drag_dpi_recapture_pending = False
+            mon0 = self._monitor_for_point(info.x + info.w // 2, info.y + info.h // 2)
+            self._drag_monitor_key = (mon0.name, mon0.left, mon0.top, mon0.width, mon0.height)
             self._drag_size_changed_at = 0.0
             self._drag_stable_moves = 0
             self._drag_recapture_tries = 0
@@ -2991,17 +3342,13 @@ class PrismEngine:
                     and abs(cached[0] - info.w) <= 16
                     and abs(cached[1] - info.h) <= 16
                 )
-                with self._hidden_lock:
-                    already_hidden_wob = hwnd in self._hidden_for_wobble
-                if cache_dim_ok and (already_hidden_wob or (now - cached[4]) < 0.8):
+                if cache_dim_ok and cached is not None:
                     self._drag_wobble_cap = (cached[0], cached[1], cached[2])
                 else:
-                    fresh = self.backend.capture_window_bgra(hwnd)
-                    if fresh and fresh[0] >= 40 and fresh[1] >= 40 and not _is_mostly_blank_bgra(fresh[2]):
-                        self._drag_wobble_cap = fresh
-                        self._store_cached_capture(hwnd, fresh[0], fresh[1], fresh[2], (info.x, info.y, info.w, info.h), now)
-                    elif cache_dim_ok and cached is not None:
-                        self._drag_wobble_cap = (cached[0], cached[1], cached[2])
+                    # Cache miss: enqueue async capture on PrismFX-OpenStager (ZERO PrintWindow on PrismFX-Hooks!)
+                    with self._hidden_lock:
+                        self._pending_wobble_captures[hwnd] = (info.x, info.y, info.w, info.h, now)
+                    self._open_wake.set()
             elif (
                 not self._drag_is_resize
                 and not self._drag_unsafe_layered
@@ -3009,31 +3356,33 @@ class PrismEngine:
                 and self.config.physics.drag_transparency_enabled
             ):
                 alpha = max(60, min(255, int(round(self.config.physics.drag_opacity_pct * 2.55))))
-                pid, cls_name, boot_ms = self._window_identity(hwnd, info)
-                self.journal.record_alpha(
-                    hwnd,
-                    self._drag_orig_alpha,
-                    had_layered=self._drag_had_layered,
-                    pid=pid,
-                    class_name=cls_name,
-                    boot_tick_ms=boot_ms,
-                )
                 if self.backend.set_window_opacity(hwnd, alpha):
+                    pid, cls_name, boot_ms = self._window_identity(hwnd, info)
+                    self.journal.record_alpha(
+                        hwnd,
+                        self._drag_orig_alpha,
+                        had_layered=self._drag_had_layered,
+                        pid=pid,
+                        class_name=cls_name,
+                        boot_tick_ms=boot_ms,
+                        sync=False,
+                    )
                     self._drag_alpha_mutated = True
                     with self._state_lock:
                         self._faded_hwnds.pop(hwnd, None)
-                else:
-                    with self._state_lock:
-                        is_faded = hwnd in self._faded_hwnds
-                    if not is_faded:
-                        self.journal.record_alpha(hwnd, None)
             return
 
         if event == w32.EVENT_OBJECT_LOCATIONCHANGE:
             if hwnd != self._drag_hwnd:
                 return
             # Fast kernel/DWM bounds only (~0.01 ms; zero OpenProcess/GetWindowText during drag!)
-            x, y, w, h = w32.get_extended_frame_bounds(hwnd)
+            if self.backend.is_demo:
+                d_info = self.backend.get_window_info(hwnd)
+                if not d_info:
+                    return
+                x, y, w, h = d_info.x, d_info.y, d_info.w, d_info.h
+            else:
+                x, y, w, h = w32.get_extended_frame_bounds(hwnd)
             if w <= 0 or h <= 0 or x <= -10000:
                 return
             now = time.perf_counter()
@@ -3050,7 +3399,12 @@ class PrismEngine:
                 # (Windows fires LOCATIONCHANGE with the maximized/snapped rect ~1ms BEFORE MOVESIZEEND!)
                 is_zoomed_now = (not self.backend.is_demo) and bool(w32.user32.IsZoomed(hwnd))
                 is_aero_snap_rect = is_zoomed_now
-                if not is_aero_snap_rect and not self.backend.is_demo and not w32.is_lbutton_down():
+                if (
+                    not is_aero_snap_rect
+                    and not self.backend.is_demo
+                    and self._cached_paused_reason != "fullscreen_game"
+                    and not w32.is_lbutton_down()
+                ):
                     mon_c = self._monitor_for_point(x + w // 2, y + h // 2)
                     if h >= mon_c.work_height - 24 and (
                         x <= mon_c.work_left + 16 or (x + w) >= mon_c.work_right - 16
@@ -3083,6 +3437,7 @@ class PrismEngine:
                             self._drag_morph_handled = True
                             if self._drag_wobble_started:
                                 self._drag_wobble_started = False
+                                self._drag_dpi_recapture_pending = False
                                 self._wobble_live_pos = None
                                 if self.on_wobbly_end:
                                     try:
@@ -3095,7 +3450,33 @@ class PrismEngine:
                 if self._drag_morph_handled:
                     return
 
-                # Size jumped mid-drag (Aero Un-Maximize / Un-Snap, cross-monitor DPI change, OR border resize).
+                cur_mon = self._monitor_for_point(x + w // 2, y + h // 2)
+                cur_mon_key = (cur_mon.name, cur_mon.left, cur_mon.top, cur_mon.width, cur_mon.height)
+                crossed_monitor = bool(self._drag_monitor_key[0] and cur_mon_key != self._drag_monitor_key)
+
+                # Smooth cross-monitor Mixed-DPI rescale (PFX-P05): keep Wobbly alive and smoothly
+                # scale the live texture without dropping/flashing, then hot-swap a crisp new-DPI
+                # texture once bounds stabilize (>= 2 moves & >= 38 ms)!
+                if (
+                    self._drag_wobble_started
+                    and not self._drag_is_resize
+                    and not is_zoomed_now
+                    and not is_aero_snap_rect
+                    and (self.backend.is_demo or (self._cached_paused_reason != "fullscreen_game" and w32.is_lbutton_down()))
+                    and is_proportional_dpi_scale(ow, oh, w, h, crossed_monitor=crossed_monitor)
+                ):
+                    self._drag_start_rect = (x, y, w, h)
+                    self._drag_monitor_key = cur_mon_key
+                    self._drag_dpi_recapture_pending = True
+                    self._drag_size_changed_at = now
+                    self._drag_stable_moves = 0
+                    self._drag_recapture_tries = 0
+                    self._wobble_live_pos = (hwnd, x, y, w, h)
+                    if not is_zoomed_now:
+                        self._drag_last_normal_rect = (x, y, w, h)
+                    return
+
+                # Size jumped mid-drag (Aero Un-Maximize / Un-Snap, OR border resize).
                 # Cancel any stale-size wobble, adopt the new (w, h) baseline, and wait for size to stabilize
                 # across pure moves before re-capturing a crisp 1:1 texture at the restored dimensions!
                 if self._drag_wobble_started:
@@ -3107,6 +3488,8 @@ class PrismEngine:
                         except Exception:
                             pass
                 self._drag_start_rect = (x, y, w, h)
+                self._drag_monitor_key = cur_mon_key
+                self._drag_dpi_recapture_pending = False
                 self._drag_wobble_cap = None
                 self._drag_size_changed = True
                 self._drag_size_changed_at = now
@@ -3136,27 +3519,58 @@ class PrismEngine:
 
                 self._wobble_live_pos = (hwnd, x, y, w, h)
 
-                # After Aero Un-Maximize / Un-Snap / DPI switch, capture fresh restored texture once size
-                # stays stable for ~38 ms & >= 2 pure moves, then seamlessly start Wobbly on the SAME drag!
-                if not self._drag_wobble_started and self._drag_wobble_cap is None and not self.backend.is_demo:
-                    ready_for_recap = (
-                        (not self._drag_size_changed)
-                        or (self._drag_stable_moves >= 2 and (now - self._drag_size_changed_at) >= 0.038)
-                    )
-                    if ready_for_recap and self._drag_recapture_tries < 3:
-                        self._drag_recapture_tries += 1
-                        fresh = self.backend.capture_window_bgra(hwnd)
-                        if fresh and fresh[0] >= 40 and fresh[1] >= 40 and not _is_mostly_blank_bgra(fresh[2]):
-                            self._drag_wobble_cap = fresh
-                            self._store_cached_capture(hwnd, fresh[0], fresh[1], fresh[2], (x, y, w, h), now)
-                            cx, cy = w32.get_cursor_pos()
-                            gu = max(0.05, min(0.95, (cx - x) / max(1, w)))
-                            gv = max(0.02, min(0.35, (cy - y) / max(1, h)))
-                            self._drag_grab_uv = (gu, gv)
-                            self._drag_tracker.reset(now, x, y)
+                # Seamless Mixed-DPI recapture while Wobbly stays active: swap in crisp new-DPI texture
+                # asynchronously off PrismFX-Hooks on live OS (or inline in demo/headless unit tests)!
+                if (
+                    self._drag_wobble_started
+                    and self._drag_dpi_recapture_pending
+                    and self._drag_stable_moves >= 2
+                    and (now - self._drag_size_changed_at) >= 0.038
+                ):
+                    if self._drag_recapture_tries < 3:
+                        if self._open_stager_thread is not None and self._open_stager_thread.is_alive():
+                            enq_dpi = False
+                            with self._hidden_lock:
+                                if hwnd not in self._pending_dpi_wobble_captures:
+                                    self._pending_dpi_wobble_captures[hwnd] = (x, y, w, h, now)
+                                    self._drag_recapture_tries += 1
+                                    self._drag_size_changed_at = now
+                                    enq_dpi = True
+                            if enq_dpi:
+                                self._open_wake.set()
                         else:
-                            # Window still repainting restored layout -> retry cleanly after another 38 ms
-                            self._drag_size_changed_at = now
+                            self._drag_recapture_tries += 1
+                            self._perform_dpi_wobble_recapture(hwnd, x, y, w, h, now)
+                    else:
+                        self._drag_dpi_recapture_pending = False
+
+                # After Aero Un-Maximize / Un-Snap, capture fresh restored texture asynchronously
+                # off PrismFX-Hooks once size stays stable for ~38 ms & >= 2 pure moves!
+                if not self._drag_wobble_started and self._drag_wobble_cap is None and not self.backend.is_demo:
+                    if not self._drag_size_changed:
+                        with self._cache_lock:
+                            cached_loc = self._cached_captures.get(hwnd)
+                        if (
+                            cached_loc is not None
+                            and abs(cached_loc[0] - w) <= 16
+                            and abs(cached_loc[1] - h) <= 16
+                        ):
+                            self._drag_wobble_cap = (cached_loc[0], cached_loc[1], cached_loc[2])
+                    if self._drag_wobble_cap is None:
+                        ready_for_recap = (
+                            (not self._drag_size_changed)
+                            or (self._drag_stable_moves >= 2 and (now - self._drag_size_changed_at) >= 0.038)
+                        )
+                        if ready_for_recap and self._drag_recapture_tries < 3:
+                            enqueued = False
+                            with self._hidden_lock:
+                                if hwnd not in self._pending_wobble_captures:
+                                    self._pending_wobble_captures[hwnd] = (x, y, w, h, now)
+                                    self._drag_recapture_tries += 1
+                                    self._drag_size_changed_at = now
+                                    enqueued = True
+                            if enqueued:
+                                self._open_wake.set()
 
                 if (
                     not self._drag_wobble_started
@@ -3204,6 +3618,7 @@ class PrismEngine:
             last_norm_cap = self._drag_last_normal_cap or self._drag_wobble_cap
             self._drag_hwnd = 0
             self._drag_wobble_started = False
+            self._drag_dpi_recapture_pending = False
             self._drag_morph_handled = False
             self._drag_alpha_mutated = False
             self._drag_unsafe_layered = False
@@ -3213,6 +3628,9 @@ class PrismEngine:
             self._drag_lbutton_up_since = 0.0
             self._drag_last_move_ts = time.perf_counter()
             self._detach_drag_location_hook()
+            with self._hidden_lock:
+                self._pending_wobble_captures.pop(hwnd, None)
+                self._pending_dpi_wobble_captures.pop(hwnd, None)
             with self._cache_lock:
                 self._pending_cache_hwnds.add(hwnd)
             info = self.backend.get_window_info(hwnd)
@@ -3227,7 +3645,7 @@ class PrismEngine:
             if (not was_wobbling) and (not morph_handled) and drag_alpha_mutated:
                 if self.backend.is_valid_window(hwnd):
                     self.backend.set_window_opacity(hwnd, drag_orig_alpha, had_layered=drag_had_layered)
-                self.journal.record_alpha(hwnd, None)
+                self.journal.record_alpha(hwnd, None, sync=False)
             if self.on_wobbly_drag and info:
                 self.on_wobbly_drag(hwnd, info.x, info.y, info.w, info.h, 0.0, 0.0, False)
 
@@ -3380,12 +3798,38 @@ class PrismEngine:
                 self._cancel_active_precover()
             with self._state_lock:
                 self._known_visible_hwnds.add(hwnd)
-            if self.trigger_effect_for_window(hwnd, "restore") is None:
+                self._cloaked_hwnds.discard(hwnd)
+            if not self._trigger_enabled("restore"):
                 self._unhide_if_prehidden(hwnd)
+                return
+            if self.backend.is_demo:
+                if self.trigger_effect_for_window(hwnd, "restore") is None:
+                    self._unhide_if_prehidden(hwnd)
+                return
+            # Fast-path ONLY on cache hit with matching non-iconic bounds (0 sleep, 0 PrintWindow on PrismFX-Hooks!)
+            fast_ok = False
+            if not w32.user32.IsIconic(hwnd):
+                rx, ry, rw, rh = w32.get_extended_frame_bounds(hwnd)
+                if rx > -10000 and rw >= 80 and rh >= 60:
+                    with self._cache_lock:
+                        cached_res = self._cached_captures.get(hwnd)
+                    if cached_res is not None and cached_res[0] == rw and cached_res[1] == rh:
+                        fast_ok = True
+            if fast_ok:
+                if self.trigger_effect_for_window(hwnd, "restore") is None:
+                    self._unhide_if_prehidden(hwnd)
+            else:
+                # Offload capture/wait to PrismFX-OpenStager while keeping pre-hidden window at alpha=0 (0ms flash!)
+                with self._hidden_lock:
+                    if (hwnd, "restore") not in self._pending_hook_triggers:
+                        self._pending_hook_triggers.append((hwnd, "restore"))
+                self._open_wake.set()
             return
         if event == w32.EVENT_SYSTEM_MENUPOPUPSTART:
             if self._active_precover_hwnd:
                 self._cancel_active_precover()
+            if not self._trigger_enabled("menu"):
+                return
             # Fast kernel pre-filter before OpenProcess/GetWindowTextW (ignores taskbar/XAML/child popups!)
             style = w32.user32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE)
             if (style & w32.WS_CHILD) or w32.is_overlay_exstyle(hwnd):
@@ -3396,9 +3840,16 @@ class PrismEngine:
             rw, rh = w32.get_window_rect_size(hwnd)
             if rw < 60 or rh < 40:
                 return
-            info = self.backend.get_window_info(hwnd)
-            if info and info.w >= 60 and info.h >= 40 and not self.is_excluded(info):
-                self.trigger_effect_for_window(hwnd, "menu")
+            if self.backend.is_demo:
+                info = self.backend.get_window_info(hwnd)
+                if info and info.w >= 60 and info.h >= 40 and not self.is_excluded(info):
+                    self.trigger_effect_for_window(hwnd, "menu")
+                return
+            # Enqueue async menu trigger on PrismFX-OpenStager (ZERO PrintWindow on PrismFX-Hooks!)
+            with self._hidden_lock:
+                if (hwnd, "menu") not in self._pending_hook_triggers:
+                    self._pending_hook_triggers.append((hwnd, "menu"))
+            self._open_wake.set()
             return
         if event == w32.EVENT_OBJECT_SHOW:
             # Fast kernel pre-filter: reject taskbar/XAML/child/overlay/internal HWNDs in < 0.005 ms
@@ -3442,15 +3893,24 @@ class PrismEngine:
         if event == w32.EVENT_OBJECT_CLOAKED:
             self._last_cloak_ts = time.perf_counter()
             with self._state_lock:
+                if hwnd in self._known_visible_hwnds:
+                    self._cloaked_hwnds.add(hwnd)
                 self._known_visible_hwnds.discard(hwnd)
             return
         if event == w32.EVENT_OBJECT_UNCLOAKED:
             now = time.perf_counter()
             self._recent_uncloak_times = [t for t in self._recent_uncloak_times if (now - t) < 0.065]
             self._recent_uncloak_times.append(now)
-            # Virtual Desktop switch guard: switching desktops cloaks/uncloaks multiple windows in < 80 ms
-            if (now - self._last_cloak_ts) < 0.08 or len(self._recent_uncloak_times) >= 3:
+            with self._state_lock:
+                was_cloaked_known = hwnd in self._cloaked_hwnds
+            # Virtual Desktop switch guard: single-window desktop switch (>100ms apart) or multi-window burst
+            if (
+                was_cloaked_known
+                or (now - self._last_cloak_ts) < 0.25
+                or len(self._recent_uncloak_times) >= 2
+            ):
                 with self._state_lock:
+                    self._cloaked_hwnds.discard(hwnd)
                     self._known_visible_hwnds.add(hwnd)
                 self._unhide_if_prehidden(hwnd)
                 return

@@ -18,7 +18,14 @@ from ..core.effects import CATEGORIES, EASING_CURVES, TRIGGER_TYPES, EffectSpec
 from ..core.engine import PrismEngine, SpotlightState, TileRequest
 from ..core.physics import SNAP_PRESETS
 from ..render.gl_renderer import OffscreenGpuEngine
-from ..render.overlay import DesktopFxOverlay, FloatingTileWindow, QuickControlPopup, SpotlightOverlay
+from ..render.overlay import (
+    DesktopFxOverlay,
+    FloatingTileWindow,
+    QuickControlPopup,
+    SpotlightOverlay,
+    clamp_to_virtual_screens,
+    physical_to_qt_logical,
+)
 from ..render.preview_widget import ShaderPreviewWidget
 from .theme import ATLAS, TOKENS, build_stylesheet
 from .widgets import (
@@ -40,6 +47,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     startupStatusReady = QtCore.Signal(object)
     spotlightStateChanged = QtCore.Signal(object)
+    pauseStateChanged = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -94,9 +102,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._app_icon = self._load_icon(self._icon_path)
         self.setWindowIcon(self._app_icon)
 
-        # Restore persisted bounds safely
+        # Restore persisted bounds safely (preserving negative multi-monitor coordinates)
         gx, gy, gw, gh = self.cfg.window_geometry
-        self.setGeometry(max(20, gx), max(20, gy), max(1120, gw), max(720, gh))
+        rx, ry, rw, rh = clamp_to_virtual_screens(gx, gy, max(1120, gw), max(720, gh))
+        self.setGeometry(rx, ry, rw, rh)
 
         # Desktop GPU overlays (optional so headless/cloaked probes stay ultra-clean)
         self.fx_overlay: Optional[DesktopFxOverlay] = DesktopFxOverlay(engine) if enable_overlays else None
@@ -109,7 +118,15 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             engine.on_spotlight_changed = self._dispatch_spotlight_from_thread
 
+        self.pauseStateChanged.connect(
+            self._on_engine_pause_changed, QtCore.Qt.QueuedConnection
+        )
+        engine.on_pause_state_changed = self._dispatch_pause_from_thread
+        if engine._cached_paused_reason == "fullscreen_game":
+            self._on_engine_pause_changed("fullscreen_game")
+
         self._build_shell()
+        self._apply_target_fps()
         self._wire_hotkeys()
         self._tray: Optional[QtWidgets.QSystemTrayIcon] = None
         if enable_tray and QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
@@ -316,7 +333,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                 return (True, 1)
                             return (True, 0)
                     elif msg.message in (w32.WM_QUERYENDSESSION, w32.WM_ENDSESSION):
-                        # Synchronously restore all hidden/pre-hidden windows before Windows logs off or shuts down
+                        # Synchronously flush journal & restore all hidden/pre-hidden windows before logoff/shutdown
+                        self.engine.journal.flush_sync()
                         self.engine.stop()
                     elif msg.message == w32.WM_POWERBROADCAST:
                         if msg.wParam == w32.PBT_APMSUSPEND:
@@ -346,30 +364,84 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.on_system_resume_or_display_change()
         OffscreenGpuEngine.shared().validate_context()
 
+    def _apply_target_fps(self) -> None:
+        fps = max(30, min(360, int(self.cfg.target_fps)))
+        if hasattr(self, "home_stage"):
+            self.home_stage.set_target_fps(fps)
+        if hasattr(self, "lab_stage"):
+            self.lab_stage.set_target_fps(fps)
+        if hasattr(self, "wobble_stage"):
+            self.wobble_stage.set_target_fps(fps)
+        if self.fx_overlay is not None:
+            self.fx_overlay.set_target_fps(fps)
+
+    def _push_config(self) -> None:
+        self.engine.update_config(self.cfg)
+        self._apply_target_fps()
+
+    def _pause_all_stages(self) -> None:
+        if hasattr(self, "home_stage"):
+            self.home_stage.pause_clock()
+        if hasattr(self, "lab_stage"):
+            self.lab_stage.pause_clock()
+        if hasattr(self, "wobble_stage"):
+            self.wobble_stage.pause_clock()
+
+    def _wake_active_stage(self) -> None:
+        if not self.isVisible() or self.isMinimized():
+            self._pause_all_stages()
+            return
+        if hasattr(self, "home_stage"):
+            if self._active_page == "home":
+                self.home_stage.notify_interaction()
+            else:
+                self.home_stage.pause_clock()
+        if hasattr(self, "lab_stage"):
+            if self._active_page == "animations":
+                self.lab_stage.notify_interaction()
+            else:
+                self.lab_stage.pause_clock()
+        if hasattr(self, "wobble_stage"):
+            if self._active_page == "physics":
+                self.wobble_stage.notify_interaction()
+            else:
+                self.wobble_stage.pause_clock()
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._persist_geometry()
         if self._tray and self._tray.isVisible() and not self.engine.backend.is_demo:
             event.ignore()
             self.hide()
-            self.home_stage.pause_clock()
-            self.lab_stage.pause_clock()
-            self.wobble_stage.pause_clock()
+            self._pause_all_stages()
         else:
             self.full_shutdown()
             event.accept()
 
+    def event(self, event: QtCore.QEvent) -> bool:
+        ev_type = event.type()
+        if ev_type == QtCore.QEvent.WindowDeactivate:
+            self._pause_all_stages()
+        elif ev_type == QtCore.QEvent.WindowActivate:
+            self._wake_active_stage()
+        return super().event(event)
+
     def changeEvent(self, event: QtCore.QEvent) -> None:
-        if event.type() == QtCore.QEvent.WindowStateChange and self.isMinimized():
-            # Phase 5: pause GPU preview clocks when minimized
-            self.home_stage.pause_clock()
-            self.lab_stage.pause_clock()
-            self.wobble_stage.pause_clock()
+        ev_type = event.type()
+        if ev_type == QtCore.QEvent.WindowStateChange:
+            if self.isMinimized():
+                # Phase 5 / Board Resolution #2: pause GPU preview clocks when minimized
+                self._pause_all_stages()
+            elif self.isVisible() and self.isActiveWindow():
+                self._wake_active_stage()
+        elif ev_type == QtCore.QEvent.ActivationChange:
+            if not self.isActiveWindow():
+                self._pause_all_stages()
+            elif self.isVisible() and not self.isMinimized():
+                self._wake_active_stage()
         super().changeEvent(event)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
-        self.home_stage.pause_clock()
-        self.lab_stage.pause_clock()
-        self.wobble_stage.pause_clock()
+        self._pause_all_stages()
         super().hideEvent(event)
 
     # ------------------------------------------------------------------
@@ -913,7 +985,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_trig_enabled = QtWidgets.QCheckBox(self._tr("เปิดใช้งานเหตุการณ์นี้", "Enable this trigger"))
         self.chk_trig_enabled.toggled.connect(self._on_trigger_params_changed)
         top_i.addWidget(self.chk_trig_enabled, 1)
-        self.btn_lab_dir = QtWidgets.QPushButton("CLOSE / OPEN")
+        self.btn_lab_dir = QtWidgets.QPushButton("DIR: OPEN ⇄")
         self.btn_lab_dir.setFixedHeight(28)
         self.btn_lab_dir.setStyleSheet(
             f"QPushButton {{ padding: 2px 10px; font-size: 11px; background: {TOKENS['bg_recessed']}; "
@@ -1460,10 +1532,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"color: {TOKENS['ink_primary'] if active else TOKENS['ink_secondary']}; }}"
                 f"QPushButton:hover {{ background: {TOKENS['bg_hover']}; color: {TOKENS['ink_primary']}; }}"
             )
-        # Pause inactive GPU stages to keep idle GPU budget razor-low!
-        self.home_stage.start_clock() if key == "home" else self.home_stage.pause_clock()
-        self.lab_stage.start_clock() if key == "animations" else self.lab_stage.pause_clock()
-        self.wobble_stage.start_clock() if key == "physics" else self.wobble_stage.pause_clock()
+        # Pause inactive GPU stages & keep unfocused window at 0 FPS!
+        if self.isVisible() and not self.isMinimized() and self.isActiveWindow():
+            self._wake_active_stage()
+        else:
+            self._pause_all_stages()
         if key == "apps":
             self._refresh_apps_table()
 
@@ -1512,8 +1585,9 @@ class MainWindow(QtWidgets.QMainWindow):
             easing=tc.easing,
             intensity=tc.intensity,
             accent_hex=tc.accent_hex,
-            reverse=(self._active_trigger in ("open", "restore")),
+            reverse=(self._active_trigger in ("open", "restore", "menu", "popup")),
         )
+        self._update_lab_dir_button()
 
     def _refresh_animations_grid(self) -> None:
         while self._anim_grid.count():
@@ -1545,7 +1619,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tc.effect_id = effect_id
         tc.duration_ms = spec.default_ms
         tc.accent_hex = spec.accent_hex
-        self.engine.update_config(self.cfg)
+        self._push_config()
         for eid, card in self._effect_cards.items():
             card.set_selected(eid == effect_id)
         self._sync_trigger_controls()
@@ -1556,7 +1630,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tc.duration_ms = self.sl_trig_dur.slider.value()
         tc.intensity = self.sl_trig_int.slider.value() / 100.0
         tc.easing = str(self.cmb_easing.currentData() or "spring_smooth")
-        self.engine.update_config(self.cfg)
+        self._push_config()
         spec = self.engine.registry.get(tc.effect_id)
         self.lab_stage.set_effect(
             spec,
@@ -1564,28 +1638,33 @@ class MainWindow(QtWidgets.QMainWindow):
             easing=tc.easing,
             intensity=tc.intensity,
             accent_hex=tc.accent_hex,
-            reverse=(self._active_trigger in ("open", "restore")),
+            reverse=(self._active_trigger in ("open", "restore", "menu", "popup")),
         )
+        self._update_lab_dir_button()
 
     def _set_trigger_accent(self, hex_color: str) -> None:
         self.cfg.triggers[self._active_trigger].accent_hex = hex_color
-        self.engine.update_config(self.cfg)
+        self._push_config()
         self._sync_trigger_controls()
+
+    def _update_lab_dir_button(self) -> None:
+        self.btn_lab_dir.setText("DIR: OPEN ⇄" if self.lab_stage._reverse else "DIR: CLOSE ⇄")
 
     def _flip_lab_direction(self) -> None:
         self.lab_stage.set_direction(not self.lab_stage._reverse)
+        self._update_lab_dir_button()
 
     def _on_master_toggled(self, enabled: bool) -> None:
         self.cfg.enabled = enabled
-        self.engine.update_config(self.cfg)
+        self._push_config()
 
     def _on_global_speed(self, val: int) -> None:
         self.cfg.global_speed_scale = val / 100.0
-        self.engine.update_config(self.cfg)
+        self._push_config()
 
     def _apply_preset(self, name: str) -> None:
         self.cfg = self.engine.store.apply_preset(self.cfg, name)
-        self.engine.update_config(self.cfg)
+        self._push_config()
         self._rebuild_preset_buttons()
         self._sync_trigger_controls()
         self._refresh_animations_grid()
@@ -1600,7 +1679,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ok and name.strip():
             self.cfg.active_preset = name.strip()
             self.engine.store.save_user_preset(name.strip(), self.cfg)
-            self.engine.update_config(self.cfg)
+            self._push_config()
             self._rebuild_preset_buttons()
 
     def _create_sample_custom_shader(self) -> None:
@@ -1650,7 +1729,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for attr, cb in self._snap_combos.items():
             setattr(ph, attr, str(cb.currentData() or "left_50"))
         self.wobble_stage.configure_wobble(ph.wobbly_stiffness, ph.wobbly_damping, ph.wobbly_amplitude)
-        self.engine.update_config(self.cfg)
+        self._push_config()
 
     def _save_focus_ui(self, *_args) -> None:
         fc = self.cfg.focus
@@ -1664,11 +1743,11 @@ class MainWindow(QtWidgets.QMainWindow):
         fc.desktop_icons_autohide = self.chk_autohide_icons.isChecked()
         fc.tiles_topmost = self.chk_tiles_top.isChecked()
         fc.tile_size_px = self.sl_tile_size.slider.value()
-        self.engine.update_config(self.cfg)
+        self._push_config()
 
     def _set_spotlight_color(self, hx: str) -> None:
         self.cfg.focus.spotlight_color_hex = hx
-        self.engine.update_config(self.cfg)
+        self._push_config()
 
     def _save_safety_ui(self, *_args) -> None:
         sf = self.cfg.safety
@@ -1676,7 +1755,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sf.pause_on_battery = self.chk_pause_bat.isChecked()
         sf.auto_exclude_games = self.chk_auto_game.isChecked()
         sf.suppress_native_min_anim = self.chk_suppress_min.isChecked()
-        self.engine.update_config(self.cfg)
+        self._push_config()
         self._refresh_apps_table()
 
     def _refresh_apps_table(self) -> None:
@@ -1738,7 +1817,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.safety.excluded_exes = [x for x in self.cfg.safety.excluded_exes if x.lower() != low]
         else:
             self.cfg.safety.excluded_exes.append(exe)
-        self.engine.update_config(self.cfg)
+        self._push_config()
         self._refresh_apps_table()
 
     def _test_active_effect_on_real_window(self) -> None:
@@ -1894,7 +1973,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ok:
             self.cfg.start_with_windows = bool(enable)
             self.cfg.start_with_windows_admin = bool(enable and elevated_task)
-            self.engine.update_config(self.cfg)
+            self._push_config()
             self._startup_status = win_startup.query_startup_status(self._repo_root, dry_run=dry_run)
         else:
             # Refresh real OS state so toggles stay 100% honest if user cancelled UAC
@@ -1923,7 +2002,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_autostart_min_toggled(self, checked: bool) -> None:
         self.cfg.autostart_minimized = bool(checked)
-        self.engine.update_config(self.cfg)
+        self._push_config()
 
     def _on_autostart_admin_toggled(self, checked: bool) -> None:
         # Turning ON elevated boot automatically enables startup in one click
@@ -1964,7 +2043,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_language(self) -> None:
         self._lang = "en" if self._lang == "th" else "th"
         self.cfg.language = self._lang
-        self.engine.update_config(self.cfg)
+        self._push_config()
         self._rebuild_preset_buttons()
         self._refresh_animations_grid()
         self._sync_trigger_controls()
@@ -2001,7 +2080,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_fps = fps
         self._current_frame_ms = avg_ms
         self.lbl_st_fps.setText(f"STAGE: {fps:5.1f} FPS ({avg_ms:4.2f} ms)")
-        self.tile_fps.set_value(f"{fps:5.1f} FPS", f"{avg_ms:4.2f} ms/frame (165 Hz budget)")
+        self.tile_fps.set_value(f"{fps:5.1f} FPS", f"{avg_ms:4.2f} ms/frame ({self.cfg.target_fps} Hz budget)")
         gpu_name = self.home_stage.gpu_renderer_name()
         if gpu_name:
             self.lbl_st_gpu.setText(f"GPU: {gpu_name}")
@@ -2054,7 +2133,11 @@ class MainWindow(QtWidgets.QMainWindow):
             tw = FloatingTileWindow(info, cap, self.cfg.focus.tile_size_px, self.cfg.focus.tiles_topmost)
             tw.restored.connect(self._on_tile_restored)
             offset = len(self._tile_windows) * 28
-            tw.move(40 + offset, 40 + offset)
+            lx, ly = physical_to_qt_logical(info.x, info.y)
+            tx, ty, _, _ = clamp_to_virtual_screens(
+                lx + 24 + offset, ly + 24 + offset, tw.width(), tw.height(), margin=12
+            )
+            tw.move(tx, ty)
             tw.show()
             self.engine.register_own_hwnd(int(tw.winId()))
             self._tile_windows[info.hwnd] = tw
@@ -2070,6 +2153,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spotlightStateChanged.emit(state)
         except RuntimeError:
             pass
+
+    def _dispatch_pause_from_thread(self, reason: str) -> None:
+        if self._shutdown_started:
+            return
+        try:
+            self.pauseStateChanged.emit(str(reason or ""))
+        except RuntimeError:
+            pass
+
+    @QtCore.Slot(str)
+    def _on_engine_pause_changed(self, reason: str) -> None:
+        if self._shutdown_started:
+            return
+        is_fs_game = (reason == "fullscreen_game")
+        if self.fx_overlay is not None:
+            self.fx_overlay.set_fullscreen_game_paused(is_fs_game)
+        if is_fs_game and self.spotlight_overlay is not None:
+            self.spotlight_overlay.hide()
 
     # ------------------------------------------------------------------
     # Hotkeys, Tray & Custom Window Dragging
@@ -2106,6 +2207,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.activateWindow()
         self.raise_()
         self._select_page(self._active_page)
+        self._wake_active_stage()
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
@@ -2127,9 +2229,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._persist_geometry()
         if self._tray and self._tray.isVisible() and not self.engine.backend.is_demo:
             self.hide()
-            self.home_stage.pause_clock()
-            self.lab_stage.pause_clock()
-            self.wobble_stage.pause_clock()
+            self._pause_all_stages()
         else:
             self.full_shutdown()
 
@@ -2142,6 +2242,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def full_shutdown(self) -> None:
         self._shutdown_started = True
         self.engine.on_spotlight_changed = None
+        self.engine.on_pause_state_changed = None
         if self._wts_registered:
             self._wts_registered = False
             try:
@@ -2163,4 +2264,5 @@ class MainWindow(QtWidgets.QMainWindow):
             self._tray.hide()
         OffscreenGpuEngine.shared().shutdown()
         self.engine.stop()
+        self.engine.journal.close()
         QtWidgets.QApplication.quit()
